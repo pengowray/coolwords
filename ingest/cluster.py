@@ -51,6 +51,47 @@ def spherical_kmeans(X: np.ndarray, k: int, iters: int = 60) -> np.ndarray:
     return labels
 
 
+def cluster_level(con, book_id, level, mat, rowmap, words, k, top, shadow) -> int:
+    """Cluster + greedy-shadow one (book, level) candidate set. Returns #embedded."""
+    cands = con.execute(
+        "SELECT word_id, score FROM candidates WHERE book_id = ? AND level = ? ORDER BY rank",
+        (book_id, level),
+    ).fetchall()
+    emb = [(wid, score) for (wid, score) in cands if wid in rowmap]  # score-ranked
+    con.execute("UPDATE candidates SET cluster = NULL, selected = 0 WHERE book_id = ? AND level = ?",
+                (book_id, level))
+    if not emb:
+        return 0
+    X = np.vstack([mat[rowmap[wid]] for wid, _ in emb]).astype(np.float32)
+
+    labels = spherical_kmeans(X, k)
+    con.executemany(
+        "UPDATE candidates SET cluster = ? WHERE book_id = ? AND level = ? AND word_id = ?",
+        [(int(labels[i]), book_id, level, emb[i][0]) for i in range(len(emb))],
+    )
+
+    # greedy varied pick down the score-ranked list (shadowing)
+    picked: list[int] = []
+    picked_vecs: list[np.ndarray] = []
+    for i in range(len(emb)):
+        v = X[i]
+        if picked_vecs:
+            sims = np.asarray(picked_vecs) @ v
+            if sims[int(sims.argmax())] >= shadow:
+                continue
+        picked.append(i)
+        picked_vecs.append(v)
+        if len(picked) >= top:
+            break
+    con.executemany(
+        "UPDATE candidates SET selected = 1 WHERE book_id = ? AND level = ? AND word_id = ?",
+        [(book_id, level, emb[i][0]) for i in picked],
+    )
+    if level == 0:
+        print(f"  level 0 varied top: {', '.join(words[emb[i][0]] for i in picked[:12])} …")
+    return len(emb)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--slug", required=True)
@@ -63,69 +104,17 @@ def main() -> None:
     book_id = con.execute("SELECT id FROM books WHERE slug = ?", (args.slug,)).fetchone()[0]
     mat = np.load(EMB_PATH)
     rowmap = {wid: row for (wid, row) in con.execute("SELECT word_id, row FROM word_embedding_map")}
-
-    cands = con.execute(
-        "SELECT word_id, score FROM candidates WHERE book_id = ? ORDER BY rank", (book_id,)
-    ).fetchall()
     words = {wid: w for (wid, w) in con.execute(
         "SELECT c.word_id, x.word FROM candidates c JOIN words x ON x.id = c.word_id WHERE c.book_id = ?",
         (book_id,))}
 
-    emb = [(wid, score) for (wid, score) in cands if wid in rowmap]  # score-ranked
-    if not emb:
-        raise SystemExit("no candidates have embeddings")
-    X = np.vstack([mat[rowmap[wid]] for wid, _ in emb]).astype(np.float32)
-
-    labels = spherical_kmeans(X, args.k)
-    con.execute("UPDATE candidates SET cluster = NULL, selected = 0 WHERE book_id = ?", (book_id,))
-    con.executemany(
-        "UPDATE candidates SET cluster = ? WHERE book_id = ? AND word_id = ?",
-        [(int(labels[i]), book_id, emb[i][0]) for i in range(len(emb))],
-    )
-
-    # greedy varied pick down the score-ranked list
-    picked: list[int] = []      # indices into emb
-    picked_vecs: list[np.ndarray] = []
-    shadowed_by: dict[int, int] = {}
-    for i in range(len(emb)):
-        v = X[i]
-        if picked_vecs:
-            sims = np.asarray(picked_vecs) @ v
-            j = int(sims.argmax())
-            if sims[j] >= args.shadow:
-                shadowed_by[i] = picked[j]
-                continue
-        picked.append(i)
-        picked_vecs.append(v)
-        if len(picked) >= args.top:
-            break
-
-    con.executemany(
-        "UPDATE candidates SET selected = 1 WHERE book_id = ? AND word_id = ?",
-        [(book_id, emb[i][0]) for i in picked],
-    )
+    per_level = {}
+    for level in (0, 1, 2, 3):
+        per_level[level] = cluster_level(
+            con, book_id, level, mat, rowmap, words, args.k, args.top, args.shadow)
     con.commit()
-    log_ingest(con, "cluster", f"{args.slug}: k={args.k}, top={args.top}", len(emb))
-
-    # --- verification output ---
-    print(f"{args.slug}: {len(emb):,}/{len(cands):,} candidates have embeddings; "
-          f"k={min(args.k,len(emb))} clusters; picked {len(picked)} varied words\n")
-    print("== clusters (top words by score) ==")
-    by_cluster: dict[int, list[str]] = {}
-    for i in range(len(emb)):
-        by_cluster.setdefault(int(labels[i]), []).append(words[emb[i][0]])
-    for c in sorted(by_cluster):
-        print(f"  c{c:>2}: {', '.join(by_cluster[c][:8])}")
-
-    print("\n== varied top-20 (selected) ==")
-    for rank, i in enumerate(picked, 1):
-        print(f"  {rank:>2}. {words[emb[i][0]]:<16} (c{int(labels[i])}, score {emb[i][1]:.2f})")
-
-    print("\n== examples of shadowed (skipped) words and what shadowed them ==")
-    for shown, (i, by) in enumerate(shadowed_by.items()):
-        if shown >= 12:
-            break
-        print(f"  {words[emb[i][0]]:<16} shadowed by {words[emb[by][0]]}")
+    log_ingest(con, "cluster", f"{args.slug}: per-level embedded " + str(per_level), sum(per_level.values()))
+    print(f"{args.slug}: clustered + shadowed; embedded candidates per level {per_level}")
     con.close()
 
 

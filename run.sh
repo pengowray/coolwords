@@ -18,13 +18,15 @@
 #      python -m ingest.wordnet        # noun.food/animal/person categories + hypernym/holo/meronym relations
 #      python -m ingest.langnames      # etymology language code -> full English name
 #      python -m ingest.embeddings     # fastText vectors -> data/coolwords_emb.npy
-#      python -m ingest.stem           # suffix-root base forms (run AFTER ngrams/fiction; needs frequency)
+#      python -m ingest.stem           # per-level lemmas word_lemma + lemma_freq (AFTER ngrams/fiction
+#                                      #   for frequency, AND embeddings for the level-3 prefix guard)
 #      python -m ingest.stats          # summary / verification report
 #
-#  ---- Analyze a book (book -> scored candidates -> clusters + varied top-20) ----
+#  ---- Analyze a book (book -> per-level scored candidates -> clusters + varied top-20) ----
 #      python -m ingest.book data/books/moby_dick_2701.txt --slug gutenberg-2701 --title "Moby-Dick" --author "Herman Melville" --source-id 2701
-#      python -m ingest.score   --slug gutenberg-2701
-#      python -m ingest.cluster --slug gutenberg-2701 --k 16 --top 20
+#      python -m ingest.score   --slug gutenberg-2701      # scores all merge levels 0-3
+#      python -m ingest.cluster --slug gutenberg-2701 --k 16 --top 20   # clusters all levels
+#      python -m ingest.trajectory     # per-decade usage (in-book words + their roots); run after books
 #      python -m ingest.refresh_freq   # re-copy ngram/fiction freq onto words after adding new headwords
 # ============================================================================
 set -euo pipefail

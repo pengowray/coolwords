@@ -34,6 +34,8 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     ],
     "candidates": [
         ("selected", "INTEGER NOT NULL DEFAULT 0"),
+        ("level", "INTEGER NOT NULL DEFAULT 0"),
+        ("n_forms", "INTEGER NOT NULL DEFAULT 1"),
     ],
     "book_occurrences": [
         ("example", "TEXT"),
@@ -52,12 +54,26 @@ def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
     con.execute("PRAGMA journal_mode = WAL")
     con.execute("PRAGMA synchronous = NORMAL")
     con.execute("PRAGMA foreign_keys = ON")
+    rebuild_legacy(con)
     init_schema(con)
     ensure_columns(con)
     # indexes on migration-added columns, created after the columns exist
     con.execute("CREATE INDEX IF NOT EXISTS idx_words_stem ON words(stem)")
     con.commit()
     return con
+
+
+def rebuild_legacy(con: sqlite3.Connection) -> None:
+    """Drop tables whose PRIMARY KEY changed shape so init_schema can recreate them.
+
+    `candidates` gained `level` in its primary key (one row per book/level/lemma);
+    a plain ADD COLUMN can't change the PK. The table is fully derived (regenerated
+    by ingest/score.py), so dropping the legacy shape loses nothing.
+    """
+    cols = {row[1] for row in con.execute("PRAGMA table_info(candidates)")}
+    if cols and "level" not in cols:
+        con.execute("DROP TABLE candidates")
+        con.commit()
 
 
 def init_schema(con: sqlite3.Connection, schema_dir: Path = SCHEMA_PATH.parent) -> None:

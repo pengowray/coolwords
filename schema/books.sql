@@ -27,10 +27,15 @@ CREATE TABLE IF NOT EXISTS book_occurrences (
 CREATE INDEX IF NOT EXISTS idx_book_occ_word ON book_occurrences(word_id);
 
 -- Scored interesting-word candidates for a book (output of ingest/score.py).
+-- One row per (book, stemming level, group representative): word_id is the
+-- lemma/root at that level, and merged surface forms are aggregated into in_book
+-- and n_forms. Level 0 = no merging (word_id is the surface form, n_forms = 1).
 CREATE TABLE IF NOT EXISTS candidates (
     book_id     INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
-    word_id     INTEGER NOT NULL REFERENCES words(id),
-    in_book     INTEGER NOT NULL,     -- occurrences in this book
+    level       INTEGER NOT NULL DEFAULT 0,   -- stemming aggressiveness 0..3 (0 = none)
+    word_id     INTEGER NOT NULL REFERENCES words(id),  -- group representative (lemma at this level)
+    in_book     INTEGER NOT NULL,     -- combined occurrences of all merged forms in this book
+    n_forms     INTEGER NOT NULL DEFAULT 1,   -- distinct in-book surface forms merged here
     score       REAL    NOT NULL,
     s_rarity    REAL,
     s_salience  REAL,                 -- prominence in book vs general corpus (weirdness)
@@ -38,10 +43,10 @@ CREATE TABLE IF NOT EXISTS candidates (
     s_aesthetic REAL,
     cluster     INTEGER,              -- embedding cluster id (ingest/cluster.py)
     selected    INTEGER NOT NULL DEFAULT 0,  -- 1 if in the varied top-N pick
-    rank        INTEGER,
-    PRIMARY KEY (book_id, word_id)
+    rank        INTEGER,              -- per (book_id, level)
+    PRIMARY KEY (book_id, level, word_id)
 );
-CREATE INDEX IF NOT EXISTS idx_candidates_rank ON candidates(book_id, rank);
+CREATE INDEX IF NOT EXISTS idx_candidates_rank ON candidates(book_id, level, rank);
 
 -- Human ratings for the selection UI (legacy single verdict; superseded by word_tags).
 CREATE TABLE IF NOT EXISTS ratings (

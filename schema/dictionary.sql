@@ -124,6 +124,33 @@ CREATE TABLE IF NOT EXISTS word_relation (
 );
 CREATE INDEX IF NOT EXISTS idx_word_relation_word ON word_relation(word_id, rel);
 
+-- Resolved root/lemma word at each stemming level (ingest/stem.py). Level 0 is
+-- implicit (every word is its own lemma) and NOT stored; rows exist for levels
+-- 1..3 only where the lemma differs from the word itself.
+--   1 = inflectional (trembling->tremble)   2 = derivational, = words.stem
+--   3 = aggressive (untrembling->tremble, illegal->legal; never hatter->hat)
+CREATE TABLE IF NOT EXISTS word_lemma (
+    word_id  INTEGER NOT NULL REFERENCES words(id) ON DELETE CASCADE,
+    level    INTEGER NOT NULL,
+    lemma_id INTEGER NOT NULL REFERENCES words(id),
+    PRIMARY KEY (word_id, level)
+);
+CREATE INDEX IF NOT EXISTS idx_word_lemma_group ON word_lemma(level, lemma_id);
+
+-- Per-level family frequency (ingest/stem.py): summed corpus frequency over every
+-- dictionary word mapping to lemma_id at this level (the lemma included). Stored
+-- only for multi-member families (n_members >= 2); singletons fall back to the
+-- representative word's own freq. Drives combined-frequency rarity + the UI's
+-- frequency column when forms are merged.
+CREATE TABLE IF NOT EXISTS lemma_freq (
+    level      INTEGER NOT NULL,
+    lemma_id   INTEGER NOT NULL REFERENCES words(id) ON DELETE CASCADE,
+    freq_pm    REAL,
+    freq_pm_lc REAL,
+    n_members  INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (level, lemma_id)
+);
+
 -- Maps a word to its row in the embedding sidecar (data/coolwords_emb.npy,
 -- float32 (N, 300), L2-normalized). Kept out of the .db so the large, stable
 -- vectors don't bloat / re-sync the frequently-changing database.

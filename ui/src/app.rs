@@ -81,6 +81,8 @@ pub struct Candidate {
     pub example: Option<String>,
     pub tags: Vec<String>,
     pub buckets: Vec<String>,
+    /// Distinct in-book surface forms merged into this group (1 = no merge).
+    pub n_forms: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -161,16 +163,16 @@ fn load_tags(conn: &rusqlite::Connection, book_id: i64) -> Result<HashMap<i64, V
 /// Per-word "pick:" buckets: POS (noun/verb/adj/adv) + full WordNet lexname
 /// categories (noun.animal, verb.communication, ...), minus the generic *.all.
 #[cfg(feature = "ssr")]
-fn load_buckets(conn: &rusqlite::Connection, book_id: i64) -> Result<HashMap<i64, Vec<String>>, ServerFnError> {
+fn load_buckets(conn: &rusqlite::Connection, book_id: i64, level: i64) -> Result<HashMap<i64, Vec<String>>, ServerFnError> {
     let mut m: HashMap<i64, BTreeSet<String>> = HashMap::new();
     let mut s1 = conn
         .prepare(
             "SELECT DISTINCT wp.word_id, wp.pos FROM word_pos wp
              JOIN candidates c ON c.word_id = wp.word_id
-             WHERE c.book_id = ?1 AND wp.pos IN ('noun','verb','adj','adv')",
+             WHERE c.book_id = ?1 AND c.level = ?2 AND wp.pos IN ('noun','verb','adj','adv')",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    for r in s1.query_map([book_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+    for r in s1.query_map([book_id, level], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
         .map_err(|e| ServerFnError::new(e.to_string()))?.filter_map(Result::ok)
     {
         m.entry(r.0).or_default().insert(r.1);
@@ -179,10 +181,10 @@ fn load_buckets(conn: &rusqlite::Connection, book_id: i64) -> Result<HashMap<i64
         .prepare(
             "SELECT DISTINCT wc.word_id, wc.category FROM word_category wc
              JOIN candidates c ON c.word_id = wc.word_id
-             WHERE c.book_id = ?1 AND wc.category NOT LIKE '%.all' AND wc.category <> 'noun.Tops'",
+             WHERE c.book_id = ?1 AND c.level = ?2 AND wc.category NOT LIKE '%.all' AND wc.category <> 'noun.Tops'",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    for r in s2.query_map([book_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+    for r in s2.query_map([book_id, level], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
         .map_err(|e| ServerFnError::new(e.to_string()))?.filter_map(Result::ok)
     {
         m.entry(r.0).or_default().insert(r.1);
@@ -306,22 +308,23 @@ fn era_label(key: &str) -> &'static str {
     }
 }
 
-/// All candidate word trajectories for a book, keyed by word_id.
+/// Trajectories of a book's candidate representatives at one level, keyed by word_id.
 #[cfg(feature = "ssr")]
 fn book_trajectories(
     conn: &rusqlite::Connection,
     book_id: i64,
+    level: i64,
 ) -> Result<HashMap<i64, Vec<(i32, f64)>>, ServerFnError> {
     let mut m: HashMap<i64, Vec<(i32, f64)>> = HashMap::new();
     let mut s = conn
         .prepare(
             "SELECT t.word_id, t.decade, t.pm FROM word_trajectory t
              JOIN candidates c ON c.word_id = t.word_id
-             WHERE c.book_id = ?1 ORDER BY t.word_id, t.decade",
+             WHERE c.book_id = ?1 AND c.level = ?2 ORDER BY t.word_id, t.decade",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     for r in s
-        .query_map([book_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as i32, r.get::<_, f64>(2)?)))
+        .query_map([book_id, level], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as i32, r.get::<_, f64>(2)?)))
         .map_err(|e| ServerFnError::new(e.to_string()))?
         .filter_map(Result::ok)
     {
@@ -362,7 +365,7 @@ pub async fn list_books() -> Result<Vec<Book>, ServerFnError> {
 }
 
 #[server]
-pub async fn list_categories(book_id: i64) -> Result<Vec<FilterOpt>, ServerFnError> {
+pub async fn list_categories(book_id: i64, level: i64) -> Result<Vec<FilterOpt>, ServerFnError> {
     use rusqlite::Connection;
     let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
     let mut out: Vec<FilterOpt> = Vec::new();
@@ -375,11 +378,11 @@ pub async fn list_categories(book_id: i64) -> Result<Vec<FilterOpt>, ServerFnErr
         .prepare(
             "SELECT wp.pos, count(DISTINCT c.word_id) FROM candidates c
              JOIN word_pos wp ON wp.word_id = c.word_id
-             WHERE c.book_id = ?1 AND wp.pos IN ('noun','verb','adj','adv') GROUP BY wp.pos",
+             WHERE c.book_id = ?1 AND c.level = ?2 AND wp.pos IN ('noun','verb','adj','adv') GROUP BY wp.pos",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     let pos_counts: HashMap<String, i64> = ps
-        .query_map([book_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .query_map([book_id, level], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
         .map_err(|e| ServerFnError::new(e.to_string()))?
         .filter_map(Result::ok)
         .collect();
@@ -392,7 +395,7 @@ pub async fn list_categories(book_id: i64) -> Result<Vec<FilterOpt>, ServerFnErr
     // --- era (relative to the book's year) + present-day status, both classified
     // from each word's trajectory in a single pass ---
     let year = book_year(&conn, book_id)?;
-    let traj = book_trajectories(&conn, book_id)?;
+    let traj = book_trajectories(&conn, book_id, level)?;
     let mut era_counts: HashMap<&str, i64> = HashMap::new();
     let mut n_obsolete = 0i64;
     for t in traj.values() {
@@ -422,11 +425,11 @@ pub async fn list_categories(book_id: i64) -> Result<Vec<FilterOpt>, ServerFnErr
         .query_row(
             &format!(
                 "SELECT count(DISTINCT c.word_id) FROM candidates c JOIN words w ON w.id = c.word_id
-                 WHERE c.book_id = ?1 AND w.etymology_lang IS NOT NULL
+                 WHERE c.book_id = ?1 AND c.level = ?2 AND w.etymology_lang IS NOT NULL
                    AND w.etymology_lang NOT IN ({})",
                 common_origins_sql()
             ),
-            [book_id],
+            [book_id, level],
             |r| r.get(0),
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -439,11 +442,11 @@ pub async fn list_categories(book_id: i64) -> Result<Vec<FilterOpt>, ServerFnErr
         .prepare(
             "SELECT wc.category, count(DISTINCT c.word_id) n
              FROM candidates c JOIN word_category wc ON wc.word_id = c.word_id
-             WHERE c.book_id = ?1 GROUP BY wc.category ORDER BY n DESC, wc.category",
+             WHERE c.book_id = ?1 AND c.level = ?2 GROUP BY wc.category ORDER BY n DESC, wc.category",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     for r in stmt
-        .query_map([book_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .query_map([book_id, level], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
         .map_err(|e| ServerFnError::new(e.to_string()))?
         .filter_map(Result::ok)
     {
@@ -458,25 +461,26 @@ pub async fn get_candidates(
     book_id: i64,
     category: Option<String>,
     limit: i32,
+    level: i64,
 ) -> Result<Vec<Candidate>, ServerFnError> {
     use rusqlite::Connection;
     let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
     let tags = load_tags(&conn, book_id)?;
-    let buckets = load_buckets(&conn, book_id)?;
+    let buckets = load_buckets(&conn, book_id, level)?;
 
     // Parse the filter spec held in the `cat` param. Exactly one filter is ever
-    // active (single-select dropdown). `era:` is resolved in Rust from each word's
-    // trajectory; the rest become a SQL WHERE fragment.
+    // active (single-select dropdown). `era:`/`status:obsolete` are resolved in
+    // Rust from each word's trajectory; the rest become a SQL WHERE fragment
+    // (the category value, when present, binds as ?3).
     let cat = category.as_deref().unwrap_or("");
     let era_filter = cat.strip_prefix("era:");
     let obsolete_filter = cat == "status:obsolete";
-    // era + obsolete are resolved in Rust from each word's trajectory.
     let needs_traj = era_filter.is_some() || obsolete_filter;
     let mut where_extra = String::new();
-    let mut bind_cat: Option<String> = None; // bound as ?2 when present
+    let mut bind_cat: Option<String> = None; // bound as ?3 when present
     if let Some(p) = cat.strip_prefix("pos:") {
         where_extra =
-            " AND EXISTS (SELECT 1 FROM word_pos wp WHERE wp.word_id = w.id AND wp.pos = ?2)".into();
+            " AND EXISTS (SELECT 1 FROM word_pos wp WHERE wp.word_id = w.id AND wp.pos = ?3)".into();
         bind_cat = Some(p.to_string());
     } else if cat == "origin:unusual" {
         where_extra = format!(
@@ -485,7 +489,7 @@ pub async fn get_candidates(
         );
     } else if !needs_traj && !cat.is_empty() {
         where_extra =
-            " AND EXISTS (SELECT 1 FROM word_category wc WHERE wc.word_id = w.id AND wc.category = ?2)"
+            " AND EXISTS (SELECT 1 FROM word_category wc WHERE wc.word_id = w.id AND wc.category = ?3)"
                 .into();
         bind_cat = Some(cat.to_string());
     }
@@ -495,12 +499,12 @@ pub async fn get_candidates(
     let limit_sql = if needs_traj { String::new() } else { format!(" LIMIT {}", limit.max(0)) };
     let sql = format!(
         "SELECT w.id, w.word, c.in_book, c.score, w.gloss, w.etymology_lang, ln.name,
-                w.wordnet_category, c.cluster, c.selected, bo.example
+                w.wordnet_category, c.cluster, c.selected, bo.example, c.n_forms
          FROM candidates c
          JOIN words w ON w.id = c.word_id
          LEFT JOIN lang_names ln ON ln.code = w.etymology_lang
          LEFT JOIN book_occurrences bo ON bo.book_id = c.book_id AND bo.word_id = c.word_id
-         WHERE c.book_id = ?1{where_extra}
+         WHERE c.book_id = ?1 AND c.level = ?2{where_extra}
          ORDER BY c.rank{limit_sql}"
     );
 
@@ -520,16 +524,17 @@ pub async fn get_candidates(
             example: row.get(10)?,
             tags: Vec::new(),
             buckets: Vec::new(),
+            n_forms: row.get(11)?,
         })
     };
     let mut out: Vec<Candidate> = match &bind_cat {
         Some(v) => stmt
-            .query_map(rusqlite::params![book_id, v], map_row)
+            .query_map(rusqlite::params![book_id, level, v], map_row)
             .map_err(|e| ServerFnError::new(e.to_string()))?
             .filter_map(Result::ok)
             .collect(),
         None => stmt
-            .query_map(rusqlite::params![book_id], map_row)
+            .query_map(rusqlite::params![book_id, level], map_row)
             .map_err(|e| ServerFnError::new(e.to_string()))?
             .filter_map(Result::ok)
             .collect(),
@@ -537,7 +542,7 @@ pub async fn get_candidates(
 
     if needs_traj {
         let year = book_year(&conn, book_id)?;
-        let traj = book_trajectories(&conn, book_id)?;
+        let traj = book_trajectories(&conn, book_id, level)?;
         if let Some(era) = era_filter {
             out.retain(|c| {
                 traj.get(&c.word_id).and_then(|t| classify_era(t, year)).is_some_and(|k| k == era)
@@ -560,7 +565,7 @@ pub async fn get_candidates(
 }
 
 #[server]
-pub async fn word_detail(book_id: i64, word_id: i64) -> Result<WordInfo, ServerFnError> {
+pub async fn word_detail(book_id: i64, word_id: i64, level: i64) -> Result<WordInfo, ServerFnError> {
     use rusqlite::{Connection, OptionalExtension};
     let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
 
@@ -608,24 +613,28 @@ pub async fn word_detail(book_id: i64, word_id: i64) -> Result<WordInfo, ServerF
         }
     }
 
+    // The merged group at this level: the representative plus every in-book
+    // surface form whose lemma-at-level resolves to it. (At level 0 there are no
+    // word_lemma rows, so this is just the word itself and the section hides.)
     let mut family = Vec::new();
-    if let Some(st) = &stem {
-        let mut fstmt = conn
-            .prepare(
-                "SELECT w.word, bo.count, w.freq_pm
-                 FROM book_occurrences bo JOIN words w ON w.id = bo.word_id
-                 WHERE bo.book_id = ?1 AND w.alpha_only = 1 AND (w.stem = ?2 OR w.word = ?2)
-                 ORDER BY w.freq_pm DESC LIMIT 15",
-            )
-            .map_err(|e| ServerFnError::new(e.to_string()))?;
-        let rows = fstmt
-            .query_map(rusqlite::params![book_id, st], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<f64>>(2)?.unwrap_or(0.0)))
-            })
-            .map_err(|e| ServerFnError::new(e.to_string()))?;
-        for r in rows {
-            family.push(r.map_err(|e| ServerFnError::new(e.to_string()))?);
-        }
+    let mut fstmt = conn
+        .prepare(
+            "SELECT w.word, bo.count, w.freq_pm
+             FROM book_occurrences bo JOIN words w ON w.id = bo.word_id
+             WHERE bo.book_id = ?1 AND w.alpha_only = 1 AND (
+                 w.id = ?2
+                 OR EXISTS (SELECT 1 FROM word_lemma wl
+                            WHERE wl.word_id = w.id AND wl.level = ?3 AND wl.lemma_id = ?2))
+             ORDER BY w.freq_pm DESC LIMIT 15",
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let rows = fstmt
+        .query_map(rusqlite::params![book_id, word_id, level], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<f64>>(2)?.unwrap_or(0.0)))
+        })
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    for r in rows {
+        family.push(r.map_err(|e| ServerFnError::new(e.to_string()))?);
     }
 
     let mut relstmt = conn
@@ -913,7 +922,10 @@ fn HomePage() -> impl IntoView {
     // doesn't scroll the list back to the top.
     let (selected, set_word) =
         query_signal_with_options::<i64>("word", NavigateOptions { scroll: false, ..Default::default() });
+    // stemming aggressiveness: 0 none / 1 inflectional / 2 derivational / 3 aggressive
+    let (lvl_q, set_lvl) = query_signal::<i64>("lvl");
     let book = Memo::new(move |_| book_q.get().unwrap_or(1));
+    let level = Memo::new(move |_| lvl_q.get().unwrap_or(0));
     let only_top = RwSignal::new(false);
     let open_picker = RwSignal::new(None::<i64>);
 
@@ -921,16 +933,16 @@ fn HomePage() -> impl IntoView {
     provide_context(tagger);
 
     let books = Resource::new(|| (), |_| list_books());
-    let categories = Resource::new(move || book.get(), list_categories);
+    let categories = Resource::new(move || (book.get(), level.get()), |(b, l)| list_categories(b, l));
     let candidates = Resource::new(
-        move || (book.get(), category.get()),
-        move |(b, cat)| get_candidates(b, cat, 400),
+        move || (book.get(), category.get(), level.get()),
+        move |(b, cat, l)| get_candidates(b, cat, 400, l),
     );
     let detail = Resource::new(
-        move || (book.get(), selected.get()),
-        move |(b, sel)| async move {
+        move || (book.get(), selected.get(), level.get()),
+        move |(b, sel, l)| async move {
             match sel {
-                Some(wid) => word_detail(b, wid).await.map(Some),
+                Some(wid) => word_detail(b, wid, l).await.map(Some),
                 None => Ok(None),
             }
         },
@@ -968,6 +980,17 @@ fn HomePage() -> impl IntoView {
                     }.into_any(),
                 })}
             </Suspense>
+            <select class="lvlsel" title="merge related word forms: none keeps every form separate; higher levels group inflections, then derivations, then aggressively (untrembling→tremble) — frequency is combined across the family"
+                prop:value=move || level.get().to_string()
+                on:change=move |ev| {
+                    let v = event_target_value(&ev).parse::<i64>().unwrap_or(0);
+                    set_lvl.set(if v == 0 { None } else { Some(v) });
+                }>
+                <option value="0">"merge: none"</option>
+                <option value="1">"merge: inflections"</option>
+                <option value="2">"merge: derivations"</option>
+                <option value="3">"merge: aggressive"</option>
+            </select>
             <Suspense fallback=|| ()>
                 {move || categories.get().map(|res| match res {
                     Err(_) => ().into_any(),
@@ -1032,6 +1055,7 @@ fn HomePage() -> impl IntoView {
                                     let wid = c.word_id;
                                     let bk = c.buckets.clone();
                                     let star = if c.selected { "•" } else { "" };
+                                    let nforms = c.n_forms;
                                     let gloss = short(&c.gloss, 90);
                                     let example = c.example.clone().unwrap_or_default();
                                     let origin_disp = c.origin_name.clone().or_else(|| c.origin_code.clone()).unwrap_or_default();
@@ -1044,6 +1068,9 @@ fn HomePage() -> impl IntoView {
                                             <td class="sel">{star}</td>
                                             <td class="word" title=example on:click=move |_| set_word.set(Some(wid))>
                                                 {c.word.clone()}
+                                                {(nforms > 1).then(|| view! {
+                                                    <small class="forms" title="surface forms merged into this group at the current level">{format!(" +{}", nforms - 1)}</small>
+                                                })}
                                             </td>
                                             <td class="gloss">{gloss}</td>
                                             <td class="num">{c.in_book}</td>

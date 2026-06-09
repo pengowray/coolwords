@@ -18,13 +18,15 @@ REM      python -m ingest.fiction        :: fiction genre baseline (the "weirdne
 REM      python -m ingest.wordnet        :: noun.food/animal/person categories + hypernym/holo/meronym relations
 REM      python -m ingest.langnames      :: etymology language code -> full English name
 REM      python -m ingest.embeddings     :: fastText vectors -> data\coolwords_emb.npy
-REM      python -m ingest.stem           :: suffix-root base forms (run AFTER ngrams/fiction; needs frequency)
+REM      python -m ingest.stem           :: per-level lemmas word_lemma + lemma_freq (AFTER ngrams/fiction
+REM                                      ::   for frequency, AND embeddings for the level-3 prefix guard)
 REM      python -m ingest.stats          :: summary / verification report
 REM
-REM  ---- Analyze a book (book -> scored candidates -> clusters + varied top-20) ----
+REM  ---- Analyze a book (book -> per-level scored candidates -> clusters + varied top-20) ----
 REM      python -m ingest.book data\books\moby_dick_2701.txt --slug gutenberg-2701 --title "Moby-Dick" --author "Herman Melville" --source-id 2701
-REM      python -m ingest.score   --slug gutenberg-2701
-REM      python -m ingest.cluster --slug gutenberg-2701 --k 16 --top 20
+REM      python -m ingest.score   --slug gutenberg-2701      :: scores all merge levels 0-3
+REM      python -m ingest.cluster --slug gutenberg-2701 --k 16 --top 20   :: clusters all levels
+REM      python -m ingest.trajectory     :: per-decade usage (in-book words + their roots); run after books
 REM      python -m ingest.refresh_freq   :: re-copy ngram/fiction freq onto words after adding new headwords
 REM ===========================================================================
 
