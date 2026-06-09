@@ -132,6 +132,15 @@ CREATE TABLE IF NOT EXISTS word_embedding_map (
     row     INTEGER NOT NULL
 );
 
+-- Per-decade per-million usage (Google 1M ngrams; ingest/trajectory.py), for the
+-- usage-over-time chart. decade = floor-10 year (1800..2000).
+CREATE TABLE IF NOT EXISTS word_trajectory (
+    word_id INTEGER NOT NULL REFERENCES words(id) ON DELETE CASCADE,
+    decade  INTEGER NOT NULL,
+    pm      REAL    NOT NULL,
+    PRIMARY KEY (word_id, decade)
+);
+
 -- Per-year frequency for trajectory over decades (Google ngrams). Reserved.
 CREATE TABLE IF NOT EXISTS word_freq_year (
     word_id INTEGER NOT NULL REFERENCES words(id) ON DELETE CASCADE,

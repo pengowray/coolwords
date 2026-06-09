@@ -64,9 +64,10 @@ def main() -> None:
     nsenses: dict = defaultdict(int)
     pos_by_word: dict = defaultdict(set)
     cats_by_word: dict = defaultdict(set)
-    primary: dict = {}  # lemma -> (lexname, tagcount, sensenum)
-    for lemma, pos, tagcount, sensenum, lexname in src.execute(
-        """SELECT w.lemma, sy.pos, s.tagcount, s.sensenum, ld.lexdomainname
+    primary: dict = {}     # lemma -> (lexname, tagcount, sensenum)
+    primary_ld: dict = {}  # lemma -> lexdomainid of its primary sense (for coordinates)
+    for lemma, pos, tagcount, sensenum, lexname, ldid in src.execute(
+        """SELECT w.lemma, sy.pos, s.tagcount, s.sensenum, ld.lexdomainname, ld.lexdomainid
            FROM words w
            JOIN senses s     ON s.wordid = w.wordid
            JOIN synsets sy   ON sy.synsetid = s.synsetid
@@ -81,6 +82,7 @@ def main() -> None:
         best = primary.get(lemma)
         if best is None or (tc, -sensenum) > (best[1], -best[2]):
             primary[lemma] = (lexname, tc, sensenum)
+            primary_ld[lemma] = ldid
 
     wn_updates = [(nsenses[l], primary[l][0], wordmap[l]) for l in nsenses]
     pos_rows = [(wordmap[l], p, "wordnet") for l, ps in pos_by_word.items() for p in ps]
@@ -139,8 +141,55 @@ def main() -> None:
         "INSERT OR IGNORE INTO word_relation(word_id, rel, target, source) VALUES (?, ?, ?, ?)", rel_rows
     )
     con.commit()
-    log_ingest(con, "wordnet", f"{len(wn_updates)} lemmas, {len(rel_rows)} relations", len(wn_updates))
     print(f"wordnet: {len(rel_rows):,} relation rows", flush=True)
+
+    # --- Step 3: coordinate terms (sister lemmas via a shared hypernym, same
+    # primary lexdomain), capped to keep broad categories sane. ---
+    hyper: dict = defaultdict(list)   # child synset -> [hypernym synsets]
+    hypo: dict = defaultdict(list)    # hypernym synset -> [child synsets]
+    for s1, s2 in src.execute("SELECT synset1id, synset2id FROM semlinks WHERE linkid = 1"):
+        hyper[s1].append(s2)
+        hypo[s2].append(s1)
+    syn_ld = dict(src.execute("SELECT synsetid, lexdomainid FROM synsets"))
+    syn_lemmas: dict = defaultdict(list)
+    lemma_syns: dict = defaultdict(list)
+    for syn, lemma in src.execute(
+        "SELECT s.synsetid, w.lemma FROM senses s JOIN words w ON w.wordid = s.wordid"
+    ):
+        syn_lemmas[syn].append(lemma)
+        lemma_syns[lemma].append(syn)
+    freq = {w: (fp or 0.0) for (w, fp) in cur.execute("SELECT word, freq_pm FROM words")}
+
+    CAP = 25
+    coord_rows = []
+    for lemma in primary:
+        ld = primary_ld.get(lemma)
+        if ld is None:
+            continue
+        sisters: set = set()
+        for syn in lemma_syns.get(lemma, ()):
+            if syn_ld.get(syn) != ld:
+                continue
+            for h in hyper.get(syn, ()):
+                for child in hypo.get(h, ()):
+                    if child == syn or syn_ld.get(child) != ld:
+                        continue
+                    for lm in syn_lemmas.get(child, ()):
+                        if lm != lemma and lm in wordmap:
+                            sisters.add(lm)
+        if not sisters:
+            continue
+        wid = wordmap[lemma]
+        for lm in sorted(sisters, key=lambda x: (-freq.get(x, 0.0), x))[:CAP]:
+            coord_rows.append((wid, "coordinate", lm, "wordnet"))
+    cur.executemany(
+        "INSERT OR IGNORE INTO word_relation(word_id, rel, target, source) VALUES (?, ?, ?, ?)", coord_rows
+    )
+    con.commit()
+    log_ingest(con, "wordnet",
+               f"{len(wn_updates)} lemmas, {len(rel_rows)} relations, {len(coord_rows)} coordinates",
+               len(wn_updates))
+    print(f"wordnet: {len(coord_rows):,} coordinate rows", flush=True)
     src.close()
     con.close()
 
