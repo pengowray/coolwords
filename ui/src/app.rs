@@ -277,6 +277,41 @@ fn short(s: &Option<String>, n: usize) -> String {
     }
 }
 
+/// Split `text` into (segment, is_match) runs, matching `word` case-insensitively
+/// on whole-word boundaries — used to bold the headword inside an example sentence.
+fn highlight(text: &str, word: &str) -> Vec<(String, bool)> {
+    let w = word.to_lowercase();
+    let hay = text.to_lowercase();
+    let hb = hay.as_bytes();
+    let mut segs = Vec::new();
+    if w.is_empty() {
+        segs.push((text.to_string(), false));
+        return segs;
+    }
+    let (mut last, mut from) = (0usize, 0usize);
+    while let Some(rel) = hay[from..].find(&w) {
+        let start = from + rel;
+        let end = start + w.len();
+        let before_ok = start == 0 || !hb[start - 1].is_ascii_alphanumeric();
+        let after_ok = end == hb.len() || !hb[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            if start > last {
+                segs.push((text[last..start].to_string(), false));
+            }
+            segs.push((text[start..end].to_string(), true));
+            last = end;
+        }
+        from = end;
+    }
+    if last < text.len() {
+        segs.push((text[last..].to_string(), false));
+    }
+    if segs.is_empty() {
+        segs.push((text.to_string(), false));
+    }
+    segs
+}
+
 #[component]
 fn HomePage() -> impl IntoView {
     let book = RwSignal::new(1i64);
@@ -418,7 +453,18 @@ fn HomePage() -> impl IntoView {
                             view! {
                                 <h2>{d.word.clone()}</h2>
                                 <p class="gloss">{d.gloss.clone().unwrap_or_default()}</p>
-                                {d.example.clone().map(|ex| view! { <blockquote class="ex">{ex}</blockquote> })}
+                                {d.example.clone().map(|ex| {
+                                    let segs = highlight(&ex, &d.word);
+                                    view! {
+                                        <blockquote class="ex">
+                                            {segs.into_iter().map(|(s, hit)| if hit {
+                                                view! { <strong>{s}</strong> }.into_any()
+                                            } else {
+                                                view! { {s} }.into_any()
+                                            }).collect_view()}
+                                        </blockquote>
+                                    }
+                                })}
                                 <ul class="meta">
                                     <li>{format!("in this book: {}×", d.in_book)}</li>
                                     <li>{format!("frequency: {:.3}/M", d.freq_pm.unwrap_or(0.0))}</li>
