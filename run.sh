@@ -20,6 +20,9 @@
 #      python -m ingest.embeddings     # fastText vectors -> data/coolwords_emb.npy
 #      python -m ingest.stem           # per-level lemmas word_lemma + lemma_freq (AFTER ngrams/fiction
 #                                      #   for frequency, AND embeddings for the level-3 prefix guard)
+#      python -m ingest.userdb         # create/migrate the separate per-user tag DB (data/user.db);
+#                                      #   self-contained, text-keyed, survives rebuilds. Override path
+#                                      #   for the UI with COOLWORDS_USER_DB. Run once (idempotent).
 #      python -m ingest.stats          # summary / verification report
 #
 #  ---- Analyze a book (book -> per-level scored candidates -> clusters + varied top-20) ----

@@ -77,8 +77,13 @@ def rebuild_legacy(con: sqlite3.Connection) -> None:
 
 
 def init_schema(con: sqlite3.Connection, schema_dir: Path = SCHEMA_PATH.parent) -> None:
-    """Apply every schema/*.sql file (dictionary, books, ...) in name order."""
+    """Apply every schema/*.sql file (dictionary, books, ...) in name order.
+
+    Skips user.sql — per-user tables live in their own database (data/user.db),
+    never in the dictionary DB (see ingest/userdb.py)."""
     for sql in sorted(Path(schema_dir).glob("*.sql")):
+        if sql.name == "user.sql":
+            continue
         con.executescript(sql.read_text(encoding="utf-8"))
     con.commit()
 

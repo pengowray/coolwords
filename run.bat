@@ -20,6 +20,9 @@ REM      python -m ingest.langnames      :: etymology language code -> full Engl
 REM      python -m ingest.embeddings     :: fastText vectors -> data\coolwords_emb.npy
 REM      python -m ingest.stem           :: per-level lemmas word_lemma + lemma_freq (AFTER ngrams/fiction
 REM                                      ::   for frequency, AND embeddings for the level-3 prefix guard)
+REM      python -m ingest.userdb         :: create/migrate the separate per-user tag DB (data\user.db);
+REM                                      ::   self-contained, text-keyed, survives rebuilds. Override path
+REM                                      ::   for the UI with COOLWORDS_USER_DB. Run once (idempotent).
 REM      python -m ingest.stats          :: summary / verification report
 REM
 REM  ---- Analyze a book (book -> per-level scored candidates -> clusters + varied top-20) ----

@@ -9,24 +9,53 @@ use leptos_router::hooks::{query_signal, query_signal_with_options};
 use leptos_router::{NavigateOptions, StaticSegment};
 use serde::{Deserialize, Serialize};
 
-/// Qualitative tags chosen from the picker. `star` is a separate quick toggle and
-/// `pick:<bucket>` tags are generated per word from its POS / noun categories.
-pub const QUAL_TAGS: &[&str] = &["useful", "strange", "interesting", "aesthetic", "emblematic"];
-
-#[cfg(feature = "ssr")]
-fn tag_allowed(tag: &str) -> bool {
-    tag == "star"
-        || QUAL_TAGS.contains(&tag)
-        || (tag.starts_with("pick:")
-            && (6..40).contains(&tag.len())
-            && tag[5..].chars().all(|c| c.is_ascii_alphanumeric() || c == '.'))
+/// A tag definition in the user's collection (builtin defaults + custom tags).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TagDef {
+    pub name: String,
+    pub comment: Option<String>,
+    pub builtin: bool,
 }
 
-/// Shared client-side tag state + the persistence action, passed via context.
+/// Normalize a free-text tag name to its canonical collection form, or None if
+/// it isn't a usable tag. Pure (client + server) so optimistic UI matches storage.
+pub fn sanitize_tag(name: &str) -> Option<String> {
+    let kept: String = name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == ' ' || *c == '-')
+        .collect();
+    let s = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    if (1..=30).contains(&s.chars().count())
+        && s.chars().any(|c| c.is_ascii_alphabetic())
+        && !s.starts_with("pick:")
+    {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+/// A tag value is allowed if it's a contextual `pick:<bucket>` tag or a clean
+/// collection name (set_tag auto-registers brand-new collection tags).
+#[cfg(feature = "ssr")]
+fn tag_allowed(tag: &str) -> bool {
+    if tag.starts_with("pick:") {
+        return (6..40).contains(&tag.len())
+            && tag[5..].chars().all(|c| c.is_ascii_alphanumeric() || c == '.');
+    }
+    sanitize_tag(tag).as_deref() == Some(tag)
+}
+
+/// Shared client-side tag state + the persistence actions + the tag collection,
+/// passed via context.
 #[derive(Clone, Copy)]
 pub struct Tagger {
     pub store: RwSignal<HashMap<(i64, i64), HashSet<String>>>,
     pub action: ServerAction<SetTag>,
+    pub tags: RwSignal<Vec<TagDef>>,
+    pub add: ServerAction<AddTag>,
 }
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
@@ -149,18 +178,66 @@ fn db_path() -> String {
     "../data/coolwords.db".to_string()
 }
 
+/// Path to the per-user database (tags + collection). Self-contained; overridable.
+#[cfg(feature = "ssr")]
+fn user_db_path() -> String {
+    if let Ok(p) = std::env::var("COOLWORDS_USER_DB") {
+        return p;
+    }
+    for p in ["../data/user.db", "data/user.db"] {
+        if std::path::Path::new(p).exists() {
+            return p.to_string();
+        }
+    }
+    "../data/user.db".to_string()
+}
+
+#[cfg(feature = "ssr")]
+const USER_SCHEMA: &str = include_str!("../../schema/user.sql");
+
+/// Open the user DB standalone (creating it + its schema/builtin tags if needed).
+/// Used by the tag-collection server fns that don't touch the dictionary.
+#[cfg(feature = "ssr")]
+fn open_user() -> Result<rusqlite::Connection, ServerFnError> {
+    let u = rusqlite::Connection::open(user_db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    u.execute_batch(USER_SCHEMA).map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(u)
+}
+
+/// Open the dictionary DB with the user DB ATTACHed as `u`, so a single
+/// connection can join words/candidates against the user's tags.
+#[cfg(feature = "ssr")]
+fn open_conn() -> Result<rusqlite::Connection, ServerFnError> {
+    open_user()?; // ensure the user DB + schema exist before attaching
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    conn.execute("ATTACH DATABASE ?1 AS u", rusqlite::params![user_db_path()])
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(conn)
+}
+
+/// Tags for a book as word_id -> tags, resolved from the user DB's text keys
+/// (book slug + headword) back to dictionary word_ids. Requires `u` attached.
 #[cfg(feature = "ssr")]
 fn load_tags(conn: &rusqlite::Connection, book_id: i64) -> Result<HashMap<i64, Vec<String>>, ServerFnError> {
+    use rusqlite::OptionalExtension;
+    let slug: Option<String> = conn
+        .query_row("SELECT slug FROM books WHERE id = ?1", [book_id], |r| r.get(0))
+        .optional()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let Some(slug) = slug else { return Ok(HashMap::new()) };
     let mut stmt = conn
-        .prepare("SELECT word_id, tag FROM word_tags WHERE book_id = ?1 AND rater = 'me'")
+        .prepare(
+            "SELECT w.id, t.tag FROM u.word_tags t JOIN words w ON w.word = t.word
+             WHERE t.book_slug = ?1 AND t.rater = 'me'",
+        )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     let mut map: HashMap<i64, Vec<String>> = HashMap::new();
-    let rows = stmt
-        .query_map([book_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    for r in rows {
-        let (wid, tag) = r.map_err(|e| ServerFnError::new(e.to_string()))?;
-        map.entry(wid).or_default().push(tag);
+    for r in stmt
+        .query_map([slug], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .filter_map(Result::ok)
+    {
+        map.entry(r.0).or_default().push(r.1);
     }
     Ok(map)
 }
@@ -368,12 +445,11 @@ fn book_year(conn: &rusqlite::Connection, book_id: i64) -> Result<Option<i64>, S
 
 #[server]
 pub async fn list_books() -> Result<Vec<Book>, ServerFnError> {
-    use rusqlite::Connection;
-    let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let conn = open_conn()?;
     let mut stmt = conn
         .prepare(
             "SELECT b.id, COALESCE(b.title, b.slug),
-                    (SELECT count(*) FROM word_tags t WHERE t.book_id = b.id AND t.tag = 'star')
+                    (SELECT count(*) FROM u.word_tags t WHERE t.book_slug = b.slug AND t.tag = 'star')
              FROM books b ORDER BY b.id",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -492,8 +568,7 @@ pub async fn get_candidates(
     limit: i32,
     level: i64,
 ) -> Result<Vec<Candidate>, ServerFnError> {
-    use rusqlite::Connection;
-    let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let conn = open_conn()?;
     let tags = load_tags(&conn, book_id)?;
     let buckets = load_buckets(&conn, book_id, level)?;
 
@@ -778,22 +853,42 @@ pub async fn word_detail(book_id: i64, word_id: i64, level: i64) -> Result<WordI
 
 #[server]
 pub async fn set_tag(book_id: i64, word_id: i64, tag: String, on: bool) -> Result<(), ServerFnError> {
-    use rusqlite::Connection;
+    use rusqlite::OptionalExtension;
     if !tag_allowed(&tag) {
-        return Err(ServerFnError::new("unknown tag"));
+        return Err(ServerFnError::new("invalid tag"));
     }
-    let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let conn = open_conn()?;
+    // resolve the stable text keys for this (book, word)
+    let slug: Option<String> = conn
+        .query_row("SELECT slug FROM books WHERE id = ?1", [book_id], |r| r.get(0))
+        .optional()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let word: Option<String> = conn
+        .query_row("SELECT word FROM words WHERE id = ?1", [word_id], |r| r.get(0))
+        .optional()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let (Some(slug), Some(word)) = (slug, word) else {
+        return Err(ServerFnError::new("unknown book or word"));
+    };
     if on {
+        // auto-register a brand-new custom tag into the collection
+        if !tag.starts_with("pick:") {
+            conn.execute(
+                "INSERT OR IGNORE INTO u.tags(name, sort, created) VALUES (?1, 100, datetime('now'))",
+                rusqlite::params![tag],
+            )
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        }
         conn.execute(
-            "INSERT OR IGNORE INTO word_tags(book_id, word_id, tag, rater, ts)
+            "INSERT OR IGNORE INTO u.word_tags(book_slug, word, tag, rater, ts)
              VALUES (?1, ?2, ?3, 'me', datetime('now'))",
-            (book_id, word_id, &tag),
+            rusqlite::params![slug, word, tag],
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     } else {
         conn.execute(
-            "DELETE FROM word_tags WHERE book_id = ?1 AND word_id = ?2 AND tag = ?3 AND rater = 'me'",
-            (book_id, word_id, &tag),
+            "DELETE FROM u.word_tags WHERE book_slug = ?1 AND word = ?2 AND tag = ?3 AND rater = 'me'",
+            rusqlite::params![slug, word, tag],
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     }
@@ -805,9 +900,42 @@ pub async fn set_tag(book_id: i64, word_id: i64, tag: String, on: bool) -> Resul
 /// which makes the family union (cross-level visibility) reactive.
 #[server]
 pub async fn book_tags(book_id: i64) -> Result<Vec<(i64, Vec<String>)>, ServerFnError> {
-    use rusqlite::Connection;
-    let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let conn = open_conn()?;
     Ok(load_tags(&conn, book_id)?.into_iter().collect())
+}
+
+/// The user's whole tag collection (builtin defaults + custom), for the picker.
+#[server]
+pub async fn list_tags() -> Result<Vec<TagDef>, ServerFnError> {
+    let conn = open_user()?;
+    let mut stmt = conn
+        .prepare("SELECT name, comment, builtin FROM tags ORDER BY builtin DESC, sort, name")
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let out = stmt
+        .query_map([], |r| {
+            Ok(TagDef { name: r.get(0)?, comment: r.get(1)?, builtin: r.get::<_, i64>(2)? != 0 })
+        })
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(out)
+}
+
+/// Add a custom tag to the collection (or update its comment if it exists).
+/// Returns the canonical tag name so the client can apply it.
+#[server]
+pub async fn add_tag(name: String, comment: String) -> Result<String, ServerFnError> {
+    let clean = sanitize_tag(&name).ok_or_else(|| ServerFnError::new("invalid tag name"))?;
+    let comment = comment.trim();
+    let comment_opt: Option<&str> = (!comment.is_empty()).then_some(comment);
+    let conn = open_user()?;
+    conn.execute(
+        "INSERT INTO tags(name, comment, builtin, sort, created) VALUES (?1, ?2, 0, 100, datetime('now'))
+         ON CONFLICT(name) DO UPDATE SET comment = COALESCE(excluded.comment, tags.comment)",
+        rusqlite::params![clean, comment_opt],
+    )
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(clean)
 }
 
 // ---- client-side tag helpers (operate on the shared Tagger context) ----
@@ -908,20 +1036,40 @@ fn Star(book_id: i64, word_id: i64) -> impl IntoView {
     }
 }
 
-/// The tag picker: qualitative tags + per-word "good for: <bucket>" picks.
+/// The tag picker: the user's tag collection (with comment tooltips + an inline
+/// "new tag" adder) plus per-word "good for: <bucket>" picks.
 #[component]
 fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView {
     let t = expect_context::<Tagger>();
     let key = (book_id, word_id);
     let has_buckets = !buckets.is_empty();
+    let new_name = RwSignal::new(String::new());
+    let new_comment = RwSignal::new(String::new());
+    let add_new = move || {
+        let raw = new_name.get();
+        let Some(clean) = sanitize_tag(&raw) else { return };
+        t.add.dispatch(AddTag { name: raw, comment: new_comment.get() });
+        if !has_tag(t, key, &clean) {
+            toggle_tag(t, book_id, word_id, &clean);
+        }
+        new_name.set(String::new());
+        new_comment.set(String::new());
+    };
     view! {
         <div class="picker">
             <div class="pickgroup">
-                {QUAL_TAGS.iter().map(|&tag| {
-                    let on = move || has_tag(t, key, tag);
+                // collection chips (everything except the quick-toggle ★ star)
+                {move || t.tags.get().into_iter().filter(|d| d.name != "star").map(|d| {
+                    let name = d.name.clone();
+                    let on_name = name.clone();
+                    let click_name = name.clone();
+                    let title = d.comment.clone().unwrap_or_default();
                     view! {
-                        <button type="button" class="chip" class:on=on
-                            on:click=move |_| toggle_tag(t, book_id, word_id, tag)>{tag}</button>
+                        <button type="button" class="chip" title=title
+                            class:on=move || has_tag(t, key, &on_name)
+                            on:click=move |_| toggle_tag(t, book_id, word_id, &click_name)>
+                            {name}
+                        </button>
                     }
                 }).collect_view()}
             </div>
@@ -940,6 +1088,17 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                     }).collect_view()}
                 </div>
             })}
+            <div class="pickgroup newtag">
+                <input class="newtag-name" placeholder="+ new tag"
+                    prop:value=move || new_name.get()
+                    on:input=move |ev| new_name.set(event_target_value(&ev))
+                    on:keydown=move |ev| if ev.key() == "Enter" { add_new(); }/>
+                <input class="newtag-comment" placeholder="what it's for (optional)"
+                    prop:value=move || new_comment.get()
+                    on:input=move |ev| new_comment.set(event_target_value(&ev))
+                    on:keydown=move |ev| if ev.key() == "Enter" { add_new(); }/>
+                <button type="button" class="chip add" on:click=move |_| add_new()>"add"</button>
+            </div>
         </div>
     }
 }
@@ -998,8 +1157,21 @@ fn HomePage() -> impl IntoView {
     let only_top = RwSignal::new(false);
     let open_picker = RwSignal::new(None::<i64>);
 
-    let tagger = Tagger { store: RwSignal::new(HashMap::new()), action: ServerAction::<SetTag>::new() };
+    let tagger = Tagger {
+        store: RwSignal::new(HashMap::new()),
+        action: ServerAction::<SetTag>::new(),
+        tags: RwSignal::new(Vec::new()),
+        add: ServerAction::<AddTag>::new(),
+    };
     provide_context(tagger);
+
+    // The tag collection (builtin + custom), refetched whenever a tag is added.
+    let tag_defs = Resource::new(move || tagger.add.version().get(), |_| list_tags());
+    Effect::new(move |_| {
+        if let Some(Ok(defs)) = tag_defs.get() {
+            tagger.tags.set(defs);
+        }
+    });
 
     let books = Resource::new(|| (), |_| list_books());
     let categories = Resource::new(move || (book.get(), level.get()), |(b, l)| list_categories(b, l));

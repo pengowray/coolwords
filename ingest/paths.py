@@ -29,4 +29,7 @@ GOOGLENEWS_BIN_GZ = WORDVEC_DIR / "GoogleNews-vectors-negative300.bin.gz"
 # Build artifacts (relative to the project root).
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = PROJECT_ROOT / "data" / "coolwords.db"
+# Per-user data (tags + tag collection), separate & self-contained. The UI may
+# override this with the COOLWORDS_USER_DB env var.
+USER_DB_PATH = PROJECT_ROOT / "data" / "user.db"
 SCHEMA_PATH = PROJECT_ROOT / "schema" / "dictionary.sql"

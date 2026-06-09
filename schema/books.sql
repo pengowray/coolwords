@@ -59,17 +59,10 @@ CREATE TABLE IF NOT EXISTS ratings (
     PRIMARY KEY (book_id, word_id, rater)
 );
 
--- Multi-tag human judgments: a row's PRESENCE means the tag is ON for (book, word).
--- Toggling a tag off deletes its row. Replaces the single ratings.verdict.
-CREATE TABLE IF NOT EXISTS word_tags (
-    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
-    word_id INTEGER NOT NULL REFERENCES words(id),
-    tag     TEXT    NOT NULL,         -- useful | strange | interesting | aesthetic | emblematic | category-pick
-    rater   TEXT    NOT NULL DEFAULT 'me',
-    ts      TEXT,
-    PRIMARY KEY (book_id, word_id, tag, rater)
-);
-CREATE INDEX IF NOT EXISTS idx_word_tags_book_word ON word_tags(book_id, word_id);
+-- NOTE: human tags now live in their own self-contained database (data/user.db,
+-- schema/user.sql), keyed by stable text (book slug + headword) so they survive
+-- re-imports and dictionary rebuilds. The old word_tags table here is migrated
+-- and dropped by ingest/userdb.py.
 
 -- Speeds the relation-target "is it in this book?" LEFT JOIN in word_detail.
 CREATE INDEX IF NOT EXISTS idx_bo_wordid_book ON book_occurrences(word_id, book_id);

@@ -89,6 +89,14 @@ h1 { margin-bottom: 0; }
 .chip:hover { border-color: #888; }
 .chip.on { background: #3498db; color: #fff; border-color: #3498db; }
 .chip.pick.on { background: #16a085; border-color: #16a085; }
+.pickgroup.newtag { gap: 4px; margin-top: 5px; border-top: 1px solid #8883; padding-top: 5px; }
+.newtag input {
+  font-size: 0.75rem; padding: 1px 6px; border: 1px solid #8884; border-radius: 8px;
+  background: Canvas; color: inherit;
+}
+.newtag-name { width: 7rem; }
+.newtag-comment { width: 10rem; }
+.chip.add { background: #16a085; color: #fff; border-color: #16a085; }
 .detail-tags { display: flex; align-items: flex-start; gap: 0.4rem; margin: 0.3rem 0 0.6rem; }
 .catsel, .lvlsel { padding: 0.2rem 0.3rem; border-radius: 6px; }
 .forms { color: #16a085; font-size: 0.72rem; font-weight: 600; }
