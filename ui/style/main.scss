@@ -91,6 +91,11 @@ h1 { margin-bottom: 0; }
 .chip.pick.on { background: #16a085; border-color: #16a085; }
 .detail-tags { display: flex; align-items: flex-start; gap: 0.4rem; margin: 0.3rem 0 0.6rem; }
 .catsel { padding: 0.2rem 0.3rem; border-radius: 6px; }
+.catx {
+  border: 1px solid #8884; background: transparent; border-radius: 50%;
+  width: 1.5rem; height: 1.5rem; cursor: pointer; color: #999; line-height: 1; padding: 0;
+}
+.catx:hover { border-color: #c0392b; color: #c0392b; }
 
 /* usage-over-time sparkline */
 .traj { display: block; margin: 0.5rem 0; }

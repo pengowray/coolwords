@@ -134,7 +134,8 @@ fn load_tags(conn: &rusqlite::Connection, book_id: i64) -> Result<HashMap<i64, V
     Ok(map)
 }
 
-/// Per-word "pick:" buckets: POS (noun/verb/adj/adv) + noun.X category suffixes.
+/// Per-word "pick:" buckets: POS (noun/verb/adj/adv) + full WordNet lexname
+/// categories (noun.animal, verb.communication, ...), minus the generic *.all.
 #[cfg(feature = "ssr")]
 fn load_buckets(conn: &rusqlite::Connection, book_id: i64) -> Result<HashMap<i64, Vec<String>>, ServerFnError> {
     let mut m: HashMap<i64, BTreeSet<String>> = HashMap::new();
@@ -154,16 +155,13 @@ fn load_buckets(conn: &rusqlite::Connection, book_id: i64) -> Result<HashMap<i64
         .prepare(
             "SELECT DISTINCT wc.word_id, wc.category FROM word_category wc
              JOIN candidates c ON c.word_id = wc.word_id
-             WHERE c.book_id = ?1 AND wc.category LIKE 'noun.%'",
+             WHERE c.book_id = ?1 AND wc.category NOT LIKE '%.all' AND wc.category <> 'noun.Tops'",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     for r in s2.query_map([book_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
         .map_err(|e| ServerFnError::new(e.to_string()))?.filter_map(Result::ok)
     {
-        let suf = &r.1[5..];
-        if suf != "Tops" {
-            m.entry(r.0).or_default().insert(suf.to_string());
-        }
+        m.entry(r.0).or_default().insert(r.1);
     }
     Ok(m.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect())
 }
@@ -180,15 +178,12 @@ fn word_buckets(conn: &rusqlite::Connection, word_id: i64) -> Result<Vec<String>
         set.insert(p);
     }
     let mut s2 = conn
-        .prepare("SELECT DISTINCT category FROM word_category WHERE word_id = ?1 AND category LIKE 'noun.%'")
+        .prepare("SELECT DISTINCT category FROM word_category WHERE word_id = ?1 AND category NOT LIKE '%.all' AND category <> 'noun.Tops'")
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     for c in s2.query_map([word_id], |r| r.get::<_, String>(0))
         .map_err(|e| ServerFnError::new(e.to_string()))?.filter_map(Result::ok)
     {
-        let suf = &c[5..];
-        if suf != "Tops" {
-            set.insert(suf.to_string());
-        }
+        set.insert(c);
     }
     Ok(set.into_iter().collect())
 }
@@ -648,7 +643,7 @@ fn HomePage() -> impl IntoView {
                             let id = b.id;
                             view! {
                                 <button class:active=move || book.get() == id
-                                    on:click=move |_| { set_book.set(Some(id)); set_word.set(None); set_cat.set(None); }>
+                                    on:click=move |_| { set_book.set(Some(id)); set_word.set(None); }>
                                     {format!("{} ({}★)", b.title, b.n_selected)}
                                 </button>
                             }
@@ -674,19 +669,15 @@ fn HomePage() -> impl IntoView {
                     }.into_any(),
                 })}
             </Suspense>
+            <Show when=move || category.get().is_some() fallback=|| ()>
+                <button class="catx" title="clear category filter" on:click=move |_| set_cat.set(None)>"×"</button>
+            </Show>
             <label class="toggle">
                 <input type="checkbox" prop:checked=move || only_top.get()
                     on:change=move |_| only_top.update(|v| *v = !*v)/>
                 " varied top-20 only"
             </label>
         </div>
-
-        <Show when=move || category.get().is_some() fallback=|| ()>
-            <p class="filter">
-                {move || format!("category: {}", category.get().unwrap_or_default())}
-                <button class="clear" on:click=move |_| set_cat.set(None)>"clear"</button>
-            </p>
-        </Show>
 
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
             {move || candidates.get().map(|res| match res {
