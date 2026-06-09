@@ -26,6 +26,37 @@ h1 { margin-bottom: 0; }
 .star { color: #f1c40f; width: 1rem; }
 .gloss { color: #999; font-size: 0.88rem; max-width: 26rem; }
 
+.word { cursor: pointer; }
+.word:hover { text-decoration: underline; }
+.cat { cursor: pointer; color: #2980b9; }
+.cat:hover { text-decoration: underline; }
+.filter { background: #3498db18; padding: 0.3rem 0.6rem; border-radius: 6px; display: inline-block; }
+.filter .clear, .catchip {
+  margin-left: 0.5rem; border: 1px solid #8886; background: transparent;
+  border-radius: 4px; padding: 0.05rem 0.4rem; cursor: pointer; font-size: 0.8rem;
+}
+.catchip { margin: 0 0.25rem 0.25rem 0; color: #2980b9; }
+
+/* detail side panel */
+.detail {
+  position: fixed; top: 0; right: 0; width: 24rem; height: 100vh; overflow-y: auto;
+  background: Canvas; border-left: 1px solid #8886; box-shadow: -4px 0 16px #0002;
+  padding: 1.2rem 1.4rem;
+}
+.detail h2 { margin: 0 1.5rem 0.2rem 0; }
+.detail .close {
+  position: absolute; top: 0.6rem; right: 0.8rem; border: none; background: transparent;
+  font-size: 1.4rem; cursor: pointer; color: #888;
+}
+.detail .ex { border-left: 3px solid #8884; margin: 0.6rem 0; padding: 0.2rem 0.8rem; color: #777; font-style: italic; }
+.detail .meta { list-style: none; padding: 0; color: #666; font-size: 0.9rem; }
+.detail .meta li { display: inline-block; margin-right: 1rem; }
+.detail .caps { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; color: #999; margin: 0.8rem 0 0.2rem; }
+.detail .base { background: #f39c1218; border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.9rem; }
+.detail .family, .detail .rels { margin: 0.2rem 0; padding-left: 1.1rem; font-size: 0.9rem; }
+.detail .rel { color: #2980b9; }
+.detail-actions { margin-top: 1rem; }
+
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: 0.3rem 0.6rem; border-bottom: 1px solid #8884; }
 th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: #888; }
