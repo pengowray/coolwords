@@ -104,6 +104,12 @@ h1 { margin-bottom: 0; }
 .traj-yr { fill: #c0392b; font-size: 8px; }
 .traj-ax { fill: #999; font-size: 8px; }
 .traj-empty { color: #aaa; font-size: 0.85rem; }
+.era { margin: 0.1rem 0 0.4rem; font-size: 0.85rem; color: #888; cursor: help; }
+.era strong { color: #b9770e; }
+
+/* filter dropdown optgroups */
+.catsel optgroup { font-style: normal; font-weight: 600; }
+.catsel option { font-weight: 400; }
 
 /* grouped relations */
 .rels { list-style: none; padding-left: 0; font-size: 0.9rem; }

@@ -54,10 +54,16 @@ pub struct Book {
     pub n_selected: i64,
 }
 
+/// One entry in the filter dropdown. `value` is what goes in the `cat` query
+/// param; `group` lets the UI break entries into <optgroup>s. Values use a small
+/// namespace: `pos:noun`, a raw lexname like `noun.animal`, `origin:unusual`, or
+/// `era:of` / `era:before` / `era:old` / `era:timeless`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CatCount {
-    pub category: String,
+pub struct FilterOpt {
+    pub value: String,
+    pub label: String,
     pub count: i64,
+    pub group: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -103,6 +109,9 @@ pub struct WordInfo {
     pub family: Vec<(String, i64, f64)>,
     pub relations: Vec<RelTarget>,
     pub trajectory: Vec<(i32, f64)>,
+    /// Usage trajectory relative to the book's year, as a human label:
+    /// "of its time" / "before its time" / "old fashioned" / "timeless".
+    pub era: Option<String>,
 }
 
 #[cfg(feature = "ssr")]
@@ -188,6 +197,106 @@ fn word_buckets(conn: &rusqlite::Connection, word_id: i64) -> Result<Vec<String>
     Ok(set.into_iter().collect())
 }
 
+/// Etymology-language codes that are the *ordinary* substrate of English: Old/
+/// Middle English, Latin, the French/Norman family, Ancient Greek, the Germanic/
+/// Norse/Dutch/German continuum, plus the generic PIE / translingual roots. A word
+/// counts as "unusual origin" when it has an etymology language NOT in this set
+/// (e.g. Hindi, Italian, Spanish, Powhatan, Quechua, Persian, Malay…).
+#[cfg(feature = "ssr")]
+const COMMON_ORIGINS: &[&str] = &[
+    "ang", "enm", "ang-nrt", "la", "la-med", "la-new", "la-vul", "fr", "fro", "frm",
+    "xno", "nrf", "grc", "el", "gem-pro", "gem", "gmw", "gmq", "non", "gml", "gmh",
+    "goh", "nds", "osx", "got", "dum", "odt", "nl", "de", "ine-pro", "mul", "sco",
+];
+
+#[cfg(feature = "ssr")]
+fn common_origins_sql() -> String {
+    // All literals are hardcoded ASCII codes, so direct interpolation is safe.
+    COMMON_ORIGINS.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(",")
+}
+
+/// Classify a word's usage trajectory relative to a book's publication decade.
+/// Returns a short key: "of" (peaked around the book era), "before" (took off
+/// later — the book used it ahead of its time), "old" (already commoner before),
+/// or "timeless" (roughly steady). `None` when there isn't enough data.
+#[cfg(feature = "ssr")]
+fn classify_era(traj: &[(i32, f64)], book_year: Option<i64>) -> Option<&'static str> {
+    let year = book_year?;
+    if traj.len() < 3 {
+        return None;
+    }
+    let bdec = (year as f64 / 10.0).floor() as i32 * 10;
+    let mean = |lo: i32, hi: i32| -> Option<f64> {
+        let v: Vec<f64> = traj.iter().filter(|(d, _)| *d >= lo && *d <= hi).map(|(_, p)| *p).collect();
+        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+    };
+    // usage around the book era; missing pre/post windows default to `at` so a
+    // book at the edge of the data isn't misread as a trend.
+    let at = mean(bdec - 10, bdec + 10).unwrap_or(0.0);
+    let before = mean(i32::MIN, bdec - 20).unwrap_or(at);
+    let after = mean(bdec + 20, i32::MAX).unwrap_or(at);
+    let peak = before.max(at).max(after);
+    if peak <= 0.0 {
+        return None;
+    }
+    let trough = before.min(at).min(after);
+    if (peak - trough) / peak < 0.25 {
+        return Some("timeless");
+    }
+    if at >= before && at >= after {
+        return Some("of");
+    }
+    if after > before {
+        return Some("before");
+    }
+    Some("old")
+}
+
+#[cfg(feature = "ssr")]
+fn era_label(key: &str) -> &'static str {
+    match key {
+        "of" => "of its time",
+        "before" => "before its time",
+        "old" => "old fashioned",
+        "timeless" => "timeless",
+        _ => "",
+    }
+}
+
+/// All candidate word trajectories for a book, keyed by word_id.
+#[cfg(feature = "ssr")]
+fn book_trajectories(
+    conn: &rusqlite::Connection,
+    book_id: i64,
+) -> Result<HashMap<i64, Vec<(i32, f64)>>, ServerFnError> {
+    let mut m: HashMap<i64, Vec<(i32, f64)>> = HashMap::new();
+    let mut s = conn
+        .prepare(
+            "SELECT t.word_id, t.decade, t.pm FROM word_trajectory t
+             JOIN candidates c ON c.word_id = t.word_id
+             WHERE c.book_id = ?1 ORDER BY t.word_id, t.decade",
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    for r in s
+        .query_map([book_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as i32, r.get::<_, f64>(2)?)))
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .filter_map(Result::ok)
+    {
+        m.entry(r.0).or_default().push((r.1, r.2));
+    }
+    Ok(m)
+}
+
+#[cfg(feature = "ssr")]
+fn book_year(conn: &rusqlite::Connection, book_id: i64) -> Result<Option<i64>, ServerFnError> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row("SELECT year FROM books WHERE id = ?1", [book_id], |r| r.get::<_, Option<i64>>(0))
+        .optional()
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .flatten())
+}
+
 #[server]
 pub async fn list_books() -> Result<Vec<Book>, ServerFnError> {
     use rusqlite::Connection;
@@ -210,9 +319,66 @@ pub async fn list_books() -> Result<Vec<Book>, ServerFnError> {
 }
 
 #[server]
-pub async fn list_categories(book_id: i64) -> Result<Vec<CatCount>, ServerFnError> {
+pub async fn list_categories(book_id: i64) -> Result<Vec<FilterOpt>, ServerFnError> {
     use rusqlite::Connection;
     let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut out: Vec<FilterOpt> = Vec::new();
+    let opt = |value: String, label: String, count: i64, group: &str| FilterOpt {
+        value, label, count, group: group.to_string(),
+    };
+
+    // --- part of speech ---
+    let mut ps = conn
+        .prepare(
+            "SELECT wp.pos, count(DISTINCT c.word_id) FROM candidates c
+             JOIN word_pos wp ON wp.word_id = c.word_id
+             WHERE c.book_id = ?1 AND wp.pos IN ('noun','verb','adj','adv') GROUP BY wp.pos",
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let pos_counts: HashMap<String, i64> = ps
+        .query_map([book_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .filter_map(Result::ok)
+        .collect();
+    for p in ["noun", "verb", "adj", "adv"] {
+        if let Some(&n) = pos_counts.get(p) {
+            out.push(opt(format!("pos:{p}"), p.to_string(), n, "part of speech"));
+        }
+    }
+
+    // --- era (relative to the book's year), classified from each word's trajectory ---
+    let year = book_year(&conn, book_id)?;
+    let traj = book_trajectories(&conn, book_id)?;
+    let mut era_counts: HashMap<&str, i64> = HashMap::new();
+    for t in traj.values() {
+        if let Some(k) = classify_era(t, year) {
+            *era_counts.entry(k).or_default() += 1;
+        }
+    }
+    for key in ["before", "of", "old", "timeless"] {
+        if let Some(&n) = era_counts.get(key) {
+            out.push(opt(format!("era:{key}"), era_label(key).to_string(), n, "era (vs. book's year)"));
+        }
+    }
+
+    // --- unusual origin ---
+    let n_origin: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(DISTINCT c.word_id) FROM candidates c JOIN words w ON w.id = c.word_id
+                 WHERE c.book_id = ?1 AND w.etymology_lang IS NOT NULL
+                   AND w.etymology_lang NOT IN ({})",
+                common_origins_sql()
+            ),
+            [book_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if n_origin > 0 {
+        out.push(opt("origin:unusual".to_string(), "unusual origin".to_string(), n_origin, "origin"));
+    }
+
+    // --- precise WordNet categories (lexnames) ---
     let mut stmt = conn
         .prepare(
             "SELECT wc.category, count(DISTINCT c.word_id) n
@@ -220,13 +386,14 @@ pub async fn list_categories(book_id: i64) -> Result<Vec<CatCount>, ServerFnErro
              WHERE c.book_id = ?1 GROUP BY wc.category ORDER BY n DESC, wc.category",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let rows = stmt
-        .query_map([book_id], |r| Ok(CatCount { category: r.get(0)?, count: r.get(1)? }))
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r.map_err(|e| ServerFnError::new(e.to_string()))?);
+    for r in stmt
+        .query_map([book_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .filter_map(Result::ok)
+    {
+        out.push(opt(r.0.clone(), r.0, r.1, "category"));
     }
+
     Ok(out)
 }
 
@@ -240,50 +407,91 @@ pub async fn get_candidates(
     let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
     let tags = load_tags(&conn, book_id)?;
     let buckets = load_buckets(&conn, book_id)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT w.id, w.word, c.in_book, c.score, w.gloss, w.etymology_lang, ln.name,
-                    w.wordnet_category, c.cluster, c.selected, bo.example
-             FROM candidates c
-             JOIN words w ON w.id = c.word_id
-             LEFT JOIN lang_names ln ON ln.code = w.etymology_lang
-             LEFT JOIN book_occurrences bo ON bo.book_id = c.book_id AND bo.word_id = c.word_id
-             WHERE c.book_id = ?1
-               AND (?2 IS NULL OR EXISTS (
-                     SELECT 1 FROM word_category wc WHERE wc.word_id = w.id AND wc.category = ?2))
-             ORDER BY c.rank
-             LIMIT ?3",
-        )
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let rows = stmt
-        .query_map(rusqlite::params![book_id, category, limit], |row| {
-            Ok(Candidate {
-                word_id: row.get(0)?,
-                word: row.get(1)?,
-                in_book: row.get(2)?,
-                score: row.get(3)?,
-                gloss: row.get(4)?,
-                origin_code: row.get(5)?,
-                origin_name: row.get(6)?,
-                category: row.get(7)?,
-                cluster: row.get(8)?,
-                selected: row.get::<_, i64>(9)? != 0,
-                example: row.get(10)?,
-                tags: Vec::new(),
-                buckets: Vec::new(),
-            })
+
+    // Parse the filter spec held in the `cat` param. Exactly one filter is ever
+    // active (single-select dropdown). `era:` is resolved in Rust from each word's
+    // trajectory; the rest become a SQL WHERE fragment.
+    let cat = category.as_deref().unwrap_or("");
+    let era_filter = cat.strip_prefix("era:");
+    let mut where_extra = String::new();
+    let mut bind_cat: Option<String> = None; // bound as ?2 when present
+    if let Some(p) = cat.strip_prefix("pos:") {
+        where_extra =
+            " AND EXISTS (SELECT 1 FROM word_pos wp WHERE wp.word_id = w.id AND wp.pos = ?2)".into();
+        bind_cat = Some(p.to_string());
+    } else if cat == "origin:unusual" {
+        where_extra = format!(
+            " AND w.etymology_lang IS NOT NULL AND w.etymology_lang NOT IN ({})",
+            common_origins_sql()
+        );
+    } else if era_filter.is_none() && !cat.is_empty() {
+        where_extra =
+            " AND EXISTS (SELECT 1 FROM word_category wc WHERE wc.word_id = w.id AND wc.category = ?2)"
+                .into();
+        bind_cat = Some(cat.to_string());
+    }
+
+    // era needs every candidate (to classify), so fetch unbounded and truncate
+    // after filtering; otherwise push the limit into SQL.
+    let limit_sql = if era_filter.is_some() { String::new() } else { format!(" LIMIT {}", limit.max(0)) };
+    let sql = format!(
+        "SELECT w.id, w.word, c.in_book, c.score, w.gloss, w.etymology_lang, ln.name,
+                w.wordnet_category, c.cluster, c.selected, bo.example
+         FROM candidates c
+         JOIN words w ON w.id = c.word_id
+         LEFT JOIN lang_names ln ON ln.code = w.etymology_lang
+         LEFT JOIN book_occurrences bo ON bo.book_id = c.book_id AND bo.word_id = c.word_id
+         WHERE c.book_id = ?1{where_extra}
+         ORDER BY c.rank{limit_sql}"
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<Candidate> {
+        Ok(Candidate {
+            word_id: row.get(0)?,
+            word: row.get(1)?,
+            in_book: row.get(2)?,
+            score: row.get(3)?,
+            gloss: row.get(4)?,
+            origin_code: row.get(5)?,
+            origin_name: row.get(6)?,
+            category: row.get(7)?,
+            cluster: row.get(8)?,
+            selected: row.get::<_, i64>(9)? != 0,
+            example: row.get(10)?,
+            tags: Vec::new(),
+            buckets: Vec::new(),
         })
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let mut out = Vec::new();
-    for r in rows {
-        let mut c = r.map_err(|e| ServerFnError::new(e.to_string()))?;
+    };
+    let mut out: Vec<Candidate> = match &bind_cat {
+        Some(v) => stmt
+            .query_map(rusqlite::params![book_id, v], map_row)
+            .map_err(|e| ServerFnError::new(e.to_string()))?
+            .filter_map(Result::ok)
+            .collect(),
+        None => stmt
+            .query_map(rusqlite::params![book_id], map_row)
+            .map_err(|e| ServerFnError::new(e.to_string()))?
+            .filter_map(Result::ok)
+            .collect(),
+    };
+
+    if let Some(era) = era_filter {
+        let year = book_year(&conn, book_id)?;
+        let traj = book_trajectories(&conn, book_id)?;
+        out.retain(|c| {
+            traj.get(&c.word_id).and_then(|t| classify_era(t, year)).is_some_and(|k| k == era)
+        });
+        out.truncate(limit.max(0) as usize);
+    }
+
+    for c in &mut out {
         if let Some(t) = tags.get(&c.word_id) {
             c.tags = t.clone();
         }
         if let Some(b) = buckets.get(&c.word_id) {
             c.buckets = b.clone();
         }
-        out.push(c);
     }
     Ok(out)
 }
@@ -396,9 +604,11 @@ pub async fn word_detail(book_id: i64, word_id: i64) -> Result<WordInfo, ServerF
         .filter_map(Result::ok)
         .collect();
 
+    let era = classify_era(&trajectory, book_year).map(|k| era_label(k).to_string());
+
     Ok(WordInfo {
         word_id, word, gloss, origin_code, origin_name, freq_pm, syllables, in_book, example,
-        book_year, categories, buckets, base, family, relations, trajectory,
+        book_year, categories, buckets, base, family, relations, trajectory, era,
     })
 }
 
@@ -657,19 +867,35 @@ fn HomePage() -> impl IntoView {
             <Suspense fallback=|| ()>
                 {move || categories.get().map(|res| match res {
                     Err(_) => ().into_any(),
-                    Ok(cats) => view! {
-                        <select class="catsel"
-                            prop:value=move || category.get().unwrap_or_default()
-                            on:change=move |ev| {
-                                let v = event_target_value(&ev);
-                                if v.is_empty() { set_cat.set(None); } else { set_cat.set(Some(v)); }
-                            }>
-                            <option value="">"all categories"</option>
-                            {cats.into_iter().map(|cc| view! {
-                                <option value=cc.category.clone()>{format!("{} ({})", cc.category, cc.count)}</option>
-                            }).collect_view()}
-                        </select>
-                    }.into_any(),
+                    Ok(opts) => {
+                        // opts arrive in group order; fold consecutive runs into <optgroup>s.
+                        let mut groups: Vec<(String, Vec<FilterOpt>)> = Vec::new();
+                        for o in opts {
+                            match groups.last_mut() {
+                                Some(g) if g.0 == o.group => g.1.push(o),
+                                _ => groups.push((o.group.clone(), vec![o])),
+                            }
+                        }
+                        view! {
+                            <select class="catsel"
+                                prop:value=move || category.get().unwrap_or_default()
+                                on:change=move |ev| {
+                                    let v = event_target_value(&ev);
+                                    if v.is_empty() { set_cat.set(None); } else { set_cat.set(Some(v)); }
+                                }>
+                                <option value="">"all categories"</option>
+                                {groups.into_iter().map(|(g, items)| view! {
+                                    <optgroup label=g>
+                                        {items.into_iter().map(|o| view! {
+                                            <option value=o.value.clone()>
+                                                {format!("{} ({})", o.label, o.count)}
+                                            </option>
+                                        }).collect_view()}
+                                    </optgroup>
+                                }).collect_view()}
+                            </select>
+                        }.into_any()
+                    }
                 })}
             </Suspense>
             <Show when=move || category.get().is_some() fallback=|| ()>
@@ -785,6 +1011,12 @@ fn HomePage() -> impl IntoView {
                                     <li>{format!("origin: {origin}")}</li>
                                 </ul>
                                 <Trajectory data=d.trajectory.clone() book_year=d.book_year/>
+                                {d.era.clone().map(|e| view! {
+                                    <p class="era"
+                                        title="usage trajectory relative to this book's decade: of its time = peaked around then; before its time = took off later; old fashioned = was commoner before; timeless = roughly steady">
+                                        "usage: " <strong>{e}</strong>
+                                    </p>
+                                })}
                                 <Show when={let c = d.categories.clone(); move || !c.is_empty()} fallback=|| ()>
                                     <p class="caps">"categories: "
                                         {d.categories.clone().into_iter().map(|cat| {
