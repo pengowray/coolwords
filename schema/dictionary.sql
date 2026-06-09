@@ -165,6 +165,12 @@ CREATE TABLE IF NOT EXISTS fiction_freq (
 );
 CREATE INDEX IF NOT EXISTS idx_fiction_freq_rank ON fiction_freq(rank);
 
+-- Etymology language code -> full English name (ingest/langnames.py), for display.
+CREATE TABLE IF NOT EXISTS lang_names (
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
 -- Append-only record of each ingest run.
 CREATE TABLE IF NOT EXISTS ingest_log (
     source TEXT,
