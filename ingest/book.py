@@ -30,8 +30,28 @@ def strip_boilerplate(text: str) -> str:
     return text
 
 
+def window_around(sentence: str, token: str, max_len: int) -> str:
+    """A <= max_len snippet of `sentence` centered on the first whole-word
+    (case-insensitive) occurrence of `token`, with ellipses where trimmed, so the
+    word is always included even in very long sentences."""
+    if len(sentence) <= max_len:
+        return sentence
+    m = re.search(r"(?<![a-z])" + re.escape(token) + r"(?![a-z])", sentence, re.I)
+    if m is None:
+        return sentence[:max_len].rstrip() + "…"
+    half = max(0, (max_len - (m.end() - m.start())) // 2)
+    hi = min(len(sentence), max(m.start() - half, 0) + max_len)
+    lo = max(0, hi - max_len)
+    snip = sentence[lo:hi].strip()
+    if lo > 0:
+        snip = "…" + snip
+    if hi < len(sentence):
+        snip = snip + "…"
+    return snip
+
+
 def tokenize(text: str) -> tuple[Counter, dict[str, str]]:
-    """Return (token counts, token -> first in-book sentence)."""
+    """Return (token counts, token -> first in-book sentence, windowed on the token)."""
     flat = re.sub(r"\s+", " ", text).replace("’", "'")
     counts: Counter = Counter()
     examples: dict[str, str] = {}
@@ -43,7 +63,7 @@ def tokenize(text: str) -> tuple[Counter, dict[str, str]]:
         for t in toks:
             counts[t] += 1
             if t not in examples:
-                examples[t] = snippet[:_MAX_EXAMPLE]
+                examples[t] = window_around(snippet, t, _MAX_EXAMPLE)
     return counts, examples
 
 
