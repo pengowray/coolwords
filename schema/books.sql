@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS books (
     author      TEXT,
     source      TEXT,                 -- 'gutenberg'
     source_id   TEXT,
+    year        INTEGER,              -- publication year (for the usage-over-time marker)
     n_tokens    INTEGER,              -- total word tokens after boilerplate strip
     n_types     INTEGER,              -- distinct lowercased token types
     ingested_at TEXT

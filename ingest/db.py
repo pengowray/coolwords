@@ -38,6 +38,9 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     "book_occurrences": [
         ("example", "TEXT"),
     ],
+    "books": [
+        ("year", "INTEGER"),
+    ],
 }
 
 

@@ -75,6 +75,7 @@ def main() -> None:
     ap.add_argument("--author", default="")
     ap.add_argument("--source", default="gutenberg")
     ap.add_argument("--source-id", default="")
+    ap.add_argument("--year", type=int, default=None)
     args = ap.parse_args()
 
     with open(args.path, encoding="utf-8") as f:
@@ -98,9 +99,9 @@ def main() -> None:
     con.execute("INSERT OR IGNORE INTO books(slug) VALUES (?)", (args.slug,))
     book_id = con.execute("SELECT id FROM books WHERE slug = ?", (args.slug,)).fetchone()[0]
     con.execute(
-        "UPDATE books SET title=?, author=?, source=?, source_id=?, n_tokens=?, n_types=?, "
+        "UPDATE books SET title=?, author=?, source=?, source_id=?, year=?, n_tokens=?, n_types=?, "
         "ingested_at=datetime('now') WHERE id=?",
-        (args.title, args.author, args.source, args.source_id, n_tokens, len(tokens), book_id),
+        (args.title, args.author, args.source, args.source_id, args.year, n_tokens, len(tokens), book_id),
     )
     con.execute("DELETE FROM book_occurrences WHERE book_id = ?", (book_id,))
     con.executemany(
