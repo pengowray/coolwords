@@ -1454,7 +1454,11 @@ fn HomePage() -> impl IntoView {
                                          format!("likely a variant of a more common word: {} ({:.1}/M)", bb.0, bb.1)}
                                     </p>
                                 </Show>
-                                <Show when={let f = d.family.clone(); move || f.len() > 1} fallback=|| ()>
+                                // Show the merged forms whenever there's more than one, OR the single
+                                // in-book form differs from the headword (the lemma isn't itself in the
+                                // book) — so a merged entry like "sev" isn't left looking orphaned.
+                                <Show when={let f = d.family.clone(); let hw = d.word.clone();
+                                            move || f.len() > 1 || f.iter().any(|m| m.1 != hw)} fallback=|| ()>
                                     <p class="caps">"forms merged here (★ to tag a variant):"</p>
                                     <ul class="family">
                                         {d.family.clone().into_iter().map(|(fwid, fw, n, fp)| view! {

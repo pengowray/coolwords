@@ -58,23 +58,37 @@ COS_MIN = 0.35
 LEVELS = (1, 2, 3)
 
 
-def base_of(word: str, freq: dict, rules: list, adj: set | None = None, aggressive: bool = False) -> str | None:
+def base_of(word: str, freq: dict, rules: list, adj: set | None = None,
+            aggressive: bool = False, vec_ok=None) -> str | None:
     """One suffix-strip step to the max-frequency real word in the family.
 
     Levels 1-2 gate comparative suffixes (CMP) on the base being an adjective, so
-    agentive -er stays split (baker, hatter). The aggressive level (3) drops that
-    gate AND undoes consonant doubling (hatter->hat, runner->run, bigger->big) —
-    only the *bare* de-doubled form, so we never invent hatter->hate."""
+    agentive -er stays split (baker, hatter). The aggressive level (3) instead
+    accepts agentive -er and undoes consonant doubling (hatter->hat, runner->run,
+    bigger->big) — but only when the base is SEMANTICALLY CLOSE to the word
+    (fastText cosine via vec_ok), so junk merges are rejected (sever->sev,
+    butter->but, summer->sum, corner->corn). Only the bare de-doubled form is
+    generated, so we never invent hatter->hate."""
     for suf, repls in rules:
         if word.endswith(suf) and len(word) > len(suf) + 1:
             stem = word[: -len(suf)]
-            cands = [stem + r for r in repls]
+            cands = [(stem + r, False) for r in repls]
             if aggressive and len(stem) >= 3 and stem[-1] == stem[-2] and stem[-1] not in "aeiou":
-                cands.append(stem[:-1])  # de-double: hatt->hat, runn->run, bigg->big
-            gated = adj is not None and suf in CMP and not aggressive
-            hits = [(c, freq[c]) for c in cands
-                    if c != word and len(c) >= 3 and freq.get(c) is not None
-                    and (not gated or c in adj)]
+                cands.append((stem[:-1], True))  # de-double: hatt->hat, runn->run, bigg->big
+            is_cmp = suf in CMP
+            hits = []
+            for c, dedoubled in cands:
+                if c == word or len(c) < 3 or freq.get(c) is None:
+                    continue
+                close = aggressive and vec_ok is not None and vec_ok(word, c)
+                if dedoubled:
+                    ok = close                                   # aggressive-only; must be close
+                elif is_cmp:
+                    ok = (adj is not None and c in adj) or close  # comparative adj, or close agentive
+                else:
+                    ok = True
+                if ok:
+                    hits.append((c, freq[c]))
             if hits:
                 hits.sort(key=lambda x: -x[1])
                 return hits[0][0]
@@ -101,7 +115,7 @@ def resolve(word: str, freq: dict, rules: list, use_prefix: bool, vec_ok, adj: s
     Returns the root word, or None if the word is already its own root."""
     cur, seen = word, {word}
     for _ in range(maxdepth):
-        nxt = base_of(cur, freq, rules, adj, aggressive)
+        nxt = base_of(cur, freq, rules, adj, aggressive, vec_ok)
         if nxt is None and use_prefix:
             nxt = prefix_of(cur, freq, vec_ok)
         if nxt is None or nxt in seen:
