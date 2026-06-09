@@ -443,6 +443,29 @@ fn book_year(conn: &rusqlite::Connection, book_id: i64) -> Result<Option<i64>, S
         .flatten())
 }
 
+/// Word classes offered in the "part of speech" filter, in display order. POS
+/// comes from word_pos (WordNet + the wiktextract fallback, so non-WordNet words
+/// are still covered). Content classes first, then other classes; affixes /
+/// phrases / proper-noun 'name' / punctuation are intentionally omitted.
+#[cfg(feature = "ssr")]
+const FILTER_POS: &[&str] = &[
+    "noun", "verb", "adj", "adv", "intj", "prep", "pron", "conj", "num", "det", "particle", "contraction",
+];
+
+#[cfg(feature = "ssr")]
+fn pos_label(pos: &str) -> String {
+    match pos {
+        "intj" => "interjection",
+        "prep" => "preposition",
+        "pron" => "pronoun",
+        "conj" => "conjunction",
+        "num" => "numeral",
+        "det" => "determiner",
+        other => other, // noun / verb / adj / adv / particle / contraction
+    }
+    .to_string()
+}
+
 #[server]
 pub async fn list_books() -> Result<Vec<Book>, ServerFnError> {
     let conn = open_conn()?;
@@ -472,12 +495,12 @@ pub async fn list_categories(book_id: i64, level: i64) -> Result<Vec<FilterOpt>,
         value, label, count, group: group.to_string(),
     };
 
-    // --- part of speech ---
+    // --- part of speech (WordNet + wiktextract fallback) ---
     let mut ps = conn
         .prepare(
             "SELECT wp.pos, count(DISTINCT c.word_id) FROM candidates c
              JOIN word_pos wp ON wp.word_id = c.word_id
-             WHERE c.book_id = ?1 AND c.level = ?2 AND wp.pos IN ('noun','verb','adj','adv') GROUP BY wp.pos",
+             WHERE c.book_id = ?1 AND c.level = ?2 GROUP BY wp.pos",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     let pos_counts: HashMap<String, i64> = ps
@@ -485,9 +508,9 @@ pub async fn list_categories(book_id: i64, level: i64) -> Result<Vec<FilterOpt>,
         .map_err(|e| ServerFnError::new(e.to_string()))?
         .filter_map(Result::ok)
         .collect();
-    for p in ["noun", "verb", "adj", "adv"] {
+    for &p in FILTER_POS {
         if let Some(&n) = pos_counts.get(p) {
-            out.push(opt(format!("pos:{p}"), p.to_string(), n, "part of speech"));
+            out.push(opt(format!("pos:{p}"), pos_label(p), n, "part of speech"));
         }
     }
 
