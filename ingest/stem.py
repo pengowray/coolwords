@@ -109,15 +109,49 @@ def prefix_of(word: str, freq: dict, vec_ok) -> str | None:
     return None
 
 
+# A WordNet derivation only counts as a merge when the base word is reasonably
+# common (we collapse derived forms INTO common words, not into obscure relatives).
+MIN_BASE_PM = 1.0
+
+
+def _suffix_deriv(word: str, base: str) -> bool:
+    """True if `base` is (almost) a prefix of `word` — i.e. `word` is a suffixed
+    derived form of `base` (desire->desirous, glory->glorious, joy->joyous),
+    allowing one trailing char to differ for e-/y-drops. This keeps transparent
+    derivations and rejects loose same-etymon pairs (judge/judicial, state/station)."""
+    n = 0
+    for x, y in zip(word, base):
+        if x != y:
+            break
+        n += 1
+    return n >= len(base) - 1
+
+
+def deriv_of(word: str, freq: dict, deriv: dict, vec_ok) -> str | None:
+    """Move to the most frequent WordNet derivation that is a more-frequent, common
+    base of which `word` is a transparent suffixed form, and is semantically close.
+    Catches opaque pairs the suffix rules miss (desirous->desire, glorious->glory)
+    without the dense graph collapsing whole families into obscure hubs."""
+    best, bestf = None, freq.get(word) or 0.0
+    for d in deriv.get(word, ()):
+        df = freq.get(d)
+        if (df is not None and df > bestf and df >= MIN_BASE_PM
+                and _suffix_deriv(word, d) and vec_ok(word, d)):
+            best, bestf = d, df
+    return best
+
+
 def resolve(word: str, freq: dict, rules: list, use_prefix: bool, vec_ok, adj: set,
-            aggressive: bool = False, maxdepth: int = 6) -> str | None:
-    """Iterate suffix (then, at level 3, prefix) steps to a fixpoint root.
-    Returns the root word, or None if the word is already its own root."""
+            aggressive: bool = False, deriv: dict | None = None, maxdepth: int = 6) -> str | None:
+    """Iterate suffix (then, at level 3, prefix and WordNet derivation) steps to a
+    fixpoint root. Returns the root word, or None if it's already its own root."""
     cur, seen = word, {word}
     for _ in range(maxdepth):
         nxt = base_of(cur, freq, rules, adj, aggressive, vec_ok)
         if nxt is None and use_prefix:
             nxt = prefix_of(cur, freq, vec_ok)
+        if nxt is None and aggressive and deriv:
+            nxt = deriv_of(cur, freq, deriv, vec_ok)
         if nxt is None or nxt in seen:
             break
         cur = nxt
@@ -149,6 +183,17 @@ def main() -> None:
     adj = {w for (w,) in con.execute(
         "SELECT DISTINCT x.word FROM word_pos p JOIN words x ON x.id = p.word_id WHERE p.pos = 'adj'")}
 
+    # WordNet derivation graph (bidirectional): catches opaque pairs the suffix
+    # rules miss (desirous<->desire). Used only at level 3, embedding-guarded.
+    deriv: dict = defaultdict(set)
+    for word, target in con.execute(
+        "SELECT w.word, wr.target FROM word_relation wr JOIN words w ON w.id = wr.word_id "
+        "WHERE wr.rel = 'derivation'"
+    ):
+        if target != word:
+            deriv[word].add(target)
+    print(f"stem: loaded {sum(len(v) for v in deriv.values()):,} derivation edges", flush=True)
+
     # level -> (suffix rules, strip prefixes?, aggressive?). Only level 3 is
     # aggressive: agentive -er + consonant de-doubling + prefix stripping.
     cfg = {1: (INFL_RULES, False, False), 2: (RULES, False, False), 3: (RULES, True, True)}
@@ -162,7 +207,7 @@ def main() -> None:
         wid = wordmap[w]
         for lvl in LEVELS:
             rules, use_pfx, aggr = cfg[lvl]
-            root = resolve(w, freq, rules, use_pfx, vec_ok, adj, aggr)
+            root = resolve(w, freq, rules, use_pfx, vec_ok, adj, aggr, deriv)
             lid = wordmap[root] if root is not None else wid
             if root is not None:
                 lemma_rows.append((wid, lvl, lid))
