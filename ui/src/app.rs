@@ -56,7 +56,7 @@ pub struct Book {
 
 /// One entry in the filter dropdown. `value` is what goes in the `cat` query
 /// param; `group` lets the UI break entries into <optgroup>s. Values use a small
-/// namespace: `pos:noun`, a raw lexname like `noun.animal`, `origin:unusual`, or
+/// namespace: `pos:noun`, a raw lexname like `noun.animal`, `origin:uncommon`/`origin:rare`, or
 /// `era:of` / `era:before` / `era:old` / `era:timeless`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FilterOpt {
@@ -221,20 +221,38 @@ fn word_buckets(conn: &rusqlite::Connection, word_id: i64) -> Result<Vec<String>
 
 /// Etymology-language codes that are the *ordinary* substrate of English: Old/
 /// Middle English, Latin, the French/Norman family, Ancient Greek, the Germanic/
-/// Norse/Dutch/German continuum, plus the generic PIE / translingual roots. A word
-/// counts as "unusual origin" when it has an etymology language NOT in this set
-/// (e.g. Hindi, Italian, Spanish, Powhatan, Quechua, Persian, Malay…).
+/// Norse/Dutch/German continuum, plus the generic PIE / translingual roots. The
+/// "uncommon" loanword filter keeps words whose etymology language is NOT in this
+/// set (e.g. Hindi, Italian, Spanish, Powhatan, Quechua, Persian, Malay…).
 #[cfg(feature = "ssr")]
 const COMMON_ORIGINS: &[&str] = &[
-    "ang", "enm", "ang-nrt", "la", "la-med", "la-new", "la-vul", "fr", "fro", "frm",
-    "xno", "nrf", "grc", "el", "gem-pro", "gem", "gmw", "gmq", "non", "gml", "gmh",
-    "goh", "nds", "osx", "got", "dum", "odt", "nl", "de", "ine-pro", "mul", "sco",
+    "ang", "enm", "enm-nor", "ang-nrt", "la", "la-med", "la-new", "la-vul", "fr", "fro",
+    "fro-nor", "frm", "xno", "nrf", "grc", "el", "gem-pro", "gem", "gmw", "gmq", "non",
+    "gml", "gmh", "goh", "nds", "osx", "got", "dum", "odt", "nl", "vls", "de", "ine-pro",
+    "mul", "sco",
 ];
 
+/// Romance languages excluded by the *stricter* loanword filter (they descend
+/// straight from Latin, so they're barely more exotic than the substrate).
+/// Romanian ('ro') is deliberately KEPT — it yields genuinely unusual words
+/// (mămăligă, cobza), so it survives even the strict filter.
 #[cfg(feature = "ssr")]
-fn common_origins_sql() -> String {
+const ROMANCE_ORIGINS: &[&str] = &[
+    "it", "es", "pt", "ca", "gl", "oc", "an", "co", "rm", "sc", "fur", "lld",
+    "nap", "scn", "vec", "lij", "pms", "lmo", "frp", "wa", "mwl", "ext", "lad",
+];
+
+/// Quoted SQL `IN`-list of etymology codes to EXCLUDE for the loanword filter.
+/// `strict` adds the Romance languages on top of the common substrate.
+#[cfg(feature = "ssr")]
+fn origin_exclude_sql(strict: bool) -> String {
     // All literals are hardcoded ASCII codes, so direct interpolation is safe.
-    COMMON_ORIGINS.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(",")
+    COMMON_ORIGINS
+        .iter()
+        .chain(if strict { ROMANCE_ORIGINS } else { &[] }.iter())
+        .map(|c| format!("'{c}'"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Window-average usage (per million) at or below this counts as "rare".
@@ -425,21 +443,27 @@ pub async fn list_categories(book_id: i64, level: i64) -> Result<Vec<FilterOpt>,
         ));
     }
 
-    // --- unusual origin ---
-    let n_origin: i64 = conn
-        .query_row(
-            &format!(
-                "SELECT count(DISTINCT c.word_id) FROM candidates c JOIN words w ON w.id = c.word_id
-                 WHERE c.book_id = ?1 AND c.level = ?2 AND w.etymology_lang IS NOT NULL
-                   AND w.etymology_lang NOT IN ({})",
-                common_origins_sql()
-            ),
-            [book_id, level],
-            |r| r.get(0),
-        )
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    if n_origin > 0 {
-        out.push(opt("origin:unusual".to_string(), "unusual origin".to_string(), n_origin, "origin"));
+    // --- loanword origin (two tiers): "uncommon" excludes English's core
+    // substrate; "rare" also excludes the Romance languages (kept: Romanian). ---
+    for (value, label, strict) in [
+        ("origin:uncommon", "uncommon", false),
+        ("origin:rare", "rare (non-Romance)", true),
+    ] {
+        let n: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(DISTINCT c.word_id) FROM candidates c JOIN words w ON w.id = c.word_id
+                     WHERE c.book_id = ?1 AND c.level = ?2 AND w.etymology_lang IS NOT NULL
+                       AND w.etymology_lang NOT IN ({})",
+                    origin_exclude_sql(strict)
+                ),
+                [book_id, level],
+                |r| r.get(0),
+            )
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        if n > 0 {
+            out.push(opt(value.to_string(), label.to_string(), n, "loanword origin"));
+        }
     }
 
     // --- precise WordNet categories (lexnames) ---
@@ -487,10 +511,10 @@ pub async fn get_candidates(
         where_extra =
             " AND EXISTS (SELECT 1 FROM word_pos wp WHERE wp.word_id = w.id AND wp.pos = ?3)".into();
         bind_cat = Some(p.to_string());
-    } else if cat == "origin:unusual" {
+    } else if cat == "origin:uncommon" || cat == "origin:rare" {
         where_extra = format!(
             " AND w.etymology_lang IS NOT NULL AND w.etymology_lang NOT IN ({})",
-            common_origins_sql()
+            origin_exclude_sql(cat == "origin:rare")
         );
     } else if !needs_traj && !cat.is_empty() {
         where_extra =
