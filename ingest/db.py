@@ -34,6 +34,9 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     "candidates": [
         ("selected", "INTEGER NOT NULL DEFAULT 0"),
     ],
+    "book_occurrences": [
+        ("example", "TEXT"),
+    ],
 }
 
 

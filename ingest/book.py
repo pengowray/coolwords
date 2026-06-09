@@ -13,6 +13,8 @@ from collections import Counter
 from ingest.db import connect
 
 TOKEN_RE = re.compile(r"[a-z]+(?:['’-][a-z]+)*")
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_MAX_EXAMPLE = 280
 # Project Gutenberg start/end markers wrap the actual text.
 _START = re.compile(r"\*\*\*\s*START OF (THE|THIS) PROJECT GUTENBERG EBOOK.*?\*\*\*", re.I | re.S)
 _END = re.compile(r"\*\*\*\s*END OF (THE|THIS) PROJECT GUTENBERG EBOOK", re.I)
@@ -28,10 +30,21 @@ def strip_boilerplate(text: str) -> str:
     return text
 
 
-def tokenize(text: str) -> Counter:
-    # normalize curly apostrophes so don't / don’t collapse
-    text = text.lower().replace("’", "'")
-    return Counter(TOKEN_RE.findall(text))
+def tokenize(text: str) -> tuple[Counter, dict[str, str]]:
+    """Return (token counts, token -> first in-book sentence)."""
+    flat = re.sub(r"\s+", " ", text).replace("’", "'")
+    counts: Counter = Counter()
+    examples: dict[str, str] = {}
+    for sentence in _SENT_SPLIT.split(flat):
+        toks = TOKEN_RE.findall(sentence.lower())
+        if not toks:
+            continue
+        snippet = sentence.strip()
+        for t in toks:
+            counts[t] += 1
+            if t not in examples:
+                examples[t] = snippet[:_MAX_EXAMPLE]
+    return counts, examples
 
 
 def main() -> None:
@@ -47,7 +60,7 @@ def main() -> None:
     with open(args.path, encoding="utf-8") as f:
         raw = f.read()
     body = strip_boilerplate(raw)
-    tokens = tokenize(body)
+    tokens, examples = tokenize(body)
     n_tokens = sum(tokens.values())
     print(f"{args.slug}: {n_tokens:,} tokens, {len(tokens):,} distinct types "
           f"(stripped {len(raw)-len(body):,} boilerplate chars)")
@@ -71,8 +84,8 @@ def main() -> None:
     )
     con.execute("DELETE FROM book_occurrences WHERE book_id = ?", (book_id,))
     con.executemany(
-        "INSERT INTO book_occurrences(book_id, token, word_id, count) VALUES (?, ?, ?, ?)",
-        [(book_id, tok, idmap.get(tok), cnt) for tok, cnt in tokens.items()],
+        "INSERT INTO book_occurrences(book_id, token, word_id, count, example) VALUES (?, ?, ?, ?, ?)",
+        [(book_id, tok, idmap.get(tok), cnt, examples.get(tok)) for tok, cnt in tokens.items()],
     )
     con.commit()
     matched = sum(1 for t in tokens if t in idmap)

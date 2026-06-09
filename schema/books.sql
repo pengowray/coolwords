@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS book_occurrences (
     token   TEXT    NOT NULL,
     word_id INTEGER REFERENCES words(id),
     count   INTEGER NOT NULL,
+    example TEXT,                       -- first sentence in the book containing the token
     PRIMARY KEY (book_id, token)
 );
 CREATE INDEX IF NOT EXISTS idx_book_occ_word ON book_occurrences(word_id);
