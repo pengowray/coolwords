@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS words (
     alpha_only      INTEGER,                    -- 1 if matches /^[a-z]+$/
     scrabble        INTEGER,                    -- scrabble score (alpha_only words only; NULL otherwise)
     rare_letters    TEXT,                       -- subset of {j,k,q,x,z} present, sorted
+    stem            TEXT,                       -- suffix-stripped real-word root (ingest/stem.py); NULL if none
 
     -- pronunciation (ingest/cmudict.py; primary variant — see word_pronunciations)
     arpabet         TEXT,
@@ -69,6 +70,8 @@ CREATE INDEX IF NOT EXISTS idx_words_syllables ON words(syllables);
 CREATE INDEX IF NOT EXISTS idx_words_rhyme     ON words(rhyme_key);
 CREATE INDEX IF NOT EXISTS idx_words_length    ON words(length);
 CREATE INDEX IF NOT EXISTS idx_words_etymology ON words(etymology_lang);
+-- idx_words_stem is created in ingest/db.py after the `stem` column migration
+-- (it postdates the original words table, so it can't be indexed here).
 
 -- All pronunciations including variants (CMUdict WORD(1), WORD(2)... entries).
 CREATE TABLE IF NOT EXISTS word_pronunciations (

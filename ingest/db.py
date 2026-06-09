@@ -15,6 +15,7 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("fic_pm", "REAL"),
         ("freq_pm_lc", "REAL"),
         ("cap_ratio", "REAL"),
+        ("stem", "TEXT"),
         ("etymology_text", "TEXT"),
         ("gloss", "TEXT"),
         ("wordnet_category", "TEXT"),
@@ -50,6 +51,9 @@ def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
     con.execute("PRAGMA foreign_keys = ON")
     init_schema(con)
     ensure_columns(con)
+    # indexes on migration-added columns, created after the columns exist
+    con.execute("CREATE INDEX IF NOT EXISTS idx_words_stem ON words(stem)")
+    con.commit()
     return con
 
 
