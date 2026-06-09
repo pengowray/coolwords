@@ -16,6 +16,7 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("freq_pm_lc", "REAL"),
         ("cap_ratio", "REAL"),
         ("etymology_text", "TEXT"),
+        ("gloss", "TEXT"),
         ("wordnet_category", "TEXT"),
         ("is_proper", "INTEGER NOT NULL DEFAULT 0"),
         ("is_form_of", "INTEGER NOT NULL DEFAULT 0"),
@@ -29,6 +30,9 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     "fiction_freq": [
         ("count_lc", "INTEGER NOT NULL DEFAULT 0"),
         ("cap_ratio", "REAL"),
+    ],
+    "candidates": [
+        ("selected", "INTEGER NOT NULL DEFAULT 0"),
     ],
 }
 

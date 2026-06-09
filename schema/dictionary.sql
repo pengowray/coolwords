@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS words (
     n_senses        INTEGER,
     etymology_lang  TEXT,                       -- primary source language code (e.g. 'fa', 'it')
     etymology_text  TEXT,                       -- human-readable etymology string (display/fallback)
+    gloss           TEXT,                       -- first sense gloss, for display while rating
     wordnet_category TEXT,                      -- denormalized primary WordNet lexname (e.g. 'noun.food')
 
     -- classification flags (ingest/wiktextract.py)

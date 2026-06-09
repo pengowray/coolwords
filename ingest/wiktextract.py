@@ -71,7 +71,7 @@ def build(path) -> tuple[dict, int]:
             if a is None:
                 a = agg[w_low] = {"n_senses": 0, "pos": set(), "ety": [], "primary": None,
                                   "proper": False, "offensive": False, "form_of": False,
-                                  "ety_text": None}
+                                  "ety_text": None, "gloss": None}
             senses = obj.get("senses") or []
             a["n_senses"] += len(senses)
             pos = obj.get("pos")
@@ -91,6 +91,10 @@ def build(path) -> tuple[dict, int]:
                     a["form_of"] = True
                 if tagset & OFFENSIVE:
                     a["offensive"] = True
+                if a["gloss"] is None:
+                    gl = s.get("glosses") or s.get("raw_glosses")
+                    if gl:
+                        a["gloss"] = gl[0]
     return agg, n_en
 
 
@@ -118,14 +122,14 @@ def main() -> None:
     upd, pos_rows, ety_rows = [], [], []
     for k, a in agg.items():
         wid = idmap[k]
-        upd.append((a["n_senses"], a["primary"], a["ety_text"],
+        upd.append((a["n_senses"], a["primary"], a["ety_text"], a["gloss"],
                     int(a["proper"]), int(a["form_of"]), int(a["offensive"]), wid))
         pos_rows.extend((wid, p, SOURCE) for p in a["pos"])
         ety_rows.extend((wid, lang, rel, SOURCE) for (lang, rel) in set(a["ety"]))
 
     cur.executemany(
         "UPDATE words SET in_wiktionary=1, n_senses=?, etymology_lang=?, etymology_text=?, "
-        "is_proper=?, is_form_of=?, is_offensive=? WHERE id=?",
+        "gloss=?, is_proper=?, is_form_of=?, is_offensive=? WHERE id=?",
         upd,
     )
     cur.executemany("INSERT OR IGNORE INTO word_pos(word_id, pos, source) VALUES (?, ?, ?)", pos_rows)

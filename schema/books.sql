@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS candidates (
     s_salience  REAL,                 -- prominence in book vs general corpus (weirdness)
     s_origin    REAL,                 -- unusual-etymology bonus
     s_aesthetic REAL,
-    cluster     INTEGER,              -- embedding cluster id (optional)
+    cluster     INTEGER,              -- embedding cluster id (ingest/cluster.py)
+    selected    INTEGER NOT NULL DEFAULT 0,  -- 1 if in the varied top-N pick
     rank        INTEGER,
     PRIMARY KEY (book_id, word_id)
 );
