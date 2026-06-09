@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "ssr")]
+use std::collections::BTreeSet;
 
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, MetaTags, Stylesheet, Title};
@@ -7,12 +9,25 @@ use leptos_router::hooks::query_signal;
 use leptos_router::StaticSegment;
 use serde::{Deserialize, Serialize};
 
-pub const TAGS: &[&str] = &[
-    "useful", "strange", "interesting", "aesthetic", "emblematic", "category-pick",
-];
+/// Qualitative tags chosen from the picker. `star` is a separate quick toggle and
+/// `pick:<bucket>` tags are generated per word from its POS / noun categories.
+pub const QUAL_TAGS: &[&str] = &["useful", "strange", "interesting", "aesthetic", "emblematic"];
 
+#[cfg(feature = "ssr")]
+fn tag_allowed(tag: &str) -> bool {
+    tag == "star"
+        || QUAL_TAGS.contains(&tag)
+        || (tag.starts_with("pick:")
+            && (6..40).contains(&tag.len())
+            && tag[5..].chars().all(|c| c.is_ascii_alphanumeric() || c == '.'))
+}
+
+/// Shared client-side tag state + the persistence action, passed via context.
 #[derive(Clone, Copy)]
-pub struct TagStore(pub RwSignal<HashMap<(i64, i64), HashSet<String>>>);
+pub struct Tagger {
+    pub store: RwSignal<HashMap<(i64, i64), HashSet<String>>>,
+    pub action: ServerAction<SetTag>,
+}
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
@@ -59,6 +74,7 @@ pub struct Candidate {
     pub selected: bool,
     pub example: Option<String>,
     pub tags: Vec<String>,
+    pub buckets: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -82,6 +98,7 @@ pub struct WordInfo {
     pub example: Option<String>,
     pub book_year: Option<i64>,
     pub categories: Vec<String>,
+    pub buckets: Vec<String>,
     pub base: Option<(String, f64)>,
     pub family: Vec<(String, i64, f64)>,
     pub relations: Vec<RelTarget>,
@@ -101,6 +118,81 @@ fn db_path() -> String {
     "../data/coolwords.db".to_string()
 }
 
+#[cfg(feature = "ssr")]
+fn load_tags(conn: &rusqlite::Connection, book_id: i64) -> Result<HashMap<i64, Vec<String>>, ServerFnError> {
+    let mut stmt = conn
+        .prepare("SELECT word_id, tag FROM word_tags WHERE book_id = ?1 AND rater = 'me'")
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut map: HashMap<i64, Vec<String>> = HashMap::new();
+    let rows = stmt
+        .query_map([book_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    for r in rows {
+        let (wid, tag) = r.map_err(|e| ServerFnError::new(e.to_string()))?;
+        map.entry(wid).or_default().push(tag);
+    }
+    Ok(map)
+}
+
+/// Per-word "pick:" buckets: POS (noun/verb/adj/adv) + noun.X category suffixes.
+#[cfg(feature = "ssr")]
+fn load_buckets(conn: &rusqlite::Connection, book_id: i64) -> Result<HashMap<i64, Vec<String>>, ServerFnError> {
+    let mut m: HashMap<i64, BTreeSet<String>> = HashMap::new();
+    let mut s1 = conn
+        .prepare(
+            "SELECT DISTINCT wp.word_id, wp.pos FROM word_pos wp
+             JOIN candidates c ON c.word_id = wp.word_id
+             WHERE c.book_id = ?1 AND wp.pos IN ('noun','verb','adj','adv')",
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    for r in s1.query_map([book_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| ServerFnError::new(e.to_string()))?.filter_map(Result::ok)
+    {
+        m.entry(r.0).or_default().insert(r.1);
+    }
+    let mut s2 = conn
+        .prepare(
+            "SELECT DISTINCT wc.word_id, wc.category FROM word_category wc
+             JOIN candidates c ON c.word_id = wc.word_id
+             WHERE c.book_id = ?1 AND wc.category LIKE 'noun.%'",
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    for r in s2.query_map([book_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| ServerFnError::new(e.to_string()))?.filter_map(Result::ok)
+    {
+        let suf = &r.1[5..];
+        if suf != "Tops" {
+            m.entry(r.0).or_default().insert(suf.to_string());
+        }
+    }
+    Ok(m.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect())
+}
+
+#[cfg(feature = "ssr")]
+fn word_buckets(conn: &rusqlite::Connection, word_id: i64) -> Result<Vec<String>, ServerFnError> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    let mut s1 = conn
+        .prepare("SELECT DISTINCT pos FROM word_pos WHERE word_id = ?1 AND pos IN ('noun','verb','adj','adv')")
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    for p in s1.query_map([word_id], |r| r.get::<_, String>(0))
+        .map_err(|e| ServerFnError::new(e.to_string()))?.filter_map(Result::ok)
+    {
+        set.insert(p);
+    }
+    let mut s2 = conn
+        .prepare("SELECT DISTINCT category FROM word_category WHERE word_id = ?1 AND category LIKE 'noun.%'")
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    for c in s2.query_map([word_id], |r| r.get::<_, String>(0))
+        .map_err(|e| ServerFnError::new(e.to_string()))?.filter_map(Result::ok)
+    {
+        let suf = &c[5..];
+        if suf != "Tops" {
+            set.insert(suf.to_string());
+        }
+    }
+    Ok(set.into_iter().collect())
+}
+
 #[server]
 pub async fn list_books() -> Result<Vec<Book>, ServerFnError> {
     use rusqlite::Connection;
@@ -108,7 +200,7 @@ pub async fn list_books() -> Result<Vec<Book>, ServerFnError> {
     let mut stmt = conn
         .prepare(
             "SELECT b.id, COALESCE(b.title, b.slug),
-                    (SELECT count(*) FROM candidates c WHERE c.book_id = b.id AND c.selected = 1)
+                    (SELECT count(*) FROM word_tags t WHERE t.book_id = b.id AND t.tag = 'star')
              FROM books b ORDER BY b.id",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -143,22 +235,6 @@ pub async fn list_categories(book_id: i64) -> Result<Vec<CatCount>, ServerFnErro
     Ok(out)
 }
 
-#[cfg(feature = "ssr")]
-fn load_tags(conn: &rusqlite::Connection, book_id: i64) -> Result<HashMap<i64, Vec<String>>, ServerFnError> {
-    let mut stmt = conn
-        .prepare("SELECT word_id, tag FROM word_tags WHERE book_id = ?1 AND rater = 'me'")
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let mut map: HashMap<i64, Vec<String>> = HashMap::new();
-    let rows = stmt
-        .query_map([book_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    for r in rows {
-        let (wid, tag) = r.map_err(|e| ServerFnError::new(e.to_string()))?;
-        map.entry(wid).or_default().push(tag);
-    }
-    Ok(map)
-}
-
 #[server]
 pub async fn get_candidates(
     book_id: i64,
@@ -168,6 +244,7 @@ pub async fn get_candidates(
     use rusqlite::Connection;
     let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
     let tags = load_tags(&conn, book_id)?;
+    let buckets = load_buckets(&conn, book_id)?;
     let mut stmt = conn
         .prepare(
             "SELECT w.id, w.word, c.in_book, c.score, w.gloss, w.etymology_lang, ln.name,
@@ -198,6 +275,7 @@ pub async fn get_candidates(
                 selected: row.get::<_, i64>(9)? != 0,
                 example: row.get(10)?,
                 tags: Vec::new(),
+                buckets: Vec::new(),
             })
         })
         .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -206,6 +284,9 @@ pub async fn get_candidates(
         let mut c = r.map_err(|e| ServerFnError::new(e.to_string()))?;
         if let Some(t) = tags.get(&c.word_id) {
             c.tags = t.clone();
+        }
+        if let Some(b) = buckets.get(&c.word_id) {
+            c.buckets = b.clone();
         }
         out.push(c);
     }
@@ -241,6 +322,8 @@ pub async fn word_detail(book_id: i64, word_id: i64) -> Result<WordInfo, ServerF
         .map_err(|e| ServerFnError::new(e.to_string()))?
         .filter_map(Result::ok)
         .collect();
+
+    let buckets = word_buckets(&conn, word_id)?;
 
     let mut base = None;
     if let Some(st) = &stem {
@@ -320,14 +403,14 @@ pub async fn word_detail(book_id: i64, word_id: i64) -> Result<WordInfo, ServerF
 
     Ok(WordInfo {
         word_id, word, gloss, origin_code, origin_name, freq_pm, syllables, in_book, example,
-        book_year, categories, base, family, relations, trajectory,
+        book_year, categories, buckets, base, family, relations, trajectory,
     })
 }
 
 #[server]
 pub async fn set_tag(book_id: i64, word_id: i64, tag: String, on: bool) -> Result<(), ServerFnError> {
     use rusqlite::Connection;
-    if !TAGS.contains(&tag.as_str()) {
+    if !tag_allowed(&tag) {
         return Err(ServerFnError::new("unknown tag"));
     }
     let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -346,6 +429,26 @@ pub async fn set_tag(book_id: i64, word_id: i64, tag: String, on: bool) -> Resul
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     }
     Ok(())
+}
+
+// ---- client-side tag helpers (operate on the shared Tagger context) ----
+fn has_tag(t: Tagger, key: (i64, i64), tag: &str) -> bool {
+    t.store.with(|m| m.get(&key).is_some_and(|s| s.contains(tag)))
+}
+fn has_any_tag(t: Tagger, key: (i64, i64)) -> bool {
+    t.store.with(|m| m.get(&key).is_some_and(|s| !s.is_empty()))
+}
+fn has_other_tags(t: Tagger, key: (i64, i64)) -> bool {
+    t.store.with(|m| m.get(&key).is_some_and(|s| s.iter().any(|x| x != "star")))
+}
+fn toggle_tag(t: Tagger, book_id: i64, word_id: i64, tag: &str) {
+    let key = (book_id, word_id);
+    let next = !has_tag(t, key, tag);
+    t.store.update(|m| {
+        let set = m.entry(key).or_default();
+        if next { set.insert(tag.to_string()); } else { set.remove(tag); }
+    });
+    t.action.dispatch(SetTag { book_id, word_id, tag: tag.to_string(), on: next });
 }
 
 #[component]
@@ -407,31 +510,50 @@ fn highlight(text: &str, word: &str) -> Vec<(String, bool)> {
     segs
 }
 
+/// A quick ★ favourite toggle for a word.
 #[component]
-fn TagChips(book_id: i64, word_id: i64) -> impl IntoView {
-    let store = expect_context::<TagStore>();
-    let set_tag = ServerAction::<SetTag>::new();
+fn Star(book_id: i64, word_id: i64) -> impl IntoView {
+    let t = expect_context::<Tagger>();
     let key = (book_id, word_id);
     view! {
-        <span class="chips">
-            {TAGS.iter().map(|&tag| {
-                let on_tag = tag.to_string();
-                let is_on = move || store.0.with(|m| m.get(&key).is_some_and(|s| s.contains(on_tag.as_str())));
-                let click_tag = tag.to_string();
-                let on_click = move |_| {
-                    let now = store.0.with(|m| m.get(&key).is_some_and(|s| s.contains(click_tag.as_str())));
-                    let next = !now;
-                    store.0.update(|m| {
-                        let set = m.entry(key).or_default();
-                        if next { set.insert(click_tag.clone()); } else { set.remove(click_tag.as_str()); }
-                    });
-                    set_tag.dispatch(SetTag { book_id, word_id, tag: click_tag.clone(), on: next });
-                };
-                view! {
-                    <button type="button" class="chip" class:on=is_on on:click=on_click>{tag}</button>
-                }
-            }).collect_view()}
-        </span>
+        <button type="button" class="star" class:on=move || has_tag(t, key, "star")
+            title="favourite" on:click=move |_| toggle_tag(t, book_id, word_id, "star")>"★"</button>
+    }
+}
+
+/// The tag picker: qualitative tags + per-word "good for: <bucket>" picks.
+#[component]
+fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView {
+    let t = expect_context::<Tagger>();
+    let key = (book_id, word_id);
+    let has_buckets = !buckets.is_empty();
+    view! {
+        <div class="picker">
+            <div class="pickgroup">
+                {QUAL_TAGS.iter().map(|&tag| {
+                    let on = move || has_tag(t, key, tag);
+                    view! {
+                        <button type="button" class="chip" class:on=on
+                            on:click=move |_| toggle_tag(t, book_id, word_id, tag)>{tag}</button>
+                    }
+                }).collect_view()}
+            </div>
+            {has_buckets.then(|| view! {
+                <div class="pickgroup">
+                    <span class="picklbl">"good for: "</span>
+                    {buckets.into_iter().map(|b| {
+                        let tag = format!("pick:{b}");
+                        let on_tag = tag.clone();
+                        let click_tag = tag.clone();
+                        view! {
+                            <button type="button" class="chip pick"
+                                class:on=move || has_tag(t, key, &on_tag)
+                                on:click=move |_| toggle_tag(t, book_id, word_id, &click_tag)>{b}</button>
+                        }
+                    }).collect_view()}
+                </div>
+            })}
+        </div>
     }
 }
 
@@ -481,9 +603,10 @@ fn HomePage() -> impl IntoView {
     let (selected, set_word) = query_signal::<i64>("word");
     let book = Memo::new(move |_| book_q.get().unwrap_or(1));
     let only_top = RwSignal::new(false);
+    let open_picker = RwSignal::new(None::<i64>);
 
-    let tag_store = TagStore(RwSignal::new(HashMap::new()));
-    provide_context(tag_store);
+    let tagger = Tagger { store: RwSignal::new(HashMap::new()), action: ServerAction::<SetTag>::new() };
+    provide_context(tagger);
 
     let books = Resource::new(|| (), |_| list_books());
     let categories = Resource::new(move || book.get(), list_categories);
@@ -501,11 +624,10 @@ fn HomePage() -> impl IntoView {
         },
     );
 
-    // seed the tag store from loaded candidates (client-side, after render)
     Effect::new(move |_| {
         if let Some(Ok(list)) = candidates.get() {
             let b = book.get();
-            tag_store.0.update(|m| {
+            tagger.store.update(|m| {
                 for c in &list {
                     m.entry((b, c.word_id)).or_default().extend(c.tags.iter().cloned());
                 }
@@ -515,7 +637,7 @@ fn HomePage() -> impl IntoView {
 
     view! {
         <h1>"coolwords"</h1>
-        <p class="sub">"Tag the interesting words. Click a word for detail; click a category to filter."</p>
+        <p class="sub">"★ to favourite; click \"tags\" to label; click a word for detail, a category to filter."</p>
 
         <div class="bar">
             <Suspense fallback=move || view! { <span>"…"</span> }>
@@ -584,7 +706,8 @@ fn HomePage() -> impl IntoView {
                             <tbody>
                                 {list.into_iter().map(|c| {
                                     let wid = c.word_id;
-                                    let star = if c.selected { "★" } else { "" };
+                                    let bk = c.buckets.clone();
+                                    let star = if c.selected { "•" } else { "" };
                                     let gloss = short(&c.gloss, 90);
                                     let example = c.example.clone().unwrap_or_default();
                                     let origin_disp = c.origin_name.clone().or_else(|| c.origin_code.clone()).unwrap_or_default();
@@ -593,8 +716,8 @@ fn HomePage() -> impl IntoView {
                                     let cat_click = cat.clone();
                                     let cluster_txt = c.cluster.map(|n| n.to_string()).unwrap_or_default();
                                     view! {
-                                        <tr class="row" class:tagged=move || store_has_tag(b, wid)>
-                                            <td class="star">{star}</td>
+                                        <tr class="row" class:tagged=move || has_any_tag(tagger, (b, wid))>
+                                            <td class="sel">{star}</td>
                                             <td class="word" title=example on:click=move |_| set_word.set(Some(wid))>
                                                 {c.word.clone()}
                                             </td>
@@ -607,7 +730,17 @@ fn HomePage() -> impl IntoView {
                                                 {cat.clone().unwrap_or_default()}
                                             </td>
                                             <td class="num">{cluster_txt}</td>
-                                            <td class="actions"><TagChips book_id=b word_id=wid/></td>
+                                            <td class="tagcell">
+                                                <Star book_id=b word_id=wid/>
+                                                <button type="button" class="tagbtn"
+                                                    class:has=move || has_other_tags(tagger, (b, wid))
+                                                    on:click=move |_| open_picker.update(|o| *o = if *o == Some(wid) { None } else { Some(wid) })>
+                                                    "tags"
+                                                </button>
+                                                <Show when=move || open_picker.get() == Some(wid) fallback=|| ()>
+                                                    <TagPicker book_id=b word_id=wid buckets=bk.clone()/>
+                                                </Show>
+                                            </td>
                                         </tr>
                                     }
                                 }).collect_view()}
@@ -629,7 +762,6 @@ fn HomePage() -> impl IntoView {
                             let b = book.get();
                             let wid = d.word_id;
                             let origin = d.origin_name.clone().or_else(|| d.origin_code.clone()).unwrap_or_default();
-                            // group relations by rel (already ordered)
                             let mut groups: Vec<(String, Vec<RelTarget>)> = Vec::new();
                             for rt in d.relations.clone() {
                                 if let Some(last) = groups.last_mut() {
@@ -639,6 +771,10 @@ fn HomePage() -> impl IntoView {
                             }
                             view! {
                                 <h2>{d.word.clone()}</h2>
+                                <div class="detail-tags">
+                                    <Star book_id=b word_id=wid/>
+                                    <TagPicker book_id=b word_id=wid buckets=d.buckets.clone()/>
+                                </div>
                                 <p class="gloss">{d.gloss.clone().unwrap_or_default()}</p>
                                 {d.example.clone().map(|ex| {
                                     let segs = highlight(&ex, &d.word);
@@ -698,7 +834,6 @@ fn HomePage() -> impl IntoView {
                                         }).collect_view()}
                                     </ul>
                                 </Show>
-                                <div class="actions detail-actions"><TagChips book_id=b word_id=wid/></div>
                             }.into_any()
                         }
                     })}
@@ -706,8 +841,4 @@ fn HomePage() -> impl IntoView {
             </aside>
         </Show>
     }
-}
-
-fn store_has_tag(book_id: i64, word_id: i64) -> bool {
-    expect_context::<TagStore>().0.with(|m| m.get(&(book_id, word_id)).is_some_and(|s| !s.is_empty()))
 }
