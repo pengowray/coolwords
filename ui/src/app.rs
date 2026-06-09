@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, MetaTags, Stylesheet, Title};
 use leptos_router::components::{Route, Router, Routes};
-use leptos_router::hooks::query_signal;
-use leptos_router::StaticSegment;
+use leptos_router::hooks::{query_signal, query_signal_with_options};
+use leptos_router::{NavigateOptions, StaticSegment};
 use serde::{Deserialize, Serialize};
 
 /// Qualitative tags chosen from the picker. `star` is a separate quick toggle and
@@ -595,7 +595,10 @@ fn Trajectory(data: Vec<(i32, f64)>, book_year: Option<i64>) -> impl IntoView {
 fn HomePage() -> impl IntoView {
     let (book_q, set_book) = query_signal::<i64>("book");
     let (category, set_cat) = query_signal::<String>("cat");
-    let (selected, set_word) = query_signal::<i64>("word");
+    // scroll:false so opening the detail sidebar (or jumping to a related word)
+    // doesn't scroll the list back to the top.
+    let (selected, set_word) =
+        query_signal_with_options::<i64>("word", NavigateOptions { scroll: false, ..Default::default() });
     let book = Memo::new(move |_| book_q.get().unwrap_or(1));
     let only_top = RwSignal::new(false);
     let open_picker = RwSignal::new(None::<i64>);
