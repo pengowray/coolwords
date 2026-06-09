@@ -1,10 +1,18 @@
+use std::collections::{HashMap, HashSet};
+
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, MetaTags, Stylesheet, Title};
-use leptos_router::{
-    components::{Route, Router, Routes},
-    StaticSegment,
-};
+use leptos_router::components::{Route, Router, Routes};
+use leptos_router::hooks::query_signal;
+use leptos_router::StaticSegment;
 use serde::{Deserialize, Serialize};
+
+pub const TAGS: &[&str] = &[
+    "useful", "strange", "interesting", "aesthetic", "emblematic", "category-pick",
+];
+
+#[derive(Clone, Copy)]
+pub struct TagStore(pub RwSignal<HashMap<(i64, i64), HashSet<String>>>);
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
@@ -32,6 +40,12 @@ pub struct Book {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CatCount {
+    pub category: String,
+    pub count: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Candidate {
     pub word_id: i64,
     pub word: String,
@@ -43,8 +57,16 @@ pub struct Candidate {
     pub category: Option<String>,
     pub cluster: Option<i64>,
     pub selected: bool,
-    pub verdict: Option<String>,
     pub example: Option<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelTarget {
+    pub rel: String,
+    pub target: String,
+    pub target_word_id: Option<i64>,
+    pub in_book: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -58,14 +80,12 @@ pub struct WordInfo {
     pub syllables: Option<i64>,
     pub in_book: i64,
     pub example: Option<String>,
-    pub verdict: Option<String>,
+    pub book_year: Option<i64>,
     pub categories: Vec<String>,
-    /// base lemma + its freq, only when the base is MORE common than this word
-    /// (i.e. this looks like a rare variant of a common lemma).
     pub base: Option<(String, f64)>,
-    /// other forms in THIS book sharing the stem (word, in-book count, freq/M)
     pub family: Vec<(String, i64, f64)>,
-    pub relations: Vec<(String, String)>,
+    pub relations: Vec<RelTarget>,
+    pub trajectory: Vec<(i32, f64)>,
 }
 
 #[cfg(feature = "ssr")]
@@ -103,6 +123,43 @@ pub async fn list_books() -> Result<Vec<Book>, ServerFnError> {
 }
 
 #[server]
+pub async fn list_categories(book_id: i64) -> Result<Vec<CatCount>, ServerFnError> {
+    use rusqlite::Connection;
+    let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT wc.category, count(DISTINCT c.word_id) n
+             FROM candidates c JOIN word_category wc ON wc.word_id = c.word_id
+             WHERE c.book_id = ?1 GROUP BY wc.category ORDER BY n DESC, wc.category",
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let rows = stmt
+        .query_map([book_id], |r| Ok(CatCount { category: r.get(0)?, count: r.get(1)? }))
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| ServerFnError::new(e.to_string()))?);
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "ssr")]
+fn load_tags(conn: &rusqlite::Connection, book_id: i64) -> Result<HashMap<i64, Vec<String>>, ServerFnError> {
+    let mut stmt = conn
+        .prepare("SELECT word_id, tag FROM word_tags WHERE book_id = ?1 AND rater = 'me'")
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut map: HashMap<i64, Vec<String>> = HashMap::new();
+    let rows = stmt
+        .query_map([book_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    for r in rows {
+        let (wid, tag) = r.map_err(|e| ServerFnError::new(e.to_string()))?;
+        map.entry(wid).or_default().push(tag);
+    }
+    Ok(map)
+}
+
+#[server]
 pub async fn get_candidates(
     book_id: i64,
     category: Option<String>,
@@ -110,15 +167,15 @@ pub async fn get_candidates(
 ) -> Result<Vec<Candidate>, ServerFnError> {
     use rusqlite::Connection;
     let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let tags = load_tags(&conn, book_id)?;
     let mut stmt = conn
         .prepare(
             "SELECT w.id, w.word, c.in_book, c.score, w.gloss, w.etymology_lang, ln.name,
-                    w.wordnet_category, c.cluster, c.selected, r.verdict, bo.example
+                    w.wordnet_category, c.cluster, c.selected, bo.example
              FROM candidates c
              JOIN words w ON w.id = c.word_id
              LEFT JOIN lang_names ln ON ln.code = w.etymology_lang
              LEFT JOIN book_occurrences bo ON bo.book_id = c.book_id AND bo.word_id = c.word_id
-             LEFT JOIN ratings r ON r.book_id = c.book_id AND r.word_id = c.word_id
              WHERE c.book_id = ?1
                AND (?2 IS NULL OR EXISTS (
                      SELECT 1 FROM word_category wc WHERE wc.word_id = w.id AND wc.category = ?2))
@@ -139,14 +196,18 @@ pub async fn get_candidates(
                 category: row.get(7)?,
                 cluster: row.get(8)?,
                 selected: row.get::<_, i64>(9)? != 0,
-                verdict: row.get(10)?,
-                example: row.get(11)?,
+                example: row.get(10)?,
+                tags: Vec::new(),
             })
         })
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     let mut out = Vec::new();
     for r in rows {
-        out.push(r.map_err(|e| ServerFnError::new(e.to_string()))?);
+        let mut c = r.map_err(|e| ServerFnError::new(e.to_string()))?;
+        if let Some(t) = tags.get(&c.word_id) {
+            c.tags = t.clone();
+        }
+        out.push(c);
     }
     Ok(out)
 }
@@ -156,16 +217,15 @@ pub async fn word_detail(book_id: i64, word_id: i64) -> Result<WordInfo, ServerF
     use rusqlite::{Connection, OptionalExtension};
     let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let (word, gloss, origin_code, origin_name, freq_pm, syllables, stem, in_book, example, verdict):
+    let (word, gloss, origin_code, origin_name, freq_pm, syllables, stem, in_book, example, book_year):
         (String, Option<String>, Option<String>, Option<String>, Option<f64>, Option<i64>,
-         Option<String>, i64, Option<String>, Option<String>) = conn
+         Option<String>, i64, Option<String>, Option<i64>) = conn
         .query_row(
             "SELECT w.word, w.gloss, w.etymology_lang, ln.name, w.freq_pm, w.syllables, w.stem,
-                    COALESCE(bo.count, 0), bo.example, r.verdict
+                    COALESCE(bo.count, 0), bo.example, (SELECT year FROM books WHERE id = ?1)
              FROM words w
              LEFT JOIN lang_names ln ON ln.code = w.etymology_lang
              LEFT JOIN book_occurrences bo ON bo.word_id = w.id AND bo.book_id = ?1
-             LEFT JOIN ratings r ON r.word_id = w.id AND r.book_id = ?1
              WHERE w.id = ?2",
             (book_id, word_id),
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
@@ -182,7 +242,6 @@ pub async fn word_detail(book_id: i64, word_id: i64) -> Result<WordInfo, ServerF
         .filter_map(Result::ok)
         .collect();
 
-    // base lemma, only surfaced when it is MORE common than this word
     let mut base = None;
     if let Some(st) = &stem {
         if st != &word {
@@ -200,7 +259,6 @@ pub async fn word_detail(book_id: i64, word_id: i64) -> Result<WordInfo, ServerF
         }
     }
 
-    // other forms in this book sharing the stem (include the base word itself)
     let mut family = Vec::new();
     if let Some(st) = &stem {
         let mut fstmt = conn
@@ -222,32 +280,71 @@ pub async fn word_detail(book_id: i64, word_id: i64) -> Result<WordInfo, ServerF
     }
 
     let mut relstmt = conn
-        .prepare("SELECT rel, target FROM word_relation WHERE word_id = ?1 ORDER BY rel LIMIT 40")
+        .prepare(
+            "SELECT wr.rel, wr.target, tw.id,
+                    CASE WHEN bo.word_id IS NOT NULL THEN 1 ELSE 0 END
+             FROM word_relation wr
+             LEFT JOIN words tw ON tw.word = wr.target
+             LEFT JOIN book_occurrences bo ON bo.word_id = tw.id AND bo.book_id = ?2
+             WHERE wr.word_id = ?1
+             ORDER BY CASE wr.rel
+                 WHEN 'hypernym' THEN 1 WHEN 'coordinate' THEN 2
+                 WHEN 'part meronym' THEN 3 WHEN 'member meronym' THEN 4 WHEN 'substance meronym' THEN 5
+                 WHEN 'part holonym' THEN 6 WHEN 'member holonym' THEN 7 WHEN 'substance holonym' THEN 8
+                 WHEN 'antonym' THEN 9 WHEN 'derivation' THEN 10 WHEN 'pertainym' THEN 11 ELSE 12 END,
+                 (bo.word_id IS NOT NULL) DESC, tw.freq_pm DESC, wr.target
+             LIMIT 120",
+        )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let relations: Vec<(String, String)> = relstmt
-        .query_map([word_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+    let relations: Vec<RelTarget> = relstmt
+        .query_map(rusqlite::params![word_id, book_id], |r| {
+            Ok(RelTarget {
+                rel: r.get(0)?,
+                target: r.get(1)?,
+                target_word_id: r.get(2)?,
+                in_book: r.get::<_, i64>(3)? != 0,
+            })
+        })
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .filter_map(Result::ok)
+        .collect();
+
+    let mut tstmt = conn
+        .prepare("SELECT decade, pm FROM word_trajectory WHERE word_id = ?1 ORDER BY decade")
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let trajectory: Vec<(i32, f64)> = tstmt
+        .query_map([word_id], |r| Ok((r.get::<_, i64>(0)? as i32, r.get::<_, f64>(1)?)))
         .map_err(|e| ServerFnError::new(e.to_string()))?
         .filter_map(Result::ok)
         .collect();
 
     Ok(WordInfo {
         word_id, word, gloss, origin_code, origin_name, freq_pm, syllables, in_book, example,
-        verdict, categories, base, family, relations,
+        book_year, categories, base, family, relations, trajectory,
     })
 }
 
 #[server]
-pub async fn set_rating(book_id: i64, word_id: i64, verdict: String) -> Result<(), ServerFnError> {
+pub async fn set_tag(book_id: i64, word_id: i64, tag: String, on: bool) -> Result<(), ServerFnError> {
     use rusqlite::Connection;
+    if !TAGS.contains(&tag.as_str()) {
+        return Err(ServerFnError::new("unknown tag"));
+    }
     let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
-    conn.execute(
-        "INSERT INTO ratings(book_id, word_id, rater, verdict, ts)
-         VALUES (?1, ?2, 'me', ?3, datetime('now'))
-         ON CONFLICT(book_id, word_id, rater)
-         DO UPDATE SET verdict = excluded.verdict, ts = excluded.ts",
-        (book_id, word_id, verdict),
-    )
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if on {
+        conn.execute(
+            "INSERT OR IGNORE INTO word_tags(book_id, word_id, tag, rater, ts)
+             VALUES (?1, ?2, ?3, 'me', datetime('now'))",
+            (book_id, word_id, &tag),
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    } else {
+        conn.execute(
+            "DELETE FROM word_tags WHERE book_id = ?1 AND word_id = ?2 AND tag = ?3 AND rater = 'me'",
+            (book_id, word_id, &tag),
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -277,8 +374,6 @@ fn short(s: &Option<String>, n: usize) -> String {
     }
 }
 
-/// Split `text` into (segment, is_match) runs, matching `word` case-insensitively
-/// on whole-word boundaries — used to bold the headword inside an example sentence.
 fn highlight(text: &str, word: &str) -> Vec<(String, bool)> {
     let w = word.to_lowercase();
     let hay = text.to_lowercase();
@@ -313,21 +408,92 @@ fn highlight(text: &str, word: &str) -> Vec<(String, bool)> {
 }
 
 #[component]
+fn TagChips(book_id: i64, word_id: i64) -> impl IntoView {
+    let store = expect_context::<TagStore>();
+    let set_tag = ServerAction::<SetTag>::new();
+    let key = (book_id, word_id);
+    view! {
+        <span class="chips">
+            {TAGS.iter().map(|&tag| {
+                let on_tag = tag.to_string();
+                let is_on = move || store.0.with(|m| m.get(&key).is_some_and(|s| s.contains(on_tag.as_str())));
+                let click_tag = tag.to_string();
+                let on_click = move |_| {
+                    let now = store.0.with(|m| m.get(&key).is_some_and(|s| s.contains(click_tag.as_str())));
+                    let next = !now;
+                    store.0.update(|m| {
+                        let set = m.entry(key).or_default();
+                        if next { set.insert(click_tag.clone()); } else { set.remove(click_tag.as_str()); }
+                    });
+                    set_tag.dispatch(SetTag { book_id, word_id, tag: click_tag.clone(), on: next });
+                };
+                view! {
+                    <button type="button" class="chip" class:on=is_on on:click=on_click>{tag}</button>
+                }
+            }).collect_view()}
+        </span>
+    }
+}
+
+#[component]
+fn Trajectory(data: Vec<(i32, f64)>, book_year: Option<i64>) -> impl IntoView {
+    let w = 240.0_f64;
+    let h = 56.0_f64;
+    let plot_h = h - 12.0;
+    if data.is_empty() {
+        return view! { <p class="traj-empty">"no usage-over-time data"</p> }.into_any();
+    }
+    let max_pm = data.iter().map(|(_, p)| *p).fold(0.0_f64, f64::max).max(1e-9);
+    let min_dec = *data.iter().map(|(d, _)| d).min().unwrap();
+    let max_dec = *data.iter().map(|(d, _)| d).max().unwrap();
+    let n = data.len() as f64;
+    let bar_w = (w / n) * 0.78;
+    let bars: Vec<(f64, f64, f64)> = data.iter().enumerate().map(|(i, (_, pm))| {
+        let x = (i as f64) * (w / n) + (w / n - bar_w) / 2.0;
+        let bh = (pm / max_pm) * plot_h;
+        (x, plot_h - bh, bh)
+    }).collect();
+    let marker = book_year.map(|y| {
+        let bdec = (y as f64 / 10.0).floor() * 10.0;
+        let span = ((max_dec - min_dec) as f64).max(10.0);
+        let frac = ((bdec - min_dec as f64) / span).clamp(0.0, 1.0);
+        (frac * (w - (w / n)) + (w / n) / 2.0, y)
+    });
+    view! {
+        <svg class="traj" width=w height=h viewBox=format!("0 0 {w} {h}") role="img" aria-label="usage over time">
+            {bars.into_iter().map(|(x, y, bh)| view! {
+                <rect x=x y=y width=bar_w height=bh class="traj-bar"/>
+            }).collect_view()}
+            {marker.map(|(mx, yr)| view! {
+                <line x1=mx y1=0.0 x2=mx y2=plot_h class="traj-marker"/>
+                <text x=mx y=h text-anchor="middle" class="traj-yr">{yr.to_string()}</text>
+            })}
+            <text x=0.0 y=h class="traj-ax">{format!("{min_dec}s")}</text>
+            <text x=w y=h text-anchor="end" class="traj-ax">{format!("{max_dec}s")}</text>
+        </svg>
+    }.into_any()
+}
+
+#[component]
 fn HomePage() -> impl IntoView {
-    let book = RwSignal::new(1i64);
+    let (book_q, set_book) = query_signal::<i64>("book");
+    let (category, set_cat) = query_signal::<String>("cat");
+    let (selected, set_word) = query_signal::<i64>("word");
+    let book = Memo::new(move |_| book_q.get().unwrap_or(1));
     let only_top = RwSignal::new(false);
-    let category = RwSignal::new(None::<String>);
-    let selected = RwSignal::new(None::<i64>);
-    let rate = ServerAction::<SetRating>::new();
+
+    let tag_store = TagStore(RwSignal::new(HashMap::new()));
+    provide_context(tag_store);
 
     let books = Resource::new(|| (), |_| list_books());
+    let categories = Resource::new(move || book.get(), list_categories);
     let candidates = Resource::new(
-        move || (book.get(), category.get(), rate.version().get()),
-        move |(b, cat, _)| get_candidates(b, cat, 400),
+        move || (book.get(), category.get()),
+        move |(b, cat)| get_candidates(b, cat, 400),
     );
     let detail = Resource::new(
-        move || (book.get(), selected.get(), rate.version().get()),
-        move |(b, sel, _)| async move {
+        move || (book.get(), selected.get()),
+        move |(b, sel)| async move {
             match sel {
                 Some(wid) => word_detail(b, wid).await.map(Some),
                 None => Ok(None),
@@ -335,25 +501,54 @@ fn HomePage() -> impl IntoView {
         },
     );
 
+    // seed the tag store from loaded candidates (client-side, after render)
+    Effect::new(move |_| {
+        if let Some(Ok(list)) = candidates.get() {
+            let b = book.get();
+            tag_store.0.update(|m| {
+                for c in &list {
+                    m.entry((b, c.word_id)).or_default().extend(c.tags.iter().cloned());
+                }
+            });
+        }
+    });
+
     view! {
         <h1>"coolwords"</h1>
-        <p class="sub">"Pick the interesting words. Click a word for detail, a category to filter."</p>
+        <p class="sub">"Tag the interesting words. Click a word for detail; click a category to filter."</p>
 
         <div class="bar">
             <Suspense fallback=move || view! { <span>"…"</span> }>
                 {move || books.get().map(|res| match res {
                     Err(e) => view! { <span class="err">{format!("{e}")}</span> }.into_any(),
                     Ok(list) => view! {
-                        <span class="label">"book: "</span>
                         {list.into_iter().map(|b| {
                             let id = b.id;
                             view! {
                                 <button class:active=move || book.get() == id
-                                    on:click=move |_| { book.set(id); selected.set(None); category.set(None); }>
+                                    on:click=move |_| { set_book.set(Some(id)); set_word.set(None); set_cat.set(None); }>
                                     {format!("{} ({}★)", b.title, b.n_selected)}
                                 </button>
                             }
                         }).collect_view()}
+                    }.into_any(),
+                })}
+            </Suspense>
+            <Suspense fallback=|| ()>
+                {move || categories.get().map(|res| match res {
+                    Err(_) => ().into_any(),
+                    Ok(cats) => view! {
+                        <select class="catsel"
+                            prop:value=move || category.get().unwrap_or_default()
+                            on:change=move |ev| {
+                                let v = event_target_value(&ev);
+                                if v.is_empty() { set_cat.set(None); } else { set_cat.set(Some(v)); }
+                            }>
+                            <option value="">"all categories"</option>
+                            {cats.into_iter().map(|cc| view! {
+                                <option value=cc.category.clone()>{format!("{} ({})", cc.category, cc.count)}</option>
+                            }).collect_view()}
+                        </select>
                     }.into_any(),
                 })}
             </Suspense>
@@ -367,7 +562,7 @@ fn HomePage() -> impl IntoView {
         <Show when=move || category.get().is_some() fallback=|| ()>
             <p class="filter">
                 {move || format!("category: {}", category.get().unwrap_or_default())}
-                <button class="clear" on:click=move |_| category.set(None)>"clear"</button>
+                <button class="clear" on:click=move |_| set_cat.set(None)>"clear"</button>
             </p>
         </Show>
 
@@ -375,26 +570,20 @@ fn HomePage() -> impl IntoView {
             {move || candidates.get().map(|res| match res {
                 Err(e) => view! { <p class="err">{format!("Error: {e}")}</p> }.into_any(),
                 Ok(all) => {
+                    let b = book.get();
                     let top = only_top.get();
                     let list: Vec<Candidate> = all.into_iter().filter(|c| !top || c.selected).collect();
                     let total = list.len();
-                    let kept = list.iter().filter(|c| c.verdict.as_deref() == Some("keep")).count();
                     view! {
-                        <p class="counts">{format!("{total} shown · {kept} kept")}</p>
+                        <p class="counts">{format!("{total} shown")}</p>
                         <table>
                             <thead><tr>
                                 <th></th><th>"word"</th><th>"gloss"</th><th>"in bk"</th><th>"score"</th>
-                                <th>"origin"</th><th>"category"</th><th>"cl"</th><th>"verdict"</th><th></th>
+                                <th>"origin"</th><th>"category"</th><th>"cl"</th><th>"tags"</th>
                             </tr></thead>
                             <tbody>
                                 {list.into_iter().map(|c| {
                                     let wid = c.word_id;
-                                    let cls = match c.verdict.as_deref() {
-                                        Some("keep") => "row keep",
-                                        Some("reject") => "row reject",
-                                        Some("shadow") => "row shadow",
-                                        _ => "row",
-                                    };
                                     let star = if c.selected { "★" } else { "" };
                                     let gloss = short(&c.gloss, 90);
                                     let example = c.example.clone().unwrap_or_default();
@@ -402,12 +591,11 @@ fn HomePage() -> impl IntoView {
                                     let origin_title = c.origin_code.clone().unwrap_or_default();
                                     let cat = c.category.clone();
                                     let cat_click = cat.clone();
-                                    let verdict_txt = c.verdict.clone().unwrap_or_default();
                                     let cluster_txt = c.cluster.map(|n| n.to_string()).unwrap_or_default();
                                     view! {
-                                        <tr class=cls>
+                                        <tr class="row" class:tagged=move || store_has_tag(b, wid)>
                                             <td class="star">{star}</td>
-                                            <td class="word" title=example on:click=move |_| selected.set(Some(wid))>
+                                            <td class="word" title=example on:click=move |_| set_word.set(Some(wid))>
                                                 {c.word.clone()}
                                             </td>
                                             <td class="gloss">{gloss}</td>
@@ -415,21 +603,11 @@ fn HomePage() -> impl IntoView {
                                             <td class="num">{format!("{:.1}", c.score)}</td>
                                             <td title=origin_title>{origin_disp}</td>
                                             <td class="cat"
-                                                on:click=move |_| { if let Some(cc) = cat_click.clone() { category.set(Some(cc)); } }>
+                                                on:click=move |_| { if let Some(cc) = cat_click.clone() { set_cat.set(Some(cc)); } }>
                                                 {cat.clone().unwrap_or_default()}
                                             </td>
                                             <td class="num">{cluster_txt}</td>
-                                            <td class="verdict">{verdict_txt}</td>
-                                            <td class="actions">
-                                                {["keep", "reject", "shadow"].into_iter().map(|v| view! {
-                                                    <ActionForm action=rate>
-                                                        <input type="hidden" name="book_id" value=move || book.get().to_string()/>
-                                                        <input type="hidden" name="word_id" value=wid.to_string()/>
-                                                        <input type="hidden" name="verdict" value=v/>
-                                                        <button type="submit" class=v>{v}</button>
-                                                    </ActionForm>
-                                                }).collect_view()}
-                                            </td>
+                                            <td class="actions"><TagChips book_id=b word_id=wid/></td>
                                         </tr>
                                     }
                                 }).collect_view()}
@@ -442,28 +620,33 @@ fn HomePage() -> impl IntoView {
 
         <Show when=move || selected.get().is_some() fallback=|| ()>
             <aside class="detail">
-                <button class="close" on:click=move |_| selected.set(None)>"×"</button>
+                <button class="close" on:click=move |_| set_word.set(None)>"×"</button>
                 <Suspense fallback=move || view! { <p class="loading">"…"</p> }>
                     {move || detail.get().map(|res| match res {
                         Err(e) => view! { <p class="err">{format!("{e}")}</p> }.into_any(),
                         Ok(None) => ().into_any(),
                         Ok(Some(d)) => {
-                            let origin = d.origin_name.clone().or_else(|| d.origin_code.clone()).unwrap_or_default();
+                            let b = book.get();
                             let wid = d.word_id;
+                            let origin = d.origin_name.clone().or_else(|| d.origin_code.clone()).unwrap_or_default();
+                            // group relations by rel (already ordered)
+                            let mut groups: Vec<(String, Vec<RelTarget>)> = Vec::new();
+                            for rt in d.relations.clone() {
+                                if let Some(last) = groups.last_mut() {
+                                    if last.0 == rt.rel { last.1.push(rt); continue; }
+                                }
+                                groups.push((rt.rel.clone(), vec![rt]));
+                            }
                             view! {
                                 <h2>{d.word.clone()}</h2>
                                 <p class="gloss">{d.gloss.clone().unwrap_or_default()}</p>
                                 {d.example.clone().map(|ex| {
                                     let segs = highlight(&ex, &d.word);
-                                    view! {
-                                        <blockquote class="ex">
-                                            {segs.into_iter().map(|(s, hit)| if hit {
-                                                view! { <strong>{s}</strong> }.into_any()
-                                            } else {
-                                                view! { {s} }.into_any()
-                                            }).collect_view()}
-                                        </blockquote>
-                                    }
+                                    view! { <blockquote class="ex">
+                                        {segs.into_iter().map(|(s, hit)| if hit {
+                                            view! { <strong>{s}</strong> }.into_any()
+                                        } else { view! { {s} }.into_any() }).collect_view()}
+                                    </blockquote> }
                                 })}
                                 <ul class="meta">
                                     <li>{format!("in this book: {}×", d.in_book)}</li>
@@ -471,48 +654,51 @@ fn HomePage() -> impl IntoView {
                                     <li>{format!("syllables: {}", d.syllables.map(|n| n.to_string()).unwrap_or_default())}</li>
                                     <li>{format!("origin: {origin}")}</li>
                                 </ul>
+                                <Trajectory data=d.trajectory.clone() book_year=d.book_year/>
                                 <Show when={let c = d.categories.clone(); move || !c.is_empty()} fallback=|| ()>
                                     <p class="caps">"categories: "
                                         {d.categories.clone().into_iter().map(|cat| {
                                             let cc = cat.clone();
-                                            view! {
-                                                <button class="catchip" on:click=move |_| category.set(Some(cc.clone()))>{cat}</button>
-                                            }
+                                            view! { <button class="catchip" on:click=move |_| set_cat.set(Some(cc.clone()))>{cat}</button> }
                                         }).collect_view()}
                                     </p>
                                 </Show>
-                                <Show when={let b = d.base.clone(); move || b.is_some()} fallback=|| ()>
+                                <Show when={let bb = d.base.clone(); move || bb.is_some()} fallback=|| ()>
                                     <p class="base">
-                                        {let b = d.base.clone().unwrap();
-                                         format!("likely a variant of a more common word: {} ({:.1}/M)", b.0, b.1)}
+                                        {let bb = d.base.clone().unwrap();
+                                         format!("likely a variant of a more common word: {} ({:.1}/M)", bb.0, bb.1)}
                                     </p>
                                 </Show>
                                 <Show when={let f = d.family.clone(); move || f.len() > 1} fallback=|| ()>
                                     <p class="caps">"related forms in this book:"</p>
                                     <ul class="family">
-                                        {d.family.clone().into_iter().map(|(w, n, fp)| view! {
-                                            <li>{format!("{w} — {n}× here, {fp:.1}/M overall")}</li>
+                                        {d.family.clone().into_iter().map(|(fw, n, fp)| view! {
+                                            <li>{format!("{fw} — {n}× here, {fp:.1}/M overall")}</li>
                                         }).collect_view()}
                                     </ul>
                                 </Show>
-                                <Show when={let r = d.relations.clone(); move || !r.is_empty()} fallback=|| ()>
-                                    <p class="caps">"WordNet relations:"</p>
+                                <Show when={let r = groups.clone(); move || !r.is_empty()} fallback=|| ()>
+                                    <p class="caps">"WordNet relations (bold = also in this book):"</p>
                                     <ul class="rels">
-                                        {d.relations.clone().into_iter().map(|(rel, tgt)| view! {
-                                            <li><span class="rel">{rel}</span>" "{tgt}</li>
+                                        {groups.clone().into_iter().map(|(rel, items)| view! {
+                                            <li>
+                                                <span class="rel">{format!("{rel}: ")}</span>
+                                                {items.into_iter().enumerate().map(|(i, rt)| {
+                                                    let sep = if i > 0 { ", " } else { "" };
+                                                    let cls = if rt.in_book { "reltgt inbook" } else { "reltgt" };
+                                                    let target = rt.target.clone();
+                                                    match rt.target_word_id {
+                                                        Some(id) => view! {
+                                                            <span>{sep}<a class=cls on:click=move |_| set_word.set(Some(id))>{target}</a></span>
+                                                        }.into_any(),
+                                                        None => view! { <span>{sep}<span class=cls>{target}</span></span> }.into_any(),
+                                                    }
+                                                }).collect_view()}
+                                            </li>
                                         }).collect_view()}
                                     </ul>
                                 </Show>
-                                <div class="actions detail-actions">
-                                    {["keep", "reject", "shadow"].into_iter().map(|v| view! {
-                                        <ActionForm action=rate>
-                                            <input type="hidden" name="book_id" value=move || book.get().to_string()/>
-                                            <input type="hidden" name="word_id" value=wid.to_string()/>
-                                            <input type="hidden" name="verdict" value=v/>
-                                            <button type="submit" class=v>{v}</button>
-                                        </ActionForm>
-                                    }).collect_view()}
-                                </div>
+                                <div class="actions detail-actions"><TagChips book_id=b word_id=wid/></div>
                             }.into_any()
                         }
                     })}
@@ -520,4 +706,8 @@ fn HomePage() -> impl IntoView {
             </aside>
         </Show>
     }
+}
+
+fn store_has_tag(book_id: i64, word_id: i64) -> bool {
+    expect_context::<TagStore>().0.with(|m| m.get(&(book_id, word_id)).is_some_and(|s| !s.is_empty()))
 }

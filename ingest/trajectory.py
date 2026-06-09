@@ -31,13 +31,15 @@ def decade_totals() -> dict:
 def main() -> None:
     con = connect()
     want: dict = {}  # lowercased ascii word bytes -> word_id
+    # all distinct in-book words (candidates + relation/family targets that occur
+    # in a book), so anything clickable from the UI can get a usage chart.
     for wid, word in con.execute(
-        "SELECT DISTINCT c.word_id, w.word FROM candidates c JOIN words w ON w.id = c.word_id "
-        "WHERE w.alpha_only = 1"
+        "SELECT DISTINCT bo.word_id, w.word FROM book_occurrences bo JOIN words w ON w.id = bo.word_id "
+        "WHERE bo.word_id IS NOT NULL AND w.alpha_only = 1"
     ):
         if word.isascii():
             want[word.encode("ascii")] = wid
-    print(f"trajectory: tracking {len(want):,} candidate words", flush=True)
+    print(f"trajectory: tracking {len(want):,} in-book words", flush=True)
 
     totals = decade_totals()
     counts: dict = defaultdict(lambda: defaultdict(int))  # word_id -> decade -> match

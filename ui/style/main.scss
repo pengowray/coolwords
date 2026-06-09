@@ -57,6 +57,35 @@ h1 { margin-bottom: 0; }
 .detail .rel { color: #2980b9; }
 .detail-actions { margin-top: 1rem; }
 
+/* multi-tag chips */
+.chips { display: inline-flex; flex-wrap: wrap; gap: 2px; }
+.chip {
+  border: 1px solid #8884; background: transparent; border-radius: 10px;
+  padding: 0 6px; font-size: 0.72rem; line-height: 1.5; cursor: pointer; color: #888;
+}
+.chip:hover { border-color: #888; }
+.chip.on { background: #3498db; color: #fff; border-color: #3498db; }
+.row.tagged { background: #3498db14; }
+.detail-actions .chip { font-size: 0.85rem; padding: 0.15rem 0.6rem; }
+.catsel { padding: 0.2rem 0.3rem; border-radius: 6px; }
+
+/* usage-over-time sparkline */
+.traj { display: block; margin: 0.5rem 0; }
+.traj-bar { fill: #93a7b3; }
+.traj-marker { stroke: #c0392b; stroke-width: 1.5; stroke-dasharray: 2 2; }
+.traj-yr { fill: #c0392b; font-size: 8px; }
+.traj-ax { fill: #999; font-size: 8px; }
+.traj-empty { color: #aaa; font-size: 0.85rem; }
+
+/* grouped relations */
+.rels { list-style: none; padding-left: 0; font-size: 0.9rem; }
+.rels li { margin: 0.15rem 0; }
+.rels .rel { color: #999; }
+.reltgt { color: #666; }
+a.reltgt { color: #2980b9; cursor: pointer; }
+a.reltgt:hover { text-decoration: underline; }
+.reltgt.inbook { font-weight: 700; }
+
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: 0.3rem 0.6rem; border-bottom: 1px solid #8884; }
 th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: #888; }
