@@ -25,13 +25,23 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Book {
+    pub id: i64,
+    pub title: String,
+    pub n_selected: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Candidate {
     pub word_id: i64,
     pub word: String,
     pub in_book: i64,
     pub score: f64,
+    pub gloss: Option<String>,
     pub etymology: Option<String>,
     pub category: Option<String>,
+    pub cluster: Option<i64>,
+    pub selected: bool,
     pub verdict: Option<String>,
 }
 
@@ -49,12 +59,36 @@ fn db_path() -> String {
 }
 
 #[server]
+pub async fn list_books() -> Result<Vec<Book>, ServerFnError> {
+    use rusqlite::Connection;
+    let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT b.id, COALESCE(b.title, b.slug),
+                    (SELECT count(*) FROM candidates c WHERE c.book_id = b.id AND c.selected = 1)
+             FROM books b ORDER BY b.id",
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(Book { id: r.get(0)?, title: r.get(1)?, n_selected: r.get(2)? })
+        })
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| ServerFnError::new(e.to_string()))?);
+    }
+    Ok(out)
+}
+
+#[server]
 pub async fn get_candidates(book_id: i64, limit: i32) -> Result<Vec<Candidate>, ServerFnError> {
     use rusqlite::Connection;
     let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
     let mut stmt = conn
         .prepare(
-            "SELECT w.id, w.word, c.in_book, c.score, w.etymology_lang, w.wordnet_category, r.verdict
+            "SELECT w.id, w.word, c.in_book, c.score, w.gloss, w.etymology_lang,
+                    w.wordnet_category, c.cluster, c.selected, r.verdict
              FROM candidates c
              JOIN words w ON w.id = c.word_id
              LEFT JOIN ratings r ON r.book_id = c.book_id AND r.word_id = c.word_id
@@ -70,9 +104,12 @@ pub async fn get_candidates(book_id: i64, limit: i32) -> Result<Vec<Candidate>, 
                 word: row.get(1)?,
                 in_book: row.get(2)?,
                 score: row.get(3)?,
-                etymology: row.get(4)?,
-                category: row.get(5)?,
-                verdict: row.get(6)?,
+                gloss: row.get(4)?,
+                etymology: row.get(5)?,
+                category: row.get(6)?,
+                cluster: row.get(7)?,
+                selected: row.get::<_, i64>(8)? != 0,
+                verdict: row.get(9)?,
             })
         })
         .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -114,33 +151,79 @@ pub fn App() -> impl IntoView {
     }
 }
 
+fn short(g: &Option<String>, n: usize) -> String {
+    match g {
+        None => String::new(),
+        Some(s) => {
+            let t: String = s.chars().take(n).collect();
+            if s.chars().count() > n {
+                format!("{t}…")
+            } else {
+                t
+            }
+        }
+    }
+}
+
 #[component]
 fn HomePage() -> impl IntoView {
-    // Alice in Wonderland (book_id 2) — the smaller, cleaner list, to start.
-    let book_id = 2i64;
+    let book = RwSignal::new(1i64); // Moby-Dick by default
+    let only_top = RwSignal::new(false);
     let rate = ServerAction::<SetRating>::new();
+    let books = Resource::new(|| (), |_| list_books());
     let candidates = Resource::new(
-        move || rate.version().get(),
-        move |_| get_candidates(book_id, 300),
+        move || (book.get(), rate.version().get()),
+        move |(b, _)| get_candidates(b, 400),
     );
 
     view! {
         <h1>"coolwords"</h1>
-        <p class="sub">"Rate the interesting-word candidates: keep / reject / shadow."</p>
+        <p class="sub">"Pick the interesting words. keep / reject / shadow — ratings persist."</p>
+
+        <div class="bar">
+            <Suspense fallback=move || view! { <span>"…"</span> }>
+                {move || books.get().map(|res| match res {
+                    Err(e) => view! { <span class="err">{format!("{e}")}</span> }.into_any(),
+                    Ok(list) => view! {
+                        <span class="label">"book: "</span>
+                        {list.into_iter().map(|b| {
+                            let id = b.id;
+                            let active = move || book.get() == id;
+                            view! {
+                                <button
+                                    class:active=active
+                                    on:click=move |_| book.set(id)
+                                >{format!("{} ({}★)", b.title, b.n_selected)}</button>
+                            }
+                        }).collect_view()}
+                    }.into_any(),
+                })}
+            </Suspense>
+            <label class="toggle">
+                <input type="checkbox" prop:checked=move || only_top.get()
+                    on:change=move |_| only_top.update(|v| *v = !*v)/>
+                " varied top-20 only"
+            </label>
+        </div>
+
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
             {move || {
                 candidates.get().map(|res| match res {
                     Err(e) => view! { <p class="err">{format!("Error: {e}")}</p> }.into_any(),
-                    Ok(list) => {
+                    Ok(all) => {
+                        let top = only_top.get();
+                        let list: Vec<Candidate> =
+                            all.into_iter().filter(|c| !top || c.selected).collect();
                         let total = list.len();
                         let kept = list.iter().filter(|c| c.verdict.as_deref() == Some("keep")).count();
                         view! {
-                            <p class="counts">{format!("{total} candidates · {kept} kept")}</p>
+                            <p class="counts">{format!("{total} shown · {kept} kept")}</p>
                             <table>
                                 <thead>
                                     <tr>
-                                        <th>"word"</th><th>"in book"</th><th>"score"</th>
-                                        <th>"origin"</th><th>"category"</th><th>"verdict"</th><th></th>
+                                        <th></th><th>"word"</th><th>"gloss"</th><th>"in bk"</th>
+                                        <th>"score"</th><th>"origin"</th><th>"category"</th>
+                                        <th>"cl"</th><th>"verdict"</th><th></th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -152,20 +235,26 @@ fn HomePage() -> impl IntoView {
                                             Some("shadow") => "row shadow",
                                             _ => "row",
                                         };
+                                        let star = if c.selected { "★" } else { "" };
+                                        let gloss = short(&c.gloss, 95);
                                         let verdict_txt = c.verdict.clone().unwrap_or_default();
+                                        let cluster_txt = c.cluster.map(|n| n.to_string()).unwrap_or_default();
                                         view! {
                                             <tr class=cls>
+                                                <td class="star">{star}</td>
                                                 <td class="word">{c.word.clone()}</td>
+                                                <td class="gloss">{gloss}</td>
                                                 <td class="num">{c.in_book}</td>
                                                 <td class="num">{format!("{:.1}", c.score)}</td>
                                                 <td>{c.etymology.clone().unwrap_or_default()}</td>
                                                 <td>{c.category.clone().unwrap_or_default()}</td>
+                                                <td class="num">{cluster_txt}</td>
                                                 <td class="verdict">{verdict_txt}</td>
                                                 <td class="actions">
                                                     {["keep", "reject", "shadow"].into_iter().map(|v| {
                                                         view! {
                                                             <ActionForm action=rate>
-                                                                <input type="hidden" name="book_id" value=book_id.to_string()/>
+                                                                <input type="hidden" name="book_id" value=move || book.get().to_string()/>
                                                                 <input type="hidden" name="word_id" value=wid.to_string()/>
                                                                 <input type="hidden" name="verdict" value=v/>
                                                                 <button type="submit" class=v>{v}</button>

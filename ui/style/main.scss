@@ -14,6 +14,18 @@ h1 { margin-bottom: 0; }
 .loading, .err { color: #888; }
 .err { color: #c0392b; }
 
+.bar { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; margin: 0.8rem 0; }
+.bar .label { color: #888; }
+.bar > button {
+  border: 1px solid #8886; background: transparent; border-radius: 6px;
+  padding: 0.25rem 0.7rem; cursor: pointer;
+}
+.bar > button.active { background: #3498db; color: white; border-color: #3498db; }
+.toggle { margin-left: auto; color: #888; cursor: pointer; user-select: none; }
+
+.star { color: #f1c40f; width: 1rem; }
+.gloss { color: #999; font-size: 0.88rem; max-width: 26rem; }
+
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: 0.3rem 0.6rem; border-bottom: 1px solid #8884; }
 th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: #888; }
