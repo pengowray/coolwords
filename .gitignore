@@ -1,0 +1,16 @@
+# Rust
+target/
+/ui/target/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local data: database, embedding sidecar, downloaded books (all reproducible)
+/data/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
