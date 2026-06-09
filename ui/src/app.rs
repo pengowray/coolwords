@@ -91,6 +91,17 @@ pub struct RelTarget {
     pub in_book: bool,
 }
 
+/// The resolved root/lemma of a headword (e.g. "harpoon" for "harpooneer"),
+/// shown as a second usage-over-time chart with its own category.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RootInfo {
+    pub word: String,
+    pub word_id: i64,
+    pub freq_pm: Option<f64>,
+    pub category: Option<String>,
+    pub trajectory: Vec<(i32, f64)>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WordInfo {
     pub word_id: i64,
@@ -109,9 +120,13 @@ pub struct WordInfo {
     pub family: Vec<(String, i64, f64)>,
     pub relations: Vec<RelTarget>,
     pub trajectory: Vec<(i32, f64)>,
-    /// Usage trajectory relative to the book's year, as a human label:
-    /// "of its time" / "before its time" / "old fashioned" / "timeless".
+    /// Era label (relative to the book's year): "ahead of its time" / "of its
+    /// time" / "declining" / "timeless" / "always rare".
     pub era: Option<String>,
+    /// Present-day status, orthogonal to `era`: effectively extinct today.
+    pub obsolete: bool,
+    /// Root/lemma word (when distinct), for a second usage chart.
+    pub root: Option<RootInfo>,
 }
 
 #[cfg(feature = "ssr")]
@@ -215,15 +230,28 @@ fn common_origins_sql() -> String {
     COMMON_ORIGINS.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(",")
 }
 
-/// Classify a word's usage trajectory relative to a book's publication decade.
-/// Returns a short key: "of" (peaked around the book era), "before" (took off
-/// later — the book used it ahead of its time), "old" (already commoner before),
-/// or "timeless" (roughly steady). `None` when there isn't enough data.
+/// Window-average usage (per million) at or below this counts as "rare".
+#[cfg(feature = "ssr")]
+const RARE_PM: f64 = 0.10;
+/// Decades from here onward stand in for "the present day" (the corpus ends in
+/// the 2000s decade), used by the obsolete-today test.
+#[cfg(feature = "ssr")]
+const RECENT_FROM: i32 = 1980;
+
+/// Classify a word's usage trajectory *relative to a book's publication decade* —
+/// a fixed historical question, independent of the present day. Returns a key:
+/// "ahead" (rare then, common later), "of" (peaked around the book era), "after"
+/// (its heyday was earlier — fading by the book's time), "timeless" (roughly
+/// steady), or "rare" (never common in any era). `None` without enough data.
 #[cfg(feature = "ssr")]
 fn classify_era(traj: &[(i32, f64)], book_year: Option<i64>) -> Option<&'static str> {
     let year = book_year?;
     if traj.len() < 3 {
         return None;
+    }
+    let peak = traj.iter().map(|(_, p)| *p).fold(0.0_f64, f64::max);
+    if peak < RARE_PM {
+        return Some("rare"); // never common in any decade
     }
     let bdec = (year as f64 / 10.0).floor() as i32 * 10;
     let mean = |lo: i32, hi: i32| -> Option<f64> {
@@ -235,30 +263,45 @@ fn classify_era(traj: &[(i32, f64)], book_year: Option<i64>) -> Option<&'static 
     let at = mean(bdec - 10, bdec + 10).unwrap_or(0.0);
     let before = mean(i32::MIN, bdec - 20).unwrap_or(at);
     let after = mean(bdec + 20, i32::MAX).unwrap_or(at);
-    let peak = before.max(at).max(after);
-    if peak <= 0.0 {
-        return None;
-    }
-    let trough = before.min(at).min(after);
-    if (peak - trough) / peak < 0.25 {
+    let hi = before.max(at).max(after);
+    let lo = before.min(at).min(after);
+    if hi <= 0.0 || (hi - lo) / hi < 0.25 {
         return Some("timeless");
     }
     if at >= before && at >= after {
         return Some("of");
     }
     if after > before {
-        return Some("before");
+        return Some("ahead");
     }
-    Some("old")
+    Some("after")
+}
+
+/// Present-day status (book-independent, orthogonal to `classify_era`): a word
+/// that had genuine usage once but is effectively extinct in the most recent
+/// decades. Anchored to an absolute recent window so a word that died long ago
+/// is still caught (its trajectory simply has no recent points → recent ≈ 0).
+#[cfg(feature = "ssr")]
+fn is_obsolete_now(traj: &[(i32, f64)]) -> bool {
+    if traj.len() < 3 {
+        return false;
+    }
+    let peak = traj.iter().map(|(_, p)| *p).fold(0.0_f64, f64::max);
+    if peak < RARE_PM {
+        return false; // never common enough to "become" obsolete — that's "always rare"
+    }
+    let recent = traj.iter().filter(|(d, _)| *d >= RECENT_FROM).map(|(_, p)| *p).fold(0.0_f64, f64::max);
+    recent < RARE_PM && recent < 0.15 * peak
 }
 
 #[cfg(feature = "ssr")]
 fn era_label(key: &str) -> &'static str {
     match key {
+        "ahead" => "ahead of its time",
         "of" => "of its time",
-        "before" => "before its time",
-        "old" => "old fashioned",
+        "after" => "declining",
         "timeless" => "timeless",
+        "rare" => "always rare",
         _ => "",
     }
 }
@@ -346,19 +389,32 @@ pub async fn list_categories(book_id: i64) -> Result<Vec<FilterOpt>, ServerFnErr
         }
     }
 
-    // --- era (relative to the book's year), classified from each word's trajectory ---
+    // --- era (relative to the book's year) + present-day status, both classified
+    // from each word's trajectory in a single pass ---
     let year = book_year(&conn, book_id)?;
     let traj = book_trajectories(&conn, book_id)?;
     let mut era_counts: HashMap<&str, i64> = HashMap::new();
+    let mut n_obsolete = 0i64;
     for t in traj.values() {
         if let Some(k) = classify_era(t, year) {
             *era_counts.entry(k).or_default() += 1;
         }
+        if is_obsolete_now(t) {
+            n_obsolete += 1;
+        }
     }
-    for key in ["before", "of", "old", "timeless"] {
+    for key in ["ahead", "of", "after", "timeless", "rare"] {
         if let Some(&n) = era_counts.get(key) {
             out.push(opt(format!("era:{key}"), era_label(key).to_string(), n, "era (vs. book's year)"));
         }
+    }
+    if n_obsolete > 0 {
+        out.push(opt(
+            "status:obsolete".to_string(),
+            "obsolete today".to_string(),
+            n_obsolete,
+            "present-day status",
+        ));
     }
 
     // --- unusual origin ---
@@ -413,6 +469,9 @@ pub async fn get_candidates(
     // trajectory; the rest become a SQL WHERE fragment.
     let cat = category.as_deref().unwrap_or("");
     let era_filter = cat.strip_prefix("era:");
+    let obsolete_filter = cat == "status:obsolete";
+    // era + obsolete are resolved in Rust from each word's trajectory.
+    let needs_traj = era_filter.is_some() || obsolete_filter;
     let mut where_extra = String::new();
     let mut bind_cat: Option<String> = None; // bound as ?2 when present
     if let Some(p) = cat.strip_prefix("pos:") {
@@ -424,16 +483,16 @@ pub async fn get_candidates(
             " AND w.etymology_lang IS NOT NULL AND w.etymology_lang NOT IN ({})",
             common_origins_sql()
         );
-    } else if era_filter.is_none() && !cat.is_empty() {
+    } else if !needs_traj && !cat.is_empty() {
         where_extra =
             " AND EXISTS (SELECT 1 FROM word_category wc WHERE wc.word_id = w.id AND wc.category = ?2)"
                 .into();
         bind_cat = Some(cat.to_string());
     }
 
-    // era needs every candidate (to classify), so fetch unbounded and truncate
-    // after filtering; otherwise push the limit into SQL.
-    let limit_sql = if era_filter.is_some() { String::new() } else { format!(" LIMIT {}", limit.max(0)) };
+    // trajectory filters need every candidate (to classify), so fetch unbounded
+    // and truncate after filtering; otherwise push the limit into SQL.
+    let limit_sql = if needs_traj { String::new() } else { format!(" LIMIT {}", limit.max(0)) };
     let sql = format!(
         "SELECT w.id, w.word, c.in_book, c.score, w.gloss, w.etymology_lang, ln.name,
                 w.wordnet_category, c.cluster, c.selected, bo.example
@@ -476,12 +535,16 @@ pub async fn get_candidates(
             .collect(),
     };
 
-    if let Some(era) = era_filter {
+    if needs_traj {
         let year = book_year(&conn, book_id)?;
         let traj = book_trajectories(&conn, book_id)?;
-        out.retain(|c| {
-            traj.get(&c.word_id).and_then(|t| classify_era(t, year)).is_some_and(|k| k == era)
-        });
+        if let Some(era) = era_filter {
+            out.retain(|c| {
+                traj.get(&c.word_id).and_then(|t| classify_era(t, year)).is_some_and(|k| k == era)
+            });
+        } else {
+            out.retain(|c| traj.get(&c.word_id).is_some_and(|t| is_obsolete_now(t)));
+        }
         out.truncate(limit.max(0) as usize);
     }
 
@@ -605,10 +668,51 @@ pub async fn word_detail(book_id: i64, word_id: i64) -> Result<WordInfo, ServerF
         .collect();
 
     let era = classify_era(&trajectory, book_year).map(|k| era_label(k).to_string());
+    let obsolete = is_obsolete_now(&trajectory);
+
+    // Root/lemma (when distinct from the headword): its own usage chart + category,
+    // so e.g. "harpooneer" also shows the trajectory of "harpoon".
+    let mut root = None;
+    if let Some(st) = &stem {
+        if st != &word {
+            let row = conn
+                .query_row(
+                    "SELECT id, freq_pm, wordnet_category FROM words WHERE word = ?1",
+                    rusqlite::params![st],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?, r.get::<_, Option<String>>(2)?)),
+                )
+                .optional()
+                .map_err(|e| ServerFnError::new(e.to_string()))?;
+            if let Some((rid, rfreq, rcat0)) = row {
+                let mut rts = conn
+                    .prepare("SELECT decade, pm FROM word_trajectory WHERE word_id = ?1 ORDER BY decade")
+                    .map_err(|e| ServerFnError::new(e.to_string()))?;
+                let rtraj: Vec<(i32, f64)> = rts
+                    .query_map([rid], |r| Ok((r.get::<_, i64>(0)? as i32, r.get::<_, f64>(1)?)))
+                    .map_err(|e| ServerFnError::new(e.to_string()))?
+                    .filter_map(Result::ok)
+                    .collect();
+                let category = rcat0.or_else(|| {
+                    conn.query_row(
+                        "SELECT category FROM word_category WHERE word_id = ?1 ORDER BY is_primary DESC, category LIMIT 1",
+                        [rid],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                });
+                // only worth a second chart if the root carries some usage history
+                if !rtraj.is_empty() {
+                    root = Some(RootInfo { word: st.clone(), word_id: rid, freq_pm: rfreq, category, trajectory: rtraj });
+                }
+            }
+        }
+    }
 
     Ok(WordInfo {
         word_id, word, gloss, origin_code, origin_name, freq_pm, syllables, in_book, example,
-        book_year, categories, buckets, base, family, relations, trajectory, era,
+        book_year, categories, buckets, base, family, relations, trajectory, era, obsolete, root,
     })
 }
 
@@ -1011,11 +1115,34 @@ fn HomePage() -> impl IntoView {
                                     <li>{format!("origin: {origin}")}</li>
                                 </ul>
                                 <Trajectory data=d.trajectory.clone() book_year=d.book_year/>
-                                {d.era.clone().map(|e| view! {
-                                    <p class="era"
-                                        title="usage trajectory relative to this book's decade: of its time = peaked around then; before its time = took off later; old fashioned = was commoner before; timeless = roughly steady">
-                                        "usage: " <strong>{e}</strong>
-                                    </p>
+                                {(d.era.is_some() || d.obsolete).then(|| {
+                                    let era = d.era.clone();
+                                    let obs = d.obsolete;
+                                    view! {
+                                        <p class="era">
+                                            {era.map(|e| view! {
+                                                <span title="trajectory relative to this book's decade — ahead of its time: rare then, common later; of its time: peaked around then; declining: its heyday was earlier; timeless: roughly steady; always rare: never common in any era">
+                                                    "usage: " <strong>{e}</strong>
+                                                </span>
+                                            })}
+                                            {obs.then(|| view! {
+                                                <span class="badge-obs" title="had real usage once, but is effectively extinct today — measured against the present day, not the book's era">"obsolete today"</span>
+                                            })}
+                                        </p>
+                                    }
+                                })}
+                                {d.root.clone().map(|r| {
+                                    let rid = r.word_id;
+                                    let rword = r.word.clone();
+                                    let cat = r.category.clone().map(|c| format!(" · {c}")).unwrap_or_default();
+                                    view! {
+                                        <p class="caps rootlbl">
+                                            "root word: "
+                                            <a class="reltgt" on:click=move |_| set_word.set(Some(rid))>{rword}</a>
+                                            {format!("  {:.1}/M{cat}", r.freq_pm.unwrap_or(0.0))}
+                                        </p>
+                                        <Trajectory data=r.trajectory.clone() book_year=d.book_year/>
+                                    }
                                 })}
                                 <Show when={let c = d.categories.clone(); move || !c.is_empty()} fallback=|| ()>
                                     <p class="caps">"categories: "

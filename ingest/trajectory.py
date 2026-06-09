@@ -5,8 +5,10 @@ per-(token, decade) buckets, normalizes each decade by that decade's summed
 corpus total (so growth of the corpus itself doesn't masquerade as word growth),
 and writes word_trajectory(word_id, decade, pm).
 
-Gated to the words actually shown in the UI (distinct candidate words) to keep
-the table tiny (~7k words, ~120k rows). Run after candidates exist; re-runnable.
+Gated to the words the UI can chart: every distinct in-book word, plus the
+resolved stem/root of each in-book word (so the detail panel's second "root word"
+chart has data even when the root itself doesn't occur in the book). Run after
+books are ingested; re-runnable.
 """
 import zipfile
 from collections import defaultdict
@@ -31,15 +33,23 @@ def decade_totals() -> dict:
 def main() -> None:
     con = connect()
     want: dict = {}  # lowercased ascii word bytes -> word_id
-    # all distinct in-book words (candidates + relation/family targets that occur
-    # in a book), so anything clickable from the UI can get a usage chart.
+    # every distinct in-book word, plus the resolved stem/root of each in-book
+    # word — so anything clickable from the UI, and the "root word" second chart,
+    # can get a usage trajectory.
     for wid, word in con.execute(
-        "SELECT DISTINCT bo.word_id, w.word FROM book_occurrences bo JOIN words w ON w.id = bo.word_id "
-        "WHERE bo.word_id IS NOT NULL AND w.alpha_only = 1"
+        """SELECT DISTINCT w.id, w.word FROM words w
+           WHERE w.alpha_only = 1 AND (
+               w.id IN (SELECT word_id FROM book_occurrences WHERE word_id IS NOT NULL)
+               OR w.word IN (
+                   SELECT DISTINCT iw.stem FROM book_occurrences bo
+                   JOIN words iw ON iw.id = bo.word_id
+                   WHERE iw.stem IS NOT NULL
+               )
+           )"""
     ):
         if word.isascii():
             want[word.encode("ascii")] = wid
-    print(f"trajectory: tracking {len(want):,} in-book words", flush=True)
+    print(f"trajectory: tracking {len(want):,} in-book + root words", flush=True)
 
     totals = decade_totals()
     counts: dict = defaultdict(lambda: defaultdict(int))  # word_id -> decade -> match
