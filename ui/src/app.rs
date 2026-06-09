@@ -83,6 +83,9 @@ pub struct Candidate {
     pub buckets: Vec<String>,
     /// Distinct in-book surface forms merged into this group (1 = no merge).
     pub n_forms: i64,
+    /// In-book member word_ids of this group (incl. the representative), so tag
+    /// state can be unioned across the family for cross-level visibility.
+    pub members: Vec<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -119,7 +122,9 @@ pub struct WordInfo {
     pub categories: Vec<String>,
     pub buckets: Vec<String>,
     pub base: Option<(String, f64)>,
-    pub family: Vec<(String, i64, f64)>,
+    /// In-book members of this word's group at the chosen level: (word_id, word,
+    /// in-book count, overall freq_pm). Each is individually taggable in the UI.
+    pub family: Vec<(i64, String, i64, f64)>,
     pub relations: Vec<RelTarget>,
     pub trajectory: Vec<(i32, f64)>,
     /// Era label (relative to the book's year): "ahead of its time" / "of its
@@ -525,6 +530,7 @@ pub async fn get_candidates(
             tags: Vec::new(),
             buckets: Vec::new(),
             n_forms: row.get(11)?,
+            members: Vec::new(),
         })
     };
     let mut out: Vec<Candidate> = match &bind_cat {
@@ -553,6 +559,25 @@ pub async fn get_candidates(
         out.truncate(limit.max(0) as usize);
     }
 
+    // in-book member word_ids per group representative at this level (level 0:
+    // each word maps to itself, so members = [self]).
+    let mut members_map: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut ms = conn
+        .prepare(
+            "SELECT COALESCE(wl.lemma_id, bo.word_id) AS rep, bo.word_id
+             FROM book_occurrences bo
+             LEFT JOIN word_lemma wl ON wl.word_id = bo.word_id AND wl.level = ?2
+             WHERE bo.book_id = ?1 AND bo.word_id IS NOT NULL",
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    for (rep, wid) in ms
+        .query_map([book_id, level], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .filter_map(Result::ok)
+    {
+        members_map.entry(rep).or_default().push(wid);
+    }
+
     for c in &mut out {
         if let Some(t) = tags.get(&c.word_id) {
             c.tags = t.clone();
@@ -560,6 +585,7 @@ pub async fn get_candidates(
         if let Some(b) = buckets.get(&c.word_id) {
             c.buckets = b.clone();
         }
+        c.members = members_map.remove(&c.word_id).unwrap_or_else(|| vec![c.word_id]);
     }
     Ok(out)
 }
@@ -619,7 +645,7 @@ pub async fn word_detail(book_id: i64, word_id: i64, level: i64) -> Result<WordI
     let mut family = Vec::new();
     let mut fstmt = conn
         .prepare(
-            "SELECT w.word, bo.count, w.freq_pm
+            "SELECT w.id, w.word, bo.count, w.freq_pm
              FROM book_occurrences bo JOIN words w ON w.id = bo.word_id
              WHERE bo.book_id = ?1 AND w.alpha_only = 1 AND (
                  w.id = ?2
@@ -630,7 +656,8 @@ pub async fn word_detail(book_id: i64, word_id: i64, level: i64) -> Result<WordI
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     let rows = fstmt
         .query_map(rusqlite::params![book_id, word_id, level], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<f64>>(2)?.unwrap_or(0.0)))
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?,
+                r.get::<_, Option<f64>>(3)?.unwrap_or(0.0)))
         })
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     for r in rows {
@@ -749,6 +776,16 @@ pub async fn set_tag(book_id: i64, word_id: i64, tag: String, on: bool) -> Resul
     Ok(())
 }
 
+/// All tags for a book, keyed by word_id — used to seed the client store so tag
+/// state is known for every surface form (not just the candidate representatives),
+/// which makes the family union (cross-level visibility) reactive.
+#[server]
+pub async fn book_tags(book_id: i64) -> Result<Vec<(i64, Vec<String>)>, ServerFnError> {
+    use rusqlite::Connection;
+    let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(load_tags(&conn, book_id)?.into_iter().collect())
+}
+
 // ---- client-side tag helpers (operate on the shared Tagger context) ----
 fn has_tag(t: Tagger, key: (i64, i64), tag: &str) -> bool {
     t.store.with(|m| m.get(&key).is_some_and(|s| s.contains(tag)))
@@ -758,6 +795,14 @@ fn has_any_tag(t: Tagger, key: (i64, i64)) -> bool {
 }
 fn has_other_tags(t: Tagger, key: (i64, i64)) -> bool {
     t.store.with(|m| m.get(&key).is_some_and(|s| s.iter().any(|x| x != "star")))
+}
+/// Any in-book member of the group carries a tag (drives the cross-level "this
+/// family is tagged" highlight regardless of which level introduced the tag).
+fn group_has_any(t: Tagger, book_id: i64, members: &[i64]) -> bool {
+    members.iter().any(|&w| has_any_tag(t, (book_id, w)))
+}
+fn group_has_other(t: Tagger, book_id: i64, members: &[i64]) -> bool {
+    members.iter().any(|&w| has_other_tags(t, (book_id, w)))
 }
 fn toggle_tag(t: Tagger, book_id: i64, word_id: i64, tag: &str) {
     let key = (book_id, word_id);
@@ -948,12 +993,15 @@ fn HomePage() -> impl IntoView {
         },
     );
 
+    // Seed the client tag store with EVERY tagged word in the book (not just the
+    // candidate representatives), so the family union reads correctly at any level.
+    let all_tags = Resource::new(move || book.get(), book_tags);
     Effect::new(move |_| {
-        if let Some(Ok(list)) = candidates.get() {
+        if let Some(Ok(rows)) = all_tags.get() {
             let b = book.get();
             tagger.store.update(|m| {
-                for c in &list {
-                    m.entry((b, c.word_id)).or_default().extend(c.tags.iter().cloned());
+                for (wid, tags) in &rows {
+                    m.entry((b, *wid)).or_default().extend(tags.iter().cloned());
                 }
             });
         }
@@ -1056,6 +1104,8 @@ fn HomePage() -> impl IntoView {
                                     let bk = c.buckets.clone();
                                     let star = if c.selected { "•" } else { "" };
                                     let nforms = c.n_forms;
+                                    let members = c.members.clone();
+                                    let members_has = c.members.clone();
                                     let gloss = short(&c.gloss, 90);
                                     let example = c.example.clone().unwrap_or_default();
                                     let origin_disp = c.origin_name.clone().or_else(|| c.origin_code.clone()).unwrap_or_default();
@@ -1064,7 +1114,7 @@ fn HomePage() -> impl IntoView {
                                     let cat_click = cat.clone();
                                     let cluster_txt = c.cluster.map(|n| n.to_string()).unwrap_or_default();
                                     view! {
-                                        <tr class="row" class:tagged=move || has_any_tag(tagger, (b, wid))>
+                                        <tr class="row" class:tagged=move || group_has_any(tagger, b, &members)>
                                             <td class="sel">{star}</td>
                                             <td class="word" title=example on:click=move |_| set_word.set(Some(wid))>
                                                 {c.word.clone()}
@@ -1084,7 +1134,7 @@ fn HomePage() -> impl IntoView {
                                             <td class="tagcell">
                                                 <Star book_id=b word_id=wid/>
                                                 <button type="button" class="tagbtn"
-                                                    class:has=move || has_other_tags(tagger, (b, wid))
+                                                    class:has=move || group_has_other(tagger, b, &members_has)
                                                     on:click=move |_| open_picker.update(|o| *o = if *o == Some(wid) { None } else { Some(wid) })>
                                                     "tags"
                                                 </button>
@@ -1186,10 +1236,14 @@ fn HomePage() -> impl IntoView {
                                     </p>
                                 </Show>
                                 <Show when={let f = d.family.clone(); move || f.len() > 1} fallback=|| ()>
-                                    <p class="caps">"related forms in this book:"</p>
+                                    <p class="caps">"forms merged here (★ to tag a variant):"</p>
                                     <ul class="family">
-                                        {d.family.clone().into_iter().map(|(fw, n, fp)| view! {
-                                            <li>{format!("{fw} — {n}× here, {fp:.1}/M overall")}</li>
+                                        {d.family.clone().into_iter().map(|(fwid, fw, n, fp)| view! {
+                                            <li>
+                                                <Star book_id=b word_id=fwid/>
+                                                <span class="word" on:click=move |_| set_word.set(Some(fwid))>{fw}</span>
+                                                {format!(" — {n}× here, {fp:.1}/M overall")}
+                                            </li>
                                         }).collect_view()}
                                     </ul>
                                 </Show>

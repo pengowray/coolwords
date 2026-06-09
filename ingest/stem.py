@@ -58,17 +58,23 @@ COS_MIN = 0.35
 LEVELS = (1, 2, 3)
 
 
-def base_of(word: str, freq: dict, rules: list, adj: set | None = None) -> str | None:
+def base_of(word: str, freq: dict, rules: list, adj: set | None = None, aggressive: bool = False) -> str | None:
     """One suffix-strip step to the max-frequency real word in the family.
-    For comparative suffixes the base must be an adjective (see CMP) when `adj`
-    is supplied, so agentive -er (baker, hatter) is not stripped."""
+
+    Levels 1-2 gate comparative suffixes (CMP) on the base being an adjective, so
+    agentive -er stays split (baker, hatter). The aggressive level (3) drops that
+    gate AND undoes consonant doubling (hatter->hat, runner->run, bigger->big) —
+    only the *bare* de-doubled form, so we never invent hatter->hate."""
     for suf, repls in rules:
         if word.endswith(suf) and len(word) > len(suf) + 1:
             stem = word[: -len(suf)]
-            gated = adj is not None and suf in CMP
-            hits = [(stem + r, freq[stem + r]) for r in repls
-                    if stem + r != word and len(stem + r) >= 3 and freq.get(stem + r) is not None
-                    and (not gated or (stem + r) in adj)]
+            cands = [stem + r for r in repls]
+            if aggressive and len(stem) >= 3 and stem[-1] == stem[-2] and stem[-1] not in "aeiou":
+                cands.append(stem[:-1])  # de-double: hatt->hat, runn->run, bigg->big
+            gated = adj is not None and suf in CMP and not aggressive
+            hits = [(c, freq[c]) for c in cands
+                    if c != word and len(c) >= 3 and freq.get(c) is not None
+                    and (not gated or c in adj)]
             if hits:
                 hits.sort(key=lambda x: -x[1])
                 return hits[0][0]
@@ -89,12 +95,13 @@ def prefix_of(word: str, freq: dict, vec_ok) -> str | None:
     return None
 
 
-def resolve(word: str, freq: dict, rules: list, use_prefix: bool, vec_ok, adj: set, maxdepth: int = 6) -> str | None:
+def resolve(word: str, freq: dict, rules: list, use_prefix: bool, vec_ok, adj: set,
+            aggressive: bool = False, maxdepth: int = 6) -> str | None:
     """Iterate suffix (then, at level 3, prefix) steps to a fixpoint root.
     Returns the root word, or None if the word is already its own root."""
     cur, seen = word, {word}
     for _ in range(maxdepth):
-        nxt = base_of(cur, freq, rules, adj)
+        nxt = base_of(cur, freq, rules, adj, aggressive)
         if nxt is None and use_prefix:
             nxt = prefix_of(cur, freq, vec_ok)
         if nxt is None or nxt in seen:
@@ -128,7 +135,9 @@ def main() -> None:
     adj = {w for (w,) in con.execute(
         "SELECT DISTINCT x.word FROM word_pos p JOIN words x ON x.id = p.word_id WHERE p.pos = 'adj'")}
 
-    cfg = {1: (INFL_RULES, False), 2: (RULES, False), 3: (RULES, True)}
+    # level -> (suffix rules, strip prefixes?, aggressive?). Only level 3 is
+    # aggressive: agentive -er + consonant de-doubling + prefix stripping.
+    cfg = {1: (INFL_RULES, False, False), 2: (RULES, False, False), 3: (RULES, True, True)}
     lemma_rows: list[tuple] = []                                # (word_id, level, lemma_id)
     fam_pm = {l: defaultdict(float) for l in LEVELS}
     fam_lc = {l: defaultdict(float) for l in LEVELS}
@@ -138,8 +147,8 @@ def main() -> None:
     for w in alpha:
         wid = wordmap[w]
         for lvl in LEVELS:
-            rules, use_pfx = cfg[lvl]
-            root = resolve(w, freq, rules, use_pfx, vec_ok, adj)
+            rules, use_pfx, aggr = cfg[lvl]
+            root = resolve(w, freq, rules, use_pfx, vec_ok, adj, aggr)
             lid = wordmap[root] if root is not None else wid
             if root is not None:
                 lemma_rows.append((wid, lvl, lid))
