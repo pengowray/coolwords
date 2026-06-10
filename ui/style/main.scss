@@ -14,6 +14,20 @@ h1 { margin-bottom: 0; }
 .loading, .err { color: #888; }
 .err { color: #c0392b; }
 
+/* busy spinner: `.spinner` as an element, or auto-prepended to any .loading text */
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinner, .loading::before {
+  content: ""; display: inline-block; box-sizing: border-box; flex: none;
+  width: 1em; height: 1em; vertical-align: -0.15em; border-radius: 50%;
+  border: 2px solid rgba(128, 128, 128, 0.3); border-top-color: currentColor;
+  animation: spin 0.7s linear infinite;
+}
+.loading { display: inline-flex; align-items: center; gap: 0.5rem; }
+.busy { display: inline-flex; align-items: center; gap: 0.45rem; }
+@media (prefers-reduced-motion: reduce) {
+  .spinner, .loading::before { animation-duration: 2.4s; }
+}
+
 .bar { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; margin: 0.8rem 0; }
 .bar .label { color: #888; }
 .bar > button {

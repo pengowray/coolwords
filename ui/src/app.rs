@@ -2016,8 +2016,13 @@ fn ImportPage() -> impl IntoView {
                         <button class="commit" disabled=move || committing.get() || is_dup
                             on:click=do_commit>
                             {move || if committing.get() {
-                                "Importing… (scoring may take a moment)".to_string()
-                            } else { "Confirm import".to_string() }}
+                                view! {
+                                    <span class="busy"><span class="spinner"></span>
+                                        "Importing… (scoring may take a moment)"</span>
+                                }.into_any()
+                            } else {
+                                view! { <span>"Confirm import"</span> }.into_any()
+                            }}
                         </button>
                     </div>
                     {move || commit_err.get().map(|e| view! { <p class="err">{e}</p> })}
