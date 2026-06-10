@@ -14,6 +14,7 @@ other's results.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -153,6 +154,15 @@ def load_cache(pdf_path: Path, engine: str) -> dict:
     return {"engine": engine, "dpi": DPI, "pages": {}}
 
 
+def save_cache(cpath: Path, cache: dict) -> None:
+    """Atomically persist the cache: write a temp sibling, then os.replace() it in.
+    A kill/interrupt can only ever leave a stray .tmp (overwritten next time) — the
+    real cache file is swapped in one atomic step, so it's never half-written."""
+    tmp = cpath.with_name(cpath.name + ".tmp")
+    tmp.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, cpath)
+
+
 def ocr_pdf(pdf_path: Path, engine: str | None = None, pages: list[int] | None = None,
             dpi: int = DPI) -> tuple[dict[int, str], str, int]:
     """OCR the given 0-based pages (default: all), reading/extending the sidecar
@@ -182,9 +192,9 @@ def ocr_pdf(pdf_path: Path, engine: str | None = None, pages: list[int] | None =
                 text = _ocr_rapidocr(pix)
             cache["pages"][str(pno)] = text
             print(f"ocr[{eng}] page {pno + 1} ({i + 1}/{len(todo)})", file=sys.stderr, flush=True)
-            if (i + 1) % 10 == 0:  # checkpoint so an interrupt loses little work
-                cpath.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+            if (i + 1) % 5 == 0:  # atomic checkpoint so an interrupt loses <=5 pages
+                save_cache(cpath, cache)
         if todo:
-            cpath.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+            save_cache(cpath, cache)
 
     return {p: cache["pages"].get(str(p), "") for p in want}, eng, len(todo)
