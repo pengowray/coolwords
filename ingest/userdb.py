@@ -17,10 +17,22 @@ from ingest.paths import DB_PATH, SCHEMA_PATH, USER_DB_PATH
 USER_SCHEMA = SCHEMA_PATH.parent / "user.sql"
 
 
+def migrate_tag_columns(user: sqlite3.Connection) -> None:
+    """Additively add columns that postdate the original `tags` table (CREATE TABLE
+    IF NOT EXISTS won't add them to an existing DB). Mirrors the Rust open_user()."""
+    have = {r[1] for r in user.execute("PRAGMA table_info(tags)")}
+    for name, decl in (("scope", "TEXT NOT NULL DEFAULT 'book'"),
+                       ("interest", "TEXT NOT NULL DEFAULT 'interesting'")):
+        if name not in have:
+            user.execute(f"ALTER TABLE tags ADD COLUMN {name} {decl}")
+    user.commit()
+
+
 def main() -> None:
     USER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     user = sqlite3.connect(USER_DB_PATH)
     user.executescript(USER_SCHEMA.read_text(encoding="utf-8"))
+    migrate_tag_columns(user)
     user.commit()
 
     migrated = 0

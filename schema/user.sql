@@ -6,12 +6,19 @@
 -- (ingest/db.py skips this file; the Leptos UI applies it to the user DB).
 
 -- The user's tag collection (definitions): builtin defaults + custom tags.
+-- `scope`    : 'book' (this book only) | 'word' (the word across ALL books).
+-- `interest` : 'interesting' (favourites the word) | 'neutral' (a note/descriptor,
+--              no fav) | 'uninteresting' (negative: junk / proper-noun / not-a-word).
+-- Validated in the UI server fns; new columns are ALTERed onto existing DBs by
+-- ingest/userdb.py and the Leptos open_user() (CREATE IF NOT EXISTS won't add them).
 CREATE TABLE IF NOT EXISTS tags (
-    name    TEXT PRIMARY KEY,            -- 'star', 'useful', 'ship-jargon', ...
-    comment TEXT,                        -- what this tag is for (free text)
-    builtin INTEGER NOT NULL DEFAULT 0,  -- 1 for the seeded defaults below
-    sort    INTEGER NOT NULL DEFAULT 100,
-    created TEXT
+    name     TEXT PRIMARY KEY,           -- 'star', 'useful', 'ship-jargon', ...
+    comment  TEXT,                       -- what this tag is for (free text)
+    builtin  INTEGER NOT NULL DEFAULT 0, -- 1 for the seeded defaults below
+    sort     INTEGER NOT NULL DEFAULT 100,
+    created  TEXT,
+    scope    TEXT NOT NULL DEFAULT 'book',
+    interest TEXT NOT NULL DEFAULT 'interesting'
 );
 
 -- Tag applications. No foreign keys into the dictionary — fully self-contained.
