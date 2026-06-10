@@ -31,6 +31,15 @@ REM      python -m ingest.score   --slug gutenberg-2701      :: scores all merge
 REM      python -m ingest.cluster --slug gutenberg-2701 --k 16 --top 20   :: clusters all levels
 REM      python -m ingest.trajectory     :: per-decade usage (in-book words + their roots); run after books
 REM      python -m ingest.refresh_freq   :: re-copy ngram/fiction freq onto words after adding new headwords
+REM
+REM  ---- Import a book without the CLI (drag-drop in the web UI, or by hand) ----
+REM    The "+ import book" page (/import) handles .txt and .epub: it auto-detects
+REM    title/author/year, dedups by content hash, shows kept-vs-stripped regions,
+REM    then copies the file into the books dir and runs the pipeline above.
+REM      python -m ingest.import_book --inspect path\to\book.epub      :: preview JSON (metadata + segments), no writes
+REM      python -m ingest.import_book --commit  path\to\book.epub --slug my-book --title "..." --author "..." --year 1984
+REM    Books are copied to %%COOLWORDS_BOOKS_DIR%% (default D:\datasets\coolwords\books).
+REM    Override it (and where the UI reads it) in a repo-root .env:  COOLWORDS_BOOKS_DIR=D:\path\to\books
 REM ===========================================================================
 
 cd /d "%~dp0ui"

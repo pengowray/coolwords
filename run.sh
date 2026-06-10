@@ -31,6 +31,15 @@
 #      python -m ingest.cluster --slug gutenberg-2701 --k 16 --top 20   # clusters all levels
 #      python -m ingest.trajectory     # per-decade usage (in-book words + their roots); run after books
 #      python -m ingest.refresh_freq   # re-copy ngram/fiction freq onto words after adding new headwords
+#
+#  ---- Import a book without the CLI (drag-drop in the web UI, or by hand) ----
+#    The "+ import book" page (/import) handles .txt and .epub: it auto-detects
+#    title/author/year, dedups by content hash, shows kept-vs-stripped regions,
+#    then copies the file into the books dir and runs the pipeline above.
+#      python -m ingest.import_book --inspect path/to/book.epub      # preview JSON (metadata + segments), no writes
+#      python -m ingest.import_book --commit  path/to/book.epub --slug my-book --title "..." --author "..." --year 1984
+#    Books are copied to $COOLWORDS_BOOKS_DIR (default D:\datasets\coolwords\books).
+#    Override it (and where the UI reads it) in a repo-root .env:  COOLWORDS_BOOKS_DIR=/path/to/books
 # ============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/ui"

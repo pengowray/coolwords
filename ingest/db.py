@@ -42,6 +42,9 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     ],
     "books": [
         ("year", "INTEGER"),
+        ("content_hash", "TEXT"),
+        ("format", "TEXT"),
+        ("orig_filename", "TEXT"),
     ],
 }
 
@@ -59,6 +62,7 @@ def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
     ensure_columns(con)
     # indexes on migration-added columns, created after the columns exist
     con.execute("CREATE INDEX IF NOT EXISTS idx_words_stem ON words(stem)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_books_content_hash ON books(content_hash)")
     con.commit()
     return con
 

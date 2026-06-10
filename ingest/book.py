@@ -1,32 +1,37 @@
-"""Ingest one book: strip boilerplate, tokenize, and store a word histogram.
+"""Ingest one book: extract the body text, tokenize, and store a word histogram.
 
     python -m ingest.book data/books/moby_dick_2701.txt \
         --slug gutenberg-2701 --title "Moby-Dick" --author "Herman Melville" --source-id 2701
 
 Tokens are lowercased words (with internal apostrophes/hyphens) and mapped to
 dictionary word_ids where possible; unmatched tokens are kept with word_id NULL.
+
+Boilerplate stripping + format handling (txt / epub) live in ingest/extract.py;
+this module tokenizes the kept body and writes it. The drag-drop web importer
+(ingest/import_book.py) reuses `ingest_tokens` here so there is one ingest path.
 """
 import argparse
 import re
 from collections import Counter
 
 from ingest.db import connect
+from ingest.extract import extract
 
 TOKEN_RE = re.compile(r"[a-z]+(?:['’-][a-z]+)*")
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
 _MAX_EXAMPLE = 280
-# Project Gutenberg start/end markers wrap the actual text.
-_START = re.compile(r"\*\*\*\s*START OF (THE|THIS) PROJECT GUTENBERG EBOOK.*?\*\*\*", re.I | re.S)
-_END = re.compile(r"\*\*\*\s*END OF (THE|THIS) PROJECT GUTENBERG EBOOK", re.I)
 
 
 def strip_boilerplate(text: str) -> str:
-    m = _START.search(text)
+    """Backward-compatible helper: keep only the Gutenberg body of an already-read
+    text. New code should use ingest.extract.extract(path) for full segmentation."""
+    from ingest.extract import _PG_START, _PG_END
+    m = _PG_START.search(text)
     if m:
         text = text[m.end():]
-    m = _END.search(text)
+    m = _PG_END.search(text)
     if m:
-        text = text[:m.start()]
+        text = text[: m.start()]
     return text
 
 
@@ -67,6 +72,45 @@ def tokenize(text: str) -> tuple[Counter, dict[str, str]]:
     return counts, examples
 
 
+_BOOK_COLS = ("title", "author", "source", "source_id", "year",
+              "content_hash", "format", "orig_filename")
+
+
+def ingest_tokens(con, slug: str, meta: dict, tokens: Counter,
+                  examples: dict[str, str]) -> tuple[int, int, int]:
+    """Upsert the book row (by slug) and replace its word histogram.
+
+    `meta` keys are any of _BOOK_COLS (missing keys are written NULL). Returns
+    (book_id, n_tokens, n_types). Shared by this CLI and ingest/import_book.py."""
+    n_tokens = sum(tokens.values())
+    n_types = len(tokens)
+
+    # map this book's tokens to dictionary word_ids (chunked IN queries)
+    idmap: dict[str, int] = {}
+    toklist = list(tokens)
+    for i in range(0, len(toklist), 900):
+        chunk = toklist[i:i + 900]
+        ph = ",".join("?" * len(chunk))
+        for word, wid in con.execute(f"SELECT word, id FROM words WHERE word IN ({ph})", chunk):
+            idmap[word] = wid
+
+    con.execute("INSERT OR IGNORE INTO books(slug) VALUES (?)", (slug,))
+    book_id = con.execute("SELECT id FROM books WHERE slug = ?", (slug,)).fetchone()[0]
+    set_cols = ", ".join(f"{c}=?" for c in _BOOK_COLS)
+    con.execute(
+        f"UPDATE books SET {set_cols}, n_tokens=?, n_types=?, ingested_at=datetime('now') WHERE id=?",
+        (*[meta.get(c) for c in _BOOK_COLS], n_tokens, n_types, book_id),
+    )
+    con.execute("DELETE FROM book_occurrences WHERE book_id = ?", (book_id,))
+    con.executemany(
+        "INSERT INTO book_occurrences(book_id, token, word_id, count, example) VALUES (?, ?, ?, ?, ?)",
+        [(book_id, tok, idmap.get(tok), cnt, examples.get(tok)) for tok, cnt in tokens.items()],
+    )
+    con.commit()
+    matched = sum(1 for t in tokens if t in idmap)
+    return book_id, n_tokens, n_types, matched
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("path")
@@ -78,40 +122,26 @@ def main() -> None:
     ap.add_argument("--year", type=int, default=None)
     args = ap.parse_args()
 
-    with open(args.path, encoding="utf-8") as f:
-        raw = f.read()
-    body = strip_boilerplate(raw)
+    ex = extract(args.path)
+    body = ex.kept_text
     tokens, examples = tokenize(body)
-    n_tokens = sum(tokens.values())
-    print(f"{args.slug}: {n_tokens:,} tokens, {len(tokens):,} distinct types "
-          f"(stripped {len(raw)-len(body):,} boilerplate chars)")
+    stripped = sum(len(s.text) for s in ex.segments if not s.kept)
+    print(f"{args.slug}: {sum(tokens.values()):,} tokens, {len(tokens):,} distinct types "
+          f"(stripped {stripped:,} boilerplate chars across "
+          f"{sum(1 for s in ex.segments if not s.kept)} regions)")
 
+    meta = {
+        "title": args.title or ex.title,
+        "author": args.author or ex.author,
+        "source": args.source or ex.source,
+        "source_id": args.source_id or ex.source_id,
+        "year": args.year if args.year is not None else ex.year,
+        "format": ex.fmt,
+    }
     con = connect()
-    # map this book's tokens to dictionary word_ids (chunked IN queries)
-    idmap: dict[str, int] = {}
-    toklist = list(tokens)
-    for i in range(0, len(toklist), 900):
-        chunk = toklist[i:i + 900]
-        ph = ",".join("?" * len(chunk))
-        for word, wid in con.execute(f"SELECT word, id FROM words WHERE word IN ({ph})", chunk):
-            idmap[word] = wid
-
-    con.execute("INSERT OR IGNORE INTO books(slug) VALUES (?)", (args.slug,))
-    book_id = con.execute("SELECT id FROM books WHERE slug = ?", (args.slug,)).fetchone()[0]
-    con.execute(
-        "UPDATE books SET title=?, author=?, source=?, source_id=?, year=?, n_tokens=?, n_types=?, "
-        "ingested_at=datetime('now') WHERE id=?",
-        (args.title, args.author, args.source, args.source_id, args.year, n_tokens, len(tokens), book_id),
-    )
-    con.execute("DELETE FROM book_occurrences WHERE book_id = ?", (book_id,))
-    con.executemany(
-        "INSERT INTO book_occurrences(book_id, token, word_id, count, example) VALUES (?, ?, ?, ?, ?)",
-        [(book_id, tok, idmap.get(tok), cnt, examples.get(tok)) for tok, cnt in tokens.items()],
-    )
-    con.commit()
-    matched = sum(1 for t in tokens if t in idmap)
-    print(f"  matched {matched:,}/{len(tokens):,} types to the dictionary "
-          f"({100*matched/len(tokens):.1f}%); book_id={book_id}")
+    book_id, n_tokens, n_types, matched = ingest_tokens(con, args.slug, meta, tokens, examples)
+    print(f"  matched {matched:,}/{n_types:,} types to the dictionary "
+          f"({100*matched/max(n_types,1):.1f}%); book_id={book_id}")
     con.close()
 
 

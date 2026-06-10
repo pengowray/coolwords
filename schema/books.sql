@@ -2,17 +2,23 @@
 -- human ratings. Depends on the dictionary `words` table (schema/dictionary.sql).
 
 CREATE TABLE IF NOT EXISTS books (
-    id          INTEGER PRIMARY KEY,
-    slug        TEXT UNIQUE,          -- e.g. 'gutenberg-2701'
-    title       TEXT,
-    author      TEXT,
-    source      TEXT,                 -- 'gutenberg'
-    source_id   TEXT,
-    year        INTEGER,              -- publication year (for the usage-over-time marker)
-    n_tokens    INTEGER,              -- total word tokens after boilerplate strip
-    n_types     INTEGER,              -- distinct lowercased token types
-    ingested_at TEXT
+    id            INTEGER PRIMARY KEY,
+    slug          TEXT UNIQUE,        -- e.g. 'gutenberg-2701'
+    title         TEXT,
+    author        TEXT,
+    source        TEXT,               -- 'gutenberg'
+    source_id     TEXT,
+    year          INTEGER,            -- publication year (for the usage-over-time marker)
+    n_tokens      INTEGER,            -- total word tokens after boilerplate strip
+    n_types       INTEGER,            -- distinct lowercased token types
+    ingested_at   TEXT,
+    content_hash  TEXT,               -- sha256 of the normalized kept token stream (dedup)
+    format        TEXT,               -- source format: 'txt' | 'epub'
+    orig_filename TEXT                -- the dropped file's original name (provenance)
 );
+-- NOTE: the idx_books_content_hash index (for exact-content dedup) is created in
+-- ingest/db.py:connect() AFTER ensure_columns, since content_hash is migrated in
+-- on existing DBs and wouldn't exist yet when this file runs.
 
 -- One row per distinct token in the book; word_id is NULL when the token is not
 -- in the dictionary (typos / scannos / possessives / OOV).

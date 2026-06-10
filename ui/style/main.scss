@@ -157,3 +157,67 @@ th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color
 .row.keep { background: #2ecc7118; }
 .row.reject { background: #e74c3c18; opacity: 0.55; }
 .row.shadow { background: #f39c1218; }
+
+/* ---- book import page ---- */
+.importlink {
+  border: 1px solid #16a085; color: #16a085; border-radius: 6px;
+  padding: 0.25rem 0.7rem; text-decoration: none; font-weight: 600;
+}
+.importlink:hover { background: #16a08518; }
+.srclink { color: #888; font-size: 0.85rem; text-decoration: none; }
+.srclink:hover { text-decoration: underline; }
+
+.dropzone {
+  border: 2px dashed #8888; border-radius: 12px; padding: 2.2rem 1rem;
+  text-align: center; color: #888; margin: 1rem 0; transition: border-color 0.15s;
+}
+.dropzone:hover { border-color: #16a085aa; }
+.dz-big { font-size: 1.15rem; color: #555; margin: 0 0 0.3rem; }
+.dz-browse { color: #16a085; cursor: pointer; text-decoration: underline; }
+
+.dup-banner {
+  background: #e67e2218; border: 1px solid #e67e2255; color: #b9550e;
+  border-radius: 8px; padding: 0.5rem 0.8rem; margin: 0.8rem 0;
+}
+
+.meta-form {
+  display: flex; flex-wrap: wrap; gap: 0.6rem 1rem; align-items: flex-end; margin: 1rem 0 0.4rem;
+}
+.meta-form label { display: flex; flex-direction: column; font-size: 0.78rem; color: #999; gap: 2px; }
+.meta-form input {
+  font-size: 0.95rem; padding: 0.3rem 0.5rem; border: 1px solid #8884; border-radius: 6px;
+  background: Canvas; color: inherit; min-width: 16rem;
+}
+.meta-form label.yr input { min-width: 5rem; width: 5rem; }
+.yr-note { color: #b9770e; font-size: 0.82rem; margin: 0.1rem 0 0.4rem; }
+button.commit {
+  border: 1px solid #16a085; background: #16a085; color: #fff; border-radius: 6px;
+  padding: 0.4rem 1rem; cursor: pointer; font-size: 0.95rem;
+}
+button.commit:hover { background: #138a72; }
+button.commit:disabled { background: #8886; border-color: #8886; cursor: not-allowed; }
+
+.seg-h { margin: 1.2rem 0 0.3rem; font-size: 1.05rem; }
+.seg-summary { color: #888; font-size: 0.85rem; margin: 0.2rem 0 0.6rem; }
+.segs { display: flex; flex-direction: column; gap: 0.5rem; }
+.seg { border: 1px solid #8884; border-radius: 8px; overflow: hidden; }
+.seg.stripped { opacity: 0.85; background: #e74c3c0c; border-color: #e74c3c33; }
+.seg.kept { background: #2ecc710a; border-color: #2ecc7133; }
+.seg-head {
+  display: flex; align-items: baseline; gap: 0.6rem; padding: 0.3rem 0.6rem;
+  border-bottom: 1px solid #8883; font-size: 0.82rem;
+}
+.seg-badge {
+  font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; font-size: 0.72rem;
+  padding: 0.05rem 0.45rem; border-radius: 10px; background: #8882; color: #666; white-space: nowrap;
+}
+.seg.kept .seg-badge { background: #2ecc7133; color: #1e8449; }
+.seg.stripped .seg-badge { background: #e74c3c2a; color: #c0392b; }
+.seg-note { color: #777; flex: 1; }
+.seg-len { color: #aaa; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.seg-text {
+  margin: 0; padding: 0.5rem 0.7rem; max-height: 16rem; overflow: auto;
+  white-space: pre-wrap; word-break: break-word; font-size: 0.82rem; line-height: 1.35;
+  font-family: ui-monospace, "Cascadia Code", "Consolas", monospace; color: #555;
+}
+.seg.kept .seg-text { color: #333; }

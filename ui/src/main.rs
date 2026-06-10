@@ -1,6 +1,7 @@
 #[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() {
+    use axum::extract::DefaultBodyLimit;
     use axum::Router;
     use leptos::logging::log;
     use leptos::prelude::*;
@@ -18,6 +19,9 @@ async fn main() {
             move || shell(leptos_options.clone())
         })
         .fallback(leptos_axum::file_and_error_handler(shell))
+        // Raise axum's 2 MB default so drag-dropped EPUBs (the upload_book server
+        // fn streams multipart bodies) aren't rejected. 64 MB headroom.
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(leptos_options);
 
     log!("listening on http://{}", &addr);

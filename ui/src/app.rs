@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, MetaTags, Stylesheet, Title};
-use leptos_router::components::{Route, Router, Routes};
-use leptos_router::hooks::{query_signal, query_signal_with_options};
+use leptos_router::components::{Route, Router, Routes, A};
+use leptos_router::hooks::{query_signal, query_signal_with_options, use_navigate};
 use leptos_router::{NavigateOptions, StaticSegment};
 use serde::{Deserialize, Serialize};
 
@@ -165,6 +165,74 @@ pub struct WordInfo {
     pub root: Option<RootInfo>,
 }
 
+/// One labelled span of an imported file: kept body text vs stripped boilerplate
+/// (Gutenberg header/licence, table of contents, EPUB front-matter, ...). Mirrors
+/// the JSON emitted by `python -m ingest.import_book`.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ImportSegment {
+    pub label: String,
+    pub kept: bool,
+    pub note: String,
+    pub char_len: i64,
+    pub preview: String,
+    pub truncated: bool,
+}
+
+/// Result of inspecting a dropped (but not yet committed) file: detected metadata,
+/// duplicate status, and the kept/stripped segmentation for the review viewer.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct Inspection {
+    #[serde(default)]
+    pub token: String, // staging filename, echoed back to confirm_import (server-set)
+    #[serde(default)]
+    pub format: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub year: Option<i64>,
+    #[serde(default)]
+    pub year_note: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub source_id: String,
+    #[serde(default)]
+    pub content_hash: String,
+    #[serde(default)]
+    pub n_tokens: i64,
+    #[serde(default)]
+    pub n_types: i64,
+    #[serde(default)]
+    pub duplicate_of: Option<String>,
+    #[serde(default)]
+    pub duplicate_title: Option<String>,
+    #[serde(default)]
+    pub suggested_slug: String,
+    #[serde(default)]
+    pub orig_filename: String,
+    #[serde(default)]
+    pub segments: Vec<ImportSegment>,
+}
+
+/// Result of committing an import (book ingested + analysis pipeline run).
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ImportResult {
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub book_id: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub n_tokens: i64,
+    #[serde(default)]
+    pub n_types: i64,
+    #[serde(default)]
+    pub candidates: i64,
+}
+
 #[cfg(feature = "ssr")]
 fn db_path() -> String {
     if let Ok(p) = std::env::var("COOLWORDS_DB") {
@@ -213,6 +281,111 @@ fn open_conn() -> Result<rusqlite::Connection, ServerFnError> {
     conn.execute("ATTACH DATABASE ?1 AS u", rusqlite::params![user_db_path()])
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(conn)
+}
+
+// ---- book import: file staging + Python orchestration (ingest/import_book.py) ----
+
+/// The repo root (parent of the `ui/` crate the server runs from), so Python is
+/// invoked with the same cwd its package imports expect. Mirrors db_path()'s
+/// "../ vs ." probing.
+#[cfg(feature = "ssr")]
+fn repo_root() -> String {
+    for p in ["..", "."] {
+        if std::path::Path::new(p).join("ingest").is_dir() {
+            return p.to_string();
+        }
+    }
+    "..".to_string()
+}
+
+/// Where dropped books are copied. Precedence: COOLWORDS_BOOKS_DIR env > repo
+/// `.env` (same file ingest/paths.py reads) > default. Kept in sync with Python.
+#[cfg(feature = "ssr")]
+fn books_dir() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("COOLWORDS_BOOKS_DIR") {
+        if !p.trim().is_empty() {
+            return p.into();
+        }
+    }
+    for envp in ["../.env", ".env"] {
+        if let Ok(txt) = std::fs::read_to_string(envp) {
+            for line in txt.lines() {
+                let line = line.trim();
+                if line.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once('=') {
+                    if k.trim() == "COOLWORDS_BOOKS_DIR" {
+                        let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
+                        if !v.is_empty() {
+                            return v.into();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    r"D:\datasets\coolwords\books".into()
+}
+
+/// Staging area for uploaded-but-not-committed files.
+#[cfg(feature = "ssr")]
+fn staging_dir() -> std::path::PathBuf {
+    let d = books_dir().join(".staging");
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+
+#[cfg(feature = "ssr")]
+fn python_exe() -> String {
+    std::env::var("COOLWORDS_PYTHON").unwrap_or_else(|_| "python".to_string())
+}
+
+/// Run `python -m ingest.import_book <args>` and return its parsed JSON, turning a
+/// non-zero exit or an `{"ok": false, ...}` payload into a user-facing error.
+#[cfg(feature = "ssr")]
+fn run_importer(args: &[&str]) -> Result<serde_json::Value, ServerFnError> {
+    let out = std::process::Command::new(python_exe())
+        .current_dir(repo_root())
+        .arg("-m")
+        .arg("ingest.import_book")
+        .args(args)
+        .output()
+        .map_err(|e| ServerFnError::new(format!("could not run python: {e}")))?;
+    if !out.status.success() {
+        return Err(ServerFnError::new(format!(
+            "importer failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
+        ServerFnError::new(format!(
+            "bad JSON from importer: {e} — {}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        ))
+    })?;
+    if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+        let msg = v.get("error").and_then(|s| s.as_str()).unwrap_or("import failed");
+        return Err(ServerFnError::new(msg.to_string()));
+    }
+    Ok(v)
+}
+
+/// Canonical book slug: lowercase, ascii-alnum + single dashes, <= 60 chars.
+#[cfg(feature = "ssr")]
+fn sanitize_slug(s: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in s.trim().to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+    }
+    out.trim_matches('-').chars().take(60).collect::<String>().trim_matches('-').to_string()
 }
 
 /// Tags for a book as word_id -> tags, resolved from the user DB's text keys
@@ -961,6 +1134,136 @@ pub async fn add_tag(name: String, comment: String) -> Result<String, ServerFnEr
     Ok(clean)
 }
 
+use server_fn::codec::{MultipartData, MultipartFormData};
+
+/// Drag-drop upload: stream the file to a staging path, then inspect it (extract
+/// text + metadata, segment kept/stripped regions, dedup check) WITHOUT committing.
+#[server(input = MultipartFormData)]
+pub async fn upload_book(data: MultipartData) -> Result<Inspection, ServerFnError> {
+    let mut data = data.into_inner().ok_or_else(|| ServerFnError::new("no upload body"))?;
+    let mut filename = String::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(mut field) =
+        data.next_field().await.map_err(|e| ServerFnError::new(e.to_string()))?
+    {
+        if field.name() == Some("file") {
+            filename = field.file_name().unwrap_or("book").to_string();
+            while let Some(chunk) =
+                field.chunk().await.map_err(|e| ServerFnError::new(e.to_string()))?
+            {
+                bytes.extend_from_slice(&chunk);
+            }
+        }
+    }
+    if bytes.is_empty() {
+        return Err(ServerFnError::new("no file received"));
+    }
+    let ext = std::path::Path::new(&filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| "txt".to_string());
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    let token = format!("up-{:016x}.{ext}", h.finish());
+    let staged = staging_dir().join(&token);
+    std::fs::write(&staged, &bytes).map_err(|e| ServerFnError::new(format!("staging write: {e}")))?;
+
+    let v = run_importer(&["--inspect", &staged.to_string_lossy()])?;
+    let mut insp: Inspection =
+        serde_json::from_value(v).map_err(|e| ServerFnError::new(format!("parse inspection: {e}")))?;
+    insp.token = token;
+    if insp.orig_filename.is_empty() {
+        insp.orig_filename = filename;
+    }
+    Ok(insp)
+}
+
+/// Commit a previously-uploaded file: copy it into the books dir, ingest the word
+/// histogram, then run the per-book analysis pipeline (score, cluster, trajectory).
+#[server]
+pub async fn confirm_import(
+    token: String,
+    slug: String,
+    title: String,
+    author: String,
+    year: String,
+    orig_filename: String,
+) -> Result<ImportResult, ServerFnError> {
+    if token.is_empty() || token.contains('/') || token.contains('\\') || token.contains("..") {
+        return Err(ServerFnError::new("invalid upload token"));
+    }
+    let slug = sanitize_slug(&slug);
+    if slug.is_empty() {
+        return Err(ServerFnError::new("please enter a slug (letters, numbers, dashes)"));
+    }
+    let staged = staging_dir().join(&token);
+    if !staged.exists() {
+        return Err(ServerFnError::new("upload expired — please drop the file again"));
+    }
+    let mut args: Vec<String> = vec![
+        "--commit".into(),
+        staged.to_string_lossy().to_string(),
+        "--slug".into(),
+        slug,
+        "--title".into(),
+        title,
+        "--author".into(),
+        author,
+        "--orig-filename".into(),
+        orig_filename,
+    ];
+    let y = year.trim();
+    if !y.is_empty() {
+        args.push("--year".into());
+        args.push(y.to_string());
+    }
+    let argref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let v = run_importer(&argref)?;
+    let res: ImportResult =
+        serde_json::from_value(v).map_err(|e| ServerFnError::new(format!("parse result: {e}")))?;
+    let _ = std::fs::remove_file(&staged);
+    Ok(res)
+}
+
+/// Re-segment an already-imported book's stored file, for the "view stripping" page.
+#[server]
+pub async fn view_source(book_id: i64) -> Result<Inspection, ServerFnError> {
+    use rusqlite::OptionalExtension;
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let row: Option<(String, Option<String>)> = conn
+        .query_row("SELECT slug, format FROM books WHERE id = ?1", [book_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let Some((slug, fmt)) = row else {
+        return Err(ServerFnError::new("book not found"));
+    };
+    let ext = if fmt.as_deref() == Some("epub") { "epub" } else { "txt" };
+    // UI-imported books live in BOOKS_DIR as <slug>.<ext>; older CLI-imported ones
+    // may still be in the repo's data/books as <slug>.txt/.epub — try both.
+    let root = repo_root();
+    let dbooks = std::path::Path::new(&root).join("data").join("books");
+    let candidates = [
+        books_dir().join(format!("{slug}.{ext}")),
+        dbooks.join(format!("{slug}.txt")),
+        dbooks.join(format!("{slug}.epub")),
+    ];
+    let Some(path) = candidates.into_iter().find(|p| p.exists()) else {
+        return Err(ServerFnError::new(format!(
+            "no stored source file for '{slug}' — re-import it via the web UI to view its stripping"
+        )));
+    };
+    // run_importer runs Python with cwd=repo_root, so a path relative to the
+    // server's own cwd would resolve wrong — make it absolute first.
+    let path = std::fs::canonicalize(&path).unwrap_or(path);
+    let v = run_importer(&["--inspect", &path.to_string_lossy()])?;
+    serde_json::from_value(v).map_err(|e| ServerFnError::new(format!("parse: {e}")))
+}
+
 // ---- client-side tag helpers (operate on the shared Tagger context) ----
 fn has_tag(t: Tagger, key: (i64, i64), tag: &str) -> bool {
     t.store.with(|m| m.get(&key).is_some_and(|s| s.contains(tag)))
@@ -999,6 +1302,8 @@ pub fn App() -> impl IntoView {
             <main>
                 <Routes fallback=|| "Page not found.".into_view()>
                     <Route path=StaticSegment("") view=HomePage/>
+                    <Route path=StaticSegment("import") view=ImportPage/>
+                    <Route path=StaticSegment("source") view=BookSourcePage/>
                 </Routes>
             </main>
         </Router>
@@ -1247,6 +1552,9 @@ fn HomePage() -> impl IntoView {
                     }.into_any(),
                 })}
             </Suspense>
+            <A href="/import" attr:class="importlink">"+ import book"</A>
+            <a class="srclink" href=move || format!("/source?book={}", book.get())
+                title="see which parts of this book were kept vs stripped">"view stripping"</a>
             <select class="lvlsel" title="merge related word forms: none keeps every form separate; higher levels group inflections, then derivations, then aggressively (untrembling→tremble) — frequency is combined across the family"
                 prop:value=move || level.get().to_string()
                 on:change=move |ev| {
@@ -1497,5 +1805,211 @@ fn HomePage() -> impl IntoView {
                 </Suspense>
             </aside>
         </Show>
+    }
+}
+
+// ---- book import UI ----
+
+/// The drop/inspect lifecycle for the import page.
+#[derive(Clone)]
+enum UploadState {
+    Idle,
+    Loading,
+    Done(Box<Inspection>),
+    Failed(String),
+}
+
+/// Send a dropped file to `upload_book` and stash the resulting inspection in
+/// `state`. The FormData / `.into()` codec only exists on the client, so the body
+/// is client-only; the SSR stub never runs (event handlers fire in the browser).
+#[cfg(not(feature = "ssr"))]
+fn upload_and_inspect(file: web_sys::File, state: RwSignal<UploadState>) {
+    state.set(UploadState::Loading);
+    let fd = web_sys::FormData::new().unwrap();
+    let _ = fd.append_with_blob_and_filename("file", &file, &file.name());
+    leptos::task::spawn_local(async move {
+        match upload_book(fd.into()).await {
+            Ok(insp) => state.set(UploadState::Done(Box::new(insp))),
+            Err(e) => state.set(UploadState::Failed(e.to_string())),
+        }
+    });
+}
+#[cfg(feature = "ssr")]
+fn upload_and_inspect(_file: web_sys::File, _state: RwSignal<UploadState>) {}
+
+/// Render a kept-vs-stripped segmentation (shared by the import preview and the
+/// per-book "view stripping" page). Kept body spans render plain; stripped spans
+/// (Gutenberg header/licence, TOC, EPUB front-matter, ...) are dimmed and labelled.
+#[component]
+fn SegmentView(segments: Vec<ImportSegment>) -> impl IntoView {
+    let kept: i64 = segments.iter().filter(|s| s.kept).map(|s| s.char_len).sum();
+    let stripped: i64 = segments.iter().filter(|s| !s.kept).map(|s| s.char_len).sum();
+    view! {
+        <p class="seg-summary">
+            {format!("{} regions · kept {} chars · stripped {} chars", segments.len(), kept, stripped)}
+        </p>
+        <div class="segs">
+            {segments.into_iter().map(|s| {
+                let badge = if s.kept { "kept".to_string() } else { s.label.clone() };
+                let text = if s.truncated { format!("{} …", s.preview) } else { s.preview.clone() };
+                view! {
+                    <div class="seg" class:kept=s.kept class:stripped=!s.kept>
+                        <div class="seg-head">
+                            <span class="seg-badge">{badge}</span>
+                            <span class="seg-note">{s.note}</span>
+                            <span class="seg-len">{format!("{} chars", s.char_len)}</span>
+                        </div>
+                        <pre class="seg-text">{text}</pre>
+                    </div>
+                }
+            }).collect_view()}
+        </div>
+    }
+}
+
+/// Drag-drop a `.txt`/`.epub`, review detected metadata + what gets stripped, then
+/// commit it (copy into the books dir, ingest, run the analysis pipeline).
+#[component]
+fn ImportPage() -> impl IntoView {
+    let state = RwSignal::new(UploadState::Idle);
+    let f_title = RwSignal::new(String::new());
+    let f_author = RwSignal::new(String::new());
+    let f_year = RwSignal::new(String::new());
+    let f_slug = RwSignal::new(String::new());
+    let committing = RwSignal::new(false);
+    let commit_err = RwSignal::new(None::<String>);
+    let file_input: NodeRef<leptos::html::Input> = NodeRef::new();
+
+    // Seed the editable form from each fresh inspection.
+    Effect::new(move |_| {
+        if let UploadState::Done(insp) = state.get() {
+            f_title.set(insp.title.clone());
+            f_author.set(insp.author.clone());
+            f_year.set(insp.year.map(|y| y.to_string()).unwrap_or_default());
+            f_slug.set(insp.suggested_slug.clone());
+        }
+    });
+
+    let do_upload = Callback::new(move |file: web_sys::File| upload_and_inspect(file, state));
+    let on_drop = move |ev: web_sys::DragEvent| {
+        ev.prevent_default();
+        if let Some(file) = ev.data_transfer().and_then(|dt| dt.files()).and_then(|f| f.get(0)) {
+            do_upload.run(file);
+        }
+    };
+    let on_dragover = move |ev: web_sys::DragEvent| ev.prevent_default();
+    let on_pick = move |_ev| {
+        if let Some(file) = file_input.get().and_then(|i| i.files()).and_then(|f| f.get(0)) {
+            do_upload.run(file);
+        }
+    };
+
+    let do_commit = move |_| {
+        let UploadState::Done(insp) = state.get() else { return };
+        committing.set(true);
+        commit_err.set(None);
+        let token = insp.token.clone();
+        let orig = insp.orig_filename.clone();
+        let (title, author, year, slug) = (f_title.get(), f_author.get(), f_year.get(), f_slug.get());
+        let navigate = use_navigate();
+        leptos::task::spawn_local(async move {
+            match confirm_import(token, slug, title, author, year, orig).await {
+                Ok(res) => navigate(&format!("/?book={}", res.book_id), Default::default()),
+                Err(e) => {
+                    commit_err.set(Some(e.to_string()));
+                    committing.set(false);
+                }
+            }
+        });
+    };
+
+    view! {
+        <h1>"Import a book"</h1>
+        <p class="sub"><A href="/">"← back to words"</A>
+            " · drop a .txt or .epub; we detect title/author and show what gets stripped."</p>
+
+        <div class="dropzone" on:drop=on_drop on:dragover=on_dragover>
+            <p class="dz-big">"Drag a .txt or .epub here"</p>
+            <p>"or "<label class="dz-browse">"browse…"
+                <input type="file" accept=".txt,.epub" node_ref=file_input
+                    on:change=on_pick style="display:none"/>
+            </label></p>
+        </div>
+
+        {move || match state.get() {
+            UploadState::Idle => ().into_any(),
+            UploadState::Loading => view! { <p class="loading">"Reading & analysing…"</p> }.into_any(),
+            UploadState::Failed(e) => view! { <p class="err">{e}</p> }.into_any(),
+            UploadState::Done(insp) => {
+                let fmt = insp.format.clone();
+                let year_note = insp.year_note.clone();
+                let ntok = insp.n_tokens;
+                let ntypes = insp.n_types;
+                let is_dup = insp.duplicate_of.is_some();
+                let dup_banner = insp.duplicate_of.clone().map(|slug| {
+                    let title = insp.duplicate_title.clone().unwrap_or_else(|| slug.clone());
+                    view! {
+                        <div class="dup-banner">
+                            {format!("⚠ Identical content already imported as \"{title}\" ({slug}). Re-importing is blocked.")}
+                        </div>
+                    }
+                });
+                let segs = insp.segments.clone();
+                view! {
+                    {dup_banner}
+                    <div class="meta-form">
+                        <label>"Title"
+                            <input prop:value=move || f_title.get()
+                                on:input=move |e| f_title.set(event_target_value(&e))/></label>
+                        <label>"Author"
+                            <input prop:value=move || f_author.get()
+                                on:input=move |e| f_author.set(event_target_value(&e))/></label>
+                        <label class="yr">"Year"
+                            <input prop:value=move || f_year.get()
+                                on:input=move |e| f_year.set(event_target_value(&e))/></label>
+                        <label>"Slug"
+                            <input prop:value=move || f_slug.get()
+                                on:input=move |e| f_slug.set(event_target_value(&e))/></label>
+                    </div>
+                    {(!year_note.is_empty()).then(|| view! { <p class="yr-note">{year_note}</p> })}
+                    <p class="counts">{format!("format: {fmt} · {ntok} tokens · {ntypes} distinct types")}</p>
+                    <div class="detail-actions">
+                        <button class="commit" disabled=move || committing.get() || is_dup
+                            on:click=do_commit>
+                            {move || if committing.get() {
+                                "Importing… (scoring may take a moment)".to_string()
+                            } else { "Confirm import".to_string() }}
+                        </button>
+                    </div>
+                    {move || commit_err.get().map(|e| view! { <p class="err">{e}</p> })}
+                    <h2 class="seg-h">"Kept vs stripped"</h2>
+                    <SegmentView segments=segs.clone()/>
+                }.into_any()
+            }
+        }}
+    }
+}
+
+/// Per-book "view stripping" page: re-segment a stored imported file so the kept /
+/// stripped regions can be reviewed after the fact.
+#[component]
+fn BookSourcePage() -> impl IntoView {
+    let (book_q, _) = query_signal::<i64>("book");
+    let book = Memo::new(move |_| book_q.get().unwrap_or(1));
+    let src = Resource::new(move || book.get(), view_source);
+    view! {
+        <h1>"Book source — kept vs stripped"</h1>
+        <p class="sub"><A href="/">"← back to words"</A></p>
+        <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
+            {move || src.get().map(|res| match res {
+                Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                Ok(insp) => view! {
+                    <p class="counts">
+                        {format!("{} · {} · {} tokens", insp.title, insp.format, insp.n_tokens)}
+                    </p>
+                    <SegmentView segments=insp.segments/>
+                }.into_any(),
+            })}
+        </Suspense>
     }
 }

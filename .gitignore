@@ -10,6 +10,9 @@ __pycache__/
 # Local data: database, embedding sidecar, downloaded books (all reproducible)
 /data/
 
+# Local machine config (paths etc.)
+.env
+
 # Editor / OS
 .DS_Store
 .idea/
