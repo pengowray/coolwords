@@ -1813,7 +1813,11 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                 view! {
                     <button type="button" class=cls draggable="true" title=title
                         class:on=move || has_tag(t, key, &on_name)
-                        on:dragstart=move |_| drag.set(Some(drag_name.clone()))
+                        on:dragstart=move |ev: web_sys::DragEvent| {
+                            drag.set(Some(drag_name.clone()));
+                            // a non-empty payload makes the drag valid in all browsers
+                            if let Some(dt) = ev.data_transfer() { let _ = dt.set_data("text/plain", &drag_name); }
+                        }
                         on:click=move |_| toggle_tag(t, book_id, word_id, &click_name)>
                         {name}
                     </button>
