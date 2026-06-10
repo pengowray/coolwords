@@ -73,7 +73,7 @@ def tokenize(text: str) -> tuple[Counter, dict[str, str]]:
 
 
 _BOOK_COLS = ("title", "author", "source", "source_id", "year",
-              "content_hash", "format", "orig_filename")
+              "content_hash", "format", "orig_filename", "text_source")
 
 
 def ingest_tokens(con, slug: str, meta: dict, tokens: Counter,

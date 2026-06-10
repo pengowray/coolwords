@@ -65,6 +65,8 @@ def detect_format(path: Path) -> str:
     ext = path.suffix.lower()
     if ext == ".epub":
         return "epub"
+    if ext == ".pdf" or _is_pdf(path):
+        return "pdf"
     if ext in (".txt", ".text", ""):
         # sniff a zip in case a .txt is really a renamed epub
         if _is_epub_zip(path):
@@ -73,6 +75,14 @@ def detect_format(path: Path) -> str:
     if _is_epub_zip(path):
         return "epub"
     return "txt"
+
+
+def _is_pdf(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(5) == b"%PDF-"
+    except OSError:
+        return False
 
 
 def _is_epub_zip(path: Path) -> bool:
@@ -89,11 +99,15 @@ def _is_epub_zip(path: Path) -> bool:
         return False
 
 
-def extract(path: Path) -> Extraction:
+def extract(path: Path, pdf_ocr: dict[int, str] | None = None) -> Extraction:
+    """Extract `path`. For PDFs, `pdf_ocr` (0-based page → text) replaces the
+    embedded text layer with our own OCR (the re-OCR import path)."""
     path = Path(path)
     fmt = detect_format(path)
     if fmt == "epub":
         return _extract_epub(path)
+    if fmt == "pdf":
+        return _extract_pdf(path, pdf_ocr)
     return _extract_txt(path)
 
 
@@ -509,3 +523,105 @@ def _html_text(html: str) -> str:
         # malformed markup: fall back to a crude tag strip
         return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
     return re.sub(r"[ \t]*\n[ \t]*", "\n", re.sub(r"[ \t]+", " ", "".join(p.parts))).strip()
+
+
+# --------------------------------------------------------------------------- #
+#  PDF (PyMuPDF; embedded text layer or a caller-supplied OCR override)       #
+# --------------------------------------------------------------------------- #
+# A page with fewer words than this is treated as image-only/blank (cover, plate,
+# unscanned-text page). Used both for segment grouping and the has_text_layer call.
+_MIN_PDF_WORDS = 15
+
+
+def _dehyphenate(text: str) -> str:
+    """Re-join words hyphenated across line breaks ("ele-\nphant" -> "elephant")
+    and drop soft hyphens. Only fires on lowercase continuation so real hyphenated
+    compounds at line end ("man-\nof-war" stays "man-of-war" wrongly? no: 'o' is
+    lowercase — accept the rare false join; histograms prefer joined words)."""
+    text = text.replace("­", "")
+    return re.sub(r"(\w)-[ \t]*\n[ \t]*(\w)", r"\1\2", text)
+
+
+def pdf_page_texts(path: Path) -> list[str]:
+    """De-hyphenated EMBEDDED text of every page (0-based), for the OCR compare."""
+    try:
+        import pymupdf
+    except ImportError:
+        raise ExtractError("PDF support needs the PyMuPDF package: pip install pymupdf",
+                           code="PDF_SUPPORT_MISSING")
+    with pymupdf.open(path) as doc:
+        return [_dehyphenate(doc[p].get_text()) for p in range(doc.page_count)]
+
+
+def _extract_pdf(path: Path, ocr_text: dict[int, str] | None = None) -> Extraction:
+    try:
+        import pymupdf
+    except ImportError:
+        raise ExtractError(
+            "PDF support needs the PyMuPDF package: pip install pymupdf",
+            code="PDF_SUPPORT_MISSING")
+
+    use_ocr = ocr_text is not None
+    segs: list[Segment] = []
+    n_text = n_image = 0
+    title = author = ""
+    year: int | None = None
+
+    with pymupdf.open(path) as doc:
+        if doc.is_encrypted and not doc.authenticate(""):
+            raise ExtractError("This PDF is password-protected and can't be read.",
+                               code="PDF_ENCRYPTED")
+        meta = doc.metadata or {}
+        title = _clean_title(meta.get("title") or "")
+        author = (meta.get("author") or "").strip()
+        # creationDate like "D:20081231..." — prefer it over modDate
+        for key in ("creationDate", "modDate"):
+            if y := re.search(r"D:(1[5-9]\d\d|20\d\d)", meta.get(key) or ""):
+                year = int(y.group(1))
+                break
+
+        n_pages = doc.page_count
+        # (page_no, text, has_text) per page, then group contiguous runs.
+        per_page: list[tuple[int, str, bool]] = []
+        for pno in range(n_pages):
+            raw = ocr_text.get(pno, "") if use_ocr else doc[pno].get_text()
+            text = _dehyphenate(raw)
+            has = len(text.split()) >= _MIN_PDF_WORDS
+            n_text += has
+            n_image += not has
+            per_page.append((pno, text, has))
+
+        run_start, run_has, run_texts = 0, None, []
+        def flush(end: int):
+            if run_has is None:
+                return
+            label = f"pages {run_start + 1}–{end}"
+            body = "\n\n".join(run_texts) + "\n\n"
+            if run_has:
+                segs.append(Segment("body", True, body, label + (" (OCR)" if use_ocr else "")))
+            else:
+                segs.append(Segment("image-pages", False, body,
+                                    f"{label} — image-only / blank (no usable text)"))
+        for pno, text, has in per_page:
+            if has != run_has:
+                flush(pno)
+                run_start, run_has, run_texts = pno, has, []
+            run_texts.append(text)
+        flush(n_pages)
+
+    ex = Extraction("pdf", [s for s in segs if s.text.strip()])
+    ex.title, ex.author, ex.year = title, author, year
+    ex.source = "pdf"
+    if not ex.title:
+        ex.title = Path(path).stem.replace("_", " ").strip()
+    if year is not None:
+        ex.year_note = "from PDF metadata (often the scan/creation date) — please check."
+    ex.meta["pdf"] = {
+        "n_pages": n_pages,
+        "n_text_pages": n_text,
+        "n_image_pages": n_image,
+        # majority of pages carry text ⇒ a usable embedded layer exists
+        "has_text_layer": n_text * 2 > n_pages,
+        "used_ocr": use_ocr,
+    }
+    return ex

@@ -13,8 +13,9 @@ CREATE TABLE IF NOT EXISTS books (
     n_types       INTEGER,            -- distinct lowercased token types
     ingested_at   TEXT,
     content_hash  TEXT,               -- sha256 of the normalized kept token stream (dedup)
-    format        TEXT,               -- source format: 'txt' | 'epub'
-    orig_filename TEXT                -- the dropped file's original name (provenance)
+    format        TEXT,               -- source format: 'txt' | 'epub' | 'pdf'
+    orig_filename TEXT,               -- the dropped file's original name (provenance)
+    text_source   TEXT                -- PDFs: 'embedded' | 'ocr:tesseract' | 'ocr:rapidocr'
 );
 -- NOTE: the idx_books_content_hash index (for exact-content dedup) is created in
 -- ingest/db.py:connect() AFTER ensure_columns, since content_hash is migrated in

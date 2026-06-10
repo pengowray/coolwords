@@ -45,6 +45,7 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("content_hash", "TEXT"),
         ("format", "TEXT"),
         ("orig_filename", "TEXT"),
+        ("text_source", "TEXT"),
     ],
 }
 

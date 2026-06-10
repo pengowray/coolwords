@@ -319,6 +319,82 @@ pub struct Inspection {
     pub orig_filename: String,
     #[serde(default)]
     pub segments: Vec<ImportSegment>,
+    // PDF-only blocks (absent/empty for txt/epub).
+    #[serde(default)]
+    pub pdf: Option<PdfInfo>,
+    #[serde(default)]
+    pub needs_ocr: bool,
+    #[serde(default)]
+    pub ocr: Option<OcrInfo>,
+}
+
+/// Page statistics for a dropped PDF.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct PdfInfo {
+    #[serde(default)]
+    pub n_pages: i64,
+    #[serde(default)]
+    pub n_text_pages: i64,
+    #[serde(default)]
+    pub n_image_pages: i64,
+    #[serde(default)]
+    pub has_text_layer: bool,
+}
+
+/// OCR engine availability for the import UI.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct OcrInfo {
+    #[serde(default)]
+    pub engines: HashMap<String, OcrEngine>,
+    #[serde(default)]
+    pub default_engine: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct OcrEngine {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// Result of `--ocr-compare`: per-page embedded-vs-OCR diffs. (Named …Result to
+/// avoid colliding with the `OcrCompare` args struct the #[server] macro derives
+/// from the `ocr_compare` server fn.)
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct OcrCompareResult {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub engine: String,
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub pages: Vec<OcrPage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct OcrPage {
+    #[serde(default)]
+    pub page: i64,
+    #[serde(default)]
+    pub sim: f64,
+    #[serde(default)]
+    pub embedded_words: i64,
+    #[serde(default)]
+    pub ocr_words: i64,
+    #[serde(default)]
+    pub ops: Vec<DiffOp>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct DiffOp {
+    #[serde(default)]
+    pub op: String, // eq | gap | del | ins | rep
+    #[serde(default)]
+    pub a: String,
+    #[serde(default)]
+    pub b: String,
 }
 
 /// Result of committing an import (book ingested + analysis pipeline run).
@@ -1570,6 +1646,8 @@ pub async fn confirm_import(
     author: String,
     year: String,
     orig_filename: String,
+    text_source: String,
+    engine: String,
 ) -> Result<ImportResult, ServerFnError> {
     if token.is_empty() || token.contains('/') || token.contains('\\') || token.contains("..") {
         return Err(ServerFnError::new("invalid upload token"));
@@ -1599,12 +1677,52 @@ pub async fn confirm_import(
         args.push("--year".into());
         args.push(y.to_string());
     }
+    if !text_source.is_empty() {
+        args.push("--text-source".into());
+        args.push(text_source);
+    }
+    if !engine.is_empty() {
+        args.push("--engine".into());
+        args.push(engine);
+    }
     let argref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let v = run_importer(&argref)?;
     let res: ImportResult =
         serde_json::from_value(v).map_err(|e| ServerFnError::new(format!("parse result: {e}")))?;
     let _ = std::fs::remove_file(&staged);
+    // drop any OCR cache sidecars (<token>.ocr.<engine>.json) left in staging
+    if let Ok(rd) = std::fs::read_dir(staging_dir()) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with(&token) && name != token {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
     Ok(res)
+}
+
+/// OCR a sample of a staged PDF's pages and diff against its embedded text layer,
+/// so the user can judge whether to import the embedded text or our re-OCR.
+#[server]
+pub async fn ocr_compare(token: String, engine: String) -> Result<OcrCompareResult, ServerFnError> {
+    if token.is_empty() || token.contains('/') || token.contains('\\') || token.contains("..") {
+        return Err(ServerFnError::new("invalid upload token"));
+    }
+    let staged = staging_dir().join(&token);
+    if !staged.exists() {
+        return Err(ServerFnError::new("upload expired — please drop the file again"));
+    }
+    let path = staged.to_string_lossy().to_string();
+    let mut args: Vec<String> = vec!["--ocr-compare".into(), path];
+    if !engine.is_empty() {
+        args.push("--engine".into());
+        args.push(engine);
+    }
+    let argref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    // run_importer errors on {ok:false}; surface OCR-missing etc. as the error text.
+    let v = run_importer(&argref)?;
+    serde_json::from_value(v).map_err(|e| ServerFnError::new(format!("parse compare: {e}")))
 }
 
 /// Re-segment an already-imported book's stored file, for the "view stripping" page.
@@ -1621,7 +1739,11 @@ pub async fn view_source(book_id: i64) -> Result<Inspection, ServerFnError> {
     let Some((slug, fmt)) = row else {
         return Err(ServerFnError::new("book not found"));
     };
-    let ext = if fmt.as_deref() == Some("epub") { "epub" } else { "txt" };
+    let ext = match fmt.as_deref() {
+        Some("epub") => "epub",
+        Some("pdf") => "pdf",
+        _ => "txt",
+    };
     // UI-imported books live in BOOKS_DIR as <slug>.<ext>; older CLI-imported ones
     // may still be in the repo's data/books as <slug>.txt/.epub — try both.
     let root = repo_root();
@@ -2510,8 +2632,56 @@ fn SegmentView(segments: Vec<ImportSegment>) -> impl IntoView {
     }
 }
 
-/// Drag-drop a `.txt`/`.epub`, review detected metadata + what gets stripped, then
-/// commit it (copy into the books dir, ingest, run the analysis pipeline).
+/// The OCR-compare lifecycle for a PDF.
+#[derive(Clone)]
+enum CompareState {
+    Idle,
+    Loading,
+    Done(Box<OcrCompareResult>),
+    Failed(String),
+}
+
+/// Per-page embedded-vs-OCR diff panel: similarity badge + an inline word diff
+/// (red strikethrough = embedded-only, green = OCR-only, grey = shared context).
+#[component]
+fn OcrCompareView(cmp: OcrCompareResult) -> impl IntoView {
+    view! {
+        <div class="ocr-compare">
+            <p class="seg-summary">
+                {format!("OCR engine: {} · {} pages sampled — red = embedded only, green = OCR only",
+                    cmp.engine, cmp.pages.len())}
+            </p>
+            {cmp.pages.into_iter().map(|p| {
+                let pct = (p.sim * 100.0).round() as i64;
+                let simcls = format!("ocr-sim {}", if pct >= 90 { "hi" } else if pct >= 70 { "mid" } else { "lo" });
+                view! {
+                    <div class="ocr-page">
+                        <div class="ocr-phead">
+                            <strong>{format!("page {}", p.page)}</strong>
+                            <span class=simcls>{format!("{pct}% match")}</span>
+                            <span class="seg-len">{format!("{}w embedded · {}w OCR", p.embedded_words, p.ocr_words)}</span>
+                        </div>
+                        <p class="ocr-diff">
+                            {p.ops.into_iter().map(|o| match o.op.as_str() {
+                                "gap" => view! { <span class="d-gap">{format!(" {} ", o.a)}</span> }.into_any(),
+                                "del" => view! { <span class="d-del">{format!("{} ", o.a)}</span> }.into_any(),
+                                "ins" => view! { <span class="d-ins">{format!("{} ", o.b)}</span> }.into_any(),
+                                "rep" => view! {
+                                    <span class="d-del">{format!("{} ", o.a)}</span>
+                                    <span class="d-ins">{format!("{} ", o.b)}</span>
+                                }.into_any(),
+                                _ => view! { <span class="d-eq">{format!("{} ", o.a)}</span> }.into_any(),
+                            }).collect_view()}
+                        </p>
+                    </div>
+                }
+            }).collect_view()}
+        </div>
+    }
+}
+
+/// Drag-drop a `.txt`/`.epub`/`.pdf`, review detected metadata + what gets stripped
+/// (and for PDFs, compare embedded text vs re-OCR), then commit it.
 #[component]
 fn ImportPage() -> impl IntoView {
     let state = RwSignal::new(UploadState::Idle);
@@ -2519,17 +2689,23 @@ fn ImportPage() -> impl IntoView {
     let f_author = RwSignal::new(String::new());
     let f_year = RwSignal::new(String::new());
     let f_slug = RwSignal::new(String::new());
+    let f_source = RwSignal::new(String::from("embedded")); // PDF text source
+    let f_engine = RwSignal::new(String::new());            // OCR engine
+    let compare = RwSignal::new(CompareState::Idle);
     let committing = RwSignal::new(false);
     let commit_err = RwSignal::new(None::<String>);
     let file_input: NodeRef<leptos::html::Input> = NodeRef::new();
 
-    // Seed the editable form from each fresh inspection.
+    // Seed the editable form (and PDF source/engine) from each fresh inspection.
     Effect::new(move |_| {
         if let UploadState::Done(insp) = state.get() {
             f_title.set(insp.title.clone());
             f_author.set(insp.author.clone());
             f_year.set(insp.year.map(|y| y.to_string()).unwrap_or_default());
             f_slug.set(insp.suggested_slug.clone());
+            f_source.set(if insp.needs_ocr { "ocr".into() } else { "embedded".into() });
+            f_engine.set(insp.ocr.as_ref().map(|o| o.default_engine.clone()).unwrap_or_default());
+            compare.set(CompareState::Idle);
         }
     });
 
@@ -2547,6 +2723,19 @@ fn ImportPage() -> impl IntoView {
         }
     };
 
+    let do_compare = move |_| {
+        let UploadState::Done(insp) = state.get() else { return };
+        let token = insp.token.clone();
+        let engine = f_engine.get();
+        compare.set(CompareState::Loading);
+        leptos::task::spawn_local(async move {
+            match ocr_compare(token, engine).await {
+                Ok(c) => compare.set(CompareState::Done(Box::new(c))),
+                Err(e) => compare.set(CompareState::Failed(e.to_string())),
+            }
+        });
+    };
+
     let do_commit = move |_| {
         let UploadState::Done(insp) = state.get() else { return };
         committing.set(true);
@@ -2554,9 +2743,15 @@ fn ImportPage() -> impl IntoView {
         let token = insp.token.clone();
         let orig = insp.orig_filename.clone();
         let (title, author, year, slug) = (f_title.get(), f_author.get(), f_year.get(), f_slug.get());
+        // text_source/engine only matter for PDFs; harmlessly ignored otherwise.
+        let (source, engine) = if insp.pdf.is_some() {
+            (f_source.get(), f_engine.get())
+        } else {
+            (String::new(), String::new())
+        };
         let navigate = use_navigate();
         leptos::task::spawn_local(async move {
-            match confirm_import(token, slug, title, author, year, orig).await {
+            match confirm_import(token, slug, title, author, year, orig, source, engine).await {
                 Ok(res) => navigate(&format!("/?book={}", res.book_id), Default::default()),
                 Err(e) => {
                     commit_err.set(Some(e.to_string()));
@@ -2569,12 +2764,13 @@ fn ImportPage() -> impl IntoView {
     view! {
         <h1>"Import a book"</h1>
         <p class="sub"><A href="/">"← back to words"</A>
-            " · drop a .txt or .epub; we detect title/author and show what gets stripped."</p>
+            " · drop a .txt, .epub or .pdf; we detect title/author and show what gets stripped. "
+            "PDFs can be re-OCR'd and compared to the embedded text."</p>
 
         <div class="dropzone" on:drop=on_drop on:dragover=on_dragover>
-            <p class="dz-big">"Drag a .txt or .epub here"</p>
+            <p class="dz-big">"Drag a .txt, .epub or .pdf here"</p>
             <p>"or "<label class="dz-browse">"browse…"
-                <input type="file" accept=".txt,.epub" node_ref=file_input
+                <input type="file" accept=".txt,.epub,.pdf" node_ref=file_input
                     on:change=on_pick style="display:none"/>
             </label></p>
         </div>
@@ -2598,6 +2794,19 @@ fn ImportPage() -> impl IntoView {
                     }
                 });
                 let segs = insp.segments.clone();
+                let pdf = insp.pdf.clone();
+                let needs_ocr = insp.needs_ocr;
+                let engines_avail: Vec<String> = insp.ocr.as_ref().map(|o| {
+                    let mut v: Vec<String> = o.engines.iter().filter(|(_, e)| e.available)
+                        .map(|(k, _)| k.clone()).collect();
+                    v.sort();
+                    v
+                }).unwrap_or_default();
+                let engines_missing: Vec<String> = insp.ocr.as_ref().map(|o| {
+                    o.engines.iter().filter(|(_, e)| !e.available)
+                        .map(|(k, e)| format!("{k}: {}", e.detail)).collect()
+                }).unwrap_or_default();
+                let has_engines = !engines_avail.is_empty();
                 view! {
                     {dup_banner}
                     <div class="meta-form">
@@ -2616,6 +2825,46 @@ fn ImportPage() -> impl IntoView {
                     </div>
                     {(!year_note.is_empty()).then(|| view! { <p class="yr-note">{year_note}</p> })}
                     <p class="counts">{format!("format: {fmt} · {ntok} tokens · {ntypes} distinct types")}</p>
+                    {pdf.map(|p| {
+                        let stats = format!("PDF · {} pages — {} with text, {} image-only",
+                            p.n_pages, p.n_text_pages, p.n_image_pages);
+                        view! {
+                            <p class="counts">{stats}</p>
+                            {needs_ocr.then(|| view! {
+                                <div class="dup-banner ocr-banner">
+                                    "No embedded text layer — this looks like a scan, so text will come from OCR."
+                                </div>
+                            })}
+                            <div class="ocr-controls">
+                                <span class="picklbl">"text source: "</span>
+                                <label><input type="radio" name="src" disabled=needs_ocr
+                                    prop:checked=move || f_source.get() == "embedded"
+                                    on:change=move |_| f_source.set("embedded".into())/>" embedded"</label>
+                                <label><input type="radio" name="src"
+                                    prop:checked=move || f_source.get() == "ocr"
+                                    on:change=move |_| f_source.set("ocr".into())/>" re-OCR"</label>
+                                {has_engines.then(|| view! {
+                                    <select class="intsel" prop:value=move || f_engine.get()
+                                        on:change=move |e| f_engine.set(event_target_value(&e))>
+                                        {engines_avail.clone().into_iter()
+                                            .map(|n| { let v = n.clone(); view! { <option value=v>{n}</option> } }).collect_view()}
+                                    </select>
+                                    <button type="button" class="chip" on:click=do_compare>
+                                        "Compare OCR (sample)"</button>
+                                })}
+                            </div>
+                            {(!engines_missing.is_empty()).then(|| view! {
+                                <p class="yr-note">{format!("OCR engines not installed — {}", engines_missing.join("; "))}</p>
+                            })}
+                            {move || match compare.get() {
+                                CompareState::Idle => ().into_any(),
+                                CompareState::Loading => view! {
+                                    <p class="loading">"OCR-ing sample pages…"</p> }.into_any(),
+                                CompareState::Failed(e) => view! { <p class="err">{e}</p> }.into_any(),
+                                CompareState::Done(c) => view! { <OcrCompareView cmp=*c/> }.into_any(),
+                            }}
+                        }
+                    })}
                     <div class="detail-actions">
                         <button class="commit" disabled=move || committing.get() || is_dup
                             on:click=do_commit>

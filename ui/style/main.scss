@@ -300,3 +300,29 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
 .scopebtn:hover { border-color: #888; }
 .intsel { font-size: 0.8rem; padding: 1px 4px; border-radius: 6px; }
 .tagsadd { margin-top: 1rem; }
+
+/* ---- PDF OCR: source controls + embedded-vs-OCR compare ---- */
+.ocr-banner { background: #e67e2218; border-color: #e67e2255; color: #b9550e; }
+.ocr-controls {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem;
+  margin: 0.5rem 0; font-size: 0.9rem;
+}
+.ocr-controls label { display: inline-flex; align-items: center; gap: 0.2rem; cursor: pointer; }
+.ocr-compare { margin: 0.6rem 0 1rem; }
+.ocr-page { border: 1px solid #8884; border-radius: 8px; margin: 0.5rem 0; overflow: hidden; }
+.ocr-phead {
+  display: flex; align-items: baseline; gap: 0.6rem; padding: 0.3rem 0.6rem;
+  border-bottom: 1px solid #8883; font-size: 0.85rem;
+}
+.ocr-sim { font-weight: 700; border-radius: 10px; padding: 0.02rem 0.5rem; font-size: 0.78rem; }
+.ocr-sim.hi  { background: #2ecc7133; color: #1e8449; }
+.ocr-sim.mid { background: #f39c1233; color: #b9770e; }
+.ocr-sim.lo  { background: #e74c3c2a; color: #c0392b; }
+.ocr-diff {
+  margin: 0; padding: 0.5rem 0.7rem; max-height: 16rem; overflow: auto;
+  font-size: 0.84rem; line-height: 1.6; word-break: break-word;
+}
+.d-eq { color: #888; }
+.d-gap { color: #bbb; font-style: italic; }
+.d-del { color: #c0392b; text-decoration: line-through; }
+.d-ins { color: #1e8449; background: #2ecc7118; }
