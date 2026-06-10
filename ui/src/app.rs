@@ -513,13 +513,33 @@ const RARE_PM: f64 = 0.10;
 #[cfg(feature = "ssr")]
 const RECENT_FROM: i32 = 1980;
 
+/// Last decade the usage corpus actually covers (the Google 1-grams end in the
+/// 2000s). Used to clamp the era classifier so books published *after* the data
+/// aren't misjudged.
+#[cfg(feature = "ssr")]
+fn corpus_last_decade(conn: &rusqlite::Connection) -> i32 {
+    conn.query_row("SELECT COALESCE(MAX(decade), 2000) FROM word_trajectory", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map(|d| d as i32)
+    .unwrap_or(2000)
+}
+
 /// Classify a word's usage trajectory *relative to a book's publication decade* —
 /// a fixed historical question, independent of the present day. Returns a key:
-/// "ahead" (rare then, common later), "of" (peaked around the book era), "after"
-/// (its heyday was earlier — fading by the book's time), "timeless" (roughly
-/// steady), or "rare" (never common in any era). `None` without enough data.
+/// "ahead" (rare then, common later), "rising" (still climbing at the latest data,
+/// for books at/after the corpus end where "ahead" can't be judged), "of" (peaked
+/// around the book era), "after" (its heyday was earlier — fading by the book's
+/// time), "timeless" (roughly steady), or "rare" (never common). `None` w/o data.
+///
+/// `corpus_end` is the last decade the data covers. A book published after it
+/// (a modern import) has no usage data at its own era, so we'd otherwise read the
+/// empty window as zero usage and mislabel rising/steady words as "declining" —
+/// clamp the book's decade to `corpus_end` and judge it as of the latest data.
+/// (A word that genuinely faded *within* the corpus still has a real near-zero
+/// `at` window and correctly stays "after"/declining.)
 #[cfg(feature = "ssr")]
-fn classify_era(traj: &[(i32, f64)], book_year: Option<i64>) -> Option<&'static str> {
+fn classify_era(traj: &[(i32, f64)], book_year: Option<i64>, corpus_end: i32) -> Option<&'static str> {
     let year = book_year?;
     if traj.len() < 3 {
         return None;
@@ -528,7 +548,20 @@ fn classify_era(traj: &[(i32, f64)], book_year: Option<i64>) -> Option<&'static 
     if peak < RARE_PM {
         return Some("rare"); // never common in any decade
     }
-    let bdec = (year as f64 / 10.0).floor() as i32 * 10;
+    let bdec_raw = (year as f64 / 10.0).floor() as i32 * 10;
+    // A book at/after the corpus end has no "after" window, so "ahead of its time"
+    // (rare-then-common-later) can't be judged. If such a word is still climbing at
+    // the latest data, that's "on the rise" — the honest modern-book read.
+    if bdec_raw >= corpus_end {
+        let mut ds: Vec<(i32, f64)> = traj.to_vec();
+        ds.sort_by(|a, b| a.0.cmp(&b.0));
+        let last = ds[ds.len() - 1].1;
+        let prev = ds[ds.len() - 2].1;
+        if last > prev * 1.15 && last >= peak * 0.90 {
+            return Some("rising");
+        }
+    }
+    let bdec = bdec_raw.min(corpus_end);
     let mean = |lo: i32, hi: i32| -> Option<f64> {
         let v: Vec<f64> = traj.iter().filter(|(d, _)| *d >= lo && *d <= hi).map(|(_, p)| *p).collect();
         (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
@@ -573,6 +606,7 @@ fn is_obsolete_now(traj: &[(i32, f64)]) -> bool {
 fn era_label(key: &str) -> &'static str {
     match key {
         "ahead" => "ahead of its time",
+        "rising" => "on the rise",
         "of" => "of its time",
         "after" => "declining",
         "timeless" => "timeless",
@@ -690,18 +724,19 @@ pub async fn list_categories(book_id: i64, level: i64) -> Result<Vec<FilterOpt>,
     // --- era (relative to the book's year) + present-day status, both classified
     // from each word's trajectory in a single pass ---
     let year = book_year(&conn, book_id)?;
+    let corpus_end = corpus_last_decade(&conn);
     let traj = book_trajectories(&conn, book_id, level)?;
     let mut era_counts: HashMap<&str, i64> = HashMap::new();
     let mut n_obsolete = 0i64;
     for t in traj.values() {
-        if let Some(k) = classify_era(t, year) {
+        if let Some(k) = classify_era(t, year, corpus_end) {
             *era_counts.entry(k).or_default() += 1;
         }
         if is_obsolete_now(t) {
             n_obsolete += 1;
         }
     }
-    for key in ["ahead", "of", "after", "timeless", "rare"] {
+    for key in ["ahead", "rising", "of", "after", "timeless", "rare"] {
         if let Some(&n) = era_counts.get(key) {
             out.push(opt(format!("era:{key}"), era_label(key).to_string(), n, "era (vs. book's year)"));
         }
@@ -843,10 +878,11 @@ pub async fn get_candidates(
 
     if needs_traj {
         let year = book_year(&conn, book_id)?;
+        let corpus_end = corpus_last_decade(&conn);
         let traj = book_trajectories(&conn, book_id, level)?;
         if let Some(era) = era_filter {
             out.retain(|c| {
-                traj.get(&c.word_id).and_then(|t| classify_era(t, year)).is_some_and(|k| k == era)
+                traj.get(&c.word_id).and_then(|t| classify_era(t, year, corpus_end)).is_some_and(|k| k == era)
             });
         } else {
             out.retain(|c| traj.get(&c.word_id).is_some_and(|t| is_obsolete_now(t)));
@@ -998,7 +1034,7 @@ pub async fn word_detail(book_id: i64, word_id: i64, level: i64) -> Result<WordI
         .filter_map(Result::ok)
         .collect();
 
-    let era = classify_era(&trajectory, book_year).map(|k| era_label(k).to_string());
+    let era = classify_era(&trajectory, book_year, corpus_last_decade(&conn)).map(|k| era_label(k).to_string());
     let obsolete = is_obsolete_now(&trajectory);
 
     // Root/lemma (when distinct from the headword): its own usage chart + category,
@@ -1452,17 +1488,20 @@ fn Trajectory(data: Vec<(i32, f64)>, book_year: Option<i64>) -> impl IntoView {
     let marker = book_year.map(|y| {
         let bdec = (y as f64 / 10.0).floor() * 10.0;
         let span = ((max_dec - min_dec) as f64).max(10.0);
-        let frac = ((bdec - min_dec as f64) / span).clamp(0.0, 1.0);
-        (frac * (w - (w / n)) + (w / n) / 2.0, y)
+        let raw = (bdec - min_dec as f64) / span;
+        let frac = raw.clamp(0.0, 1.0);
+        // A book past the charted data pins to the right edge; label it at the TOP
+        // so its year doesn't collide with the bottom-right axis decade label.
+        (frac * (w - (w / n)) + (w / n) / 2.0, y, raw > 1.0)
     });
     view! {
         <svg class="traj" width=w height=h viewBox=format!("0 0 {w} {h}") role="img" aria-label="usage over time">
             {bars.into_iter().map(|(x, y, bh)| view! {
                 <rect x=x y=y width=bar_w height=bh class="traj-bar"/>
             }).collect_view()}
-            {marker.map(|(mx, yr)| view! {
+            {marker.map(|(mx, yr, beyond)| view! {
                 <line x1=mx y1=0.0 x2=mx y2=plot_h class="traj-marker"/>
-                <text x=mx y=h text-anchor="middle" class="traj-yr">{yr.to_string()}</text>
+                <text x=mx y={if beyond { 8.0 } else { h }} text-anchor="middle" class="traj-yr">{yr.to_string()}</text>
             })}
             <text x=0.0 y=h class="traj-ax">{format!("{min_dec}s")}</text>
             <text x=w y=h text-anchor="end" class="traj-ax">{format!("{max_dec}s")}</text>
