@@ -1,0 +1,12 @@
+# Keep the CI build context small: source only, never the 1 GB of data or build output.
+.git
+.github
+data/
+target/
+ui/target/
+**/*.db
+**/*.npy
+books/
+*.log
+.cf-empty.yml
+node_modules/

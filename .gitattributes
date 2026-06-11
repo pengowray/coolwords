@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings so they run inside the Linux container even
+# when the repo is checked out / committed from Windows.
+*.sh text eol=lf
+coolwords/run.sh text eol=lf
