@@ -1996,19 +1996,29 @@ fn toggle_tag(t: Tagger, book_id: i64, word_id: i64, tag: &str) {
 #[derive(Clone, Copy)]
 struct CurrentBook(RwSignal<Option<i64>>);
 
-/// Recall / remember the last-viewed book id (client-only; no-ops on the server,
-/// where there's no `window`).
+/// Recall / remember the last-viewed book id via localStorage. Client-only: the
+/// `book` Memo reads `stored_book()` during SSR too, and js-sys panics ("cannot
+/// access imported statics on non-wasm targets") if `web_sys` is touched on the
+/// native server — so these are no-ops off the hydrate (wasm) target.
+#[cfg(feature = "hydrate")]
 fn stored_book() -> Option<i64> {
     web_sys::window()
         .and_then(|w| w.local_storage().ok().flatten())
         .and_then(|s| s.get_item("coolwords.book").ok().flatten())
         .and_then(|v| v.parse::<i64>().ok())
 }
+#[cfg(not(feature = "hydrate"))]
+fn stored_book() -> Option<i64> {
+    None
+}
+#[cfg(feature = "hydrate")]
 fn remember_book(id: i64) {
     if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = s.set_item("coolwords.book", &id.to_string());
     }
 }
+#[cfg(not(feature = "hydrate"))]
+fn remember_book(_id: i64) {}
 
 /// Persistent top menu shown on every page: brand + the three sections + a single
 /// consistent "import" action. The active page is highlighted, and "words" carries

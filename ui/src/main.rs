@@ -9,8 +9,16 @@ async fn main() {
     use coolwords_ui::app::*;
 
     let conf = get_configuration(None).unwrap();
-    let addr = conf.leptos_options.site_addr;
-    let leptos_options = conf.leptos_options;
+    let mut leptos_options = conf.leptos_options;
+    // Allow overriding the bind address at runtime (LEPTOS_SITE_ADDR also works, but
+    // this is unambiguous for the tunnel / Linux / Home Assistant add-on deploys).
+    if let Ok(bind) = std::env::var("COOLWORDS_BIND") {
+        match bind.parse() {
+            Ok(parsed) => leptos_options.site_addr = parsed,
+            Err(e) => log!("ignoring invalid COOLWORDS_BIND={bind:?}: {e}"),
+        }
+    }
+    let addr = leptos_options.site_addr;
     let routes = generate_route_list(App);
 
     let app = Router::new()
