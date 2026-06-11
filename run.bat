@@ -47,8 +47,13 @@ REM    OCR engines (either; for scans or to re-OCR a bad embedded layer):
 REM      winget install UB-Mannheim.TesseractOCR :: tesseract (fast, system install)
 REM      pip install rapidocr-onnxruntime        :: rapidocr (pip-only; better on noisy scans)
 REM    .env knobs: COOLWORDS_OCR_ENGINE=tesseract^|rapidocr ; COOLWORDS_TESSERACT=path\to\tesseract.exe
-REM      python -m ingest.import_book --ocr-compare path\to\book.pdf [--engine tesseract] [--pages 1,5,9-12]
-REM      python -m ingest.import_book --commit path\to\book.pdf --slug s --text-source ocr --engine tesseract
+REM    Import is always fast (embedded text); manage OCR after the fact on /books
+REM    (background jobs with progress + cancel). The cache lives beside the book:
+REM    %%COOLWORDS_BOOKS_DIR%%\<slug>.pdf.ocr.<engine>.json
+REM      python -m ingest.import_book --ocr-status SLUG                 :: cache + source state
+REM      python -m ingest.import_book --ocr-book SLUG --engine tesseract:: OCR all pages (resumable)
+REM      python -m ingest.import_book --ocr-compare path\to\book.pdf [--engine E] [--pages 1,5,9-12]
+REM      python -m ingest.import_book --reingest SLUG --text-source embedded^|ocr:tesseract
 REM ===========================================================================
 
 cd /d "%~dp0ui"

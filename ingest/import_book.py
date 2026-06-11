@@ -90,6 +90,15 @@ def _dup_lookup(con, content_hash: str, exclude_slug: str = ""):
     return (row[0], row[1]) if row else (None, None)
 
 
+def book_file(slug: str) -> Path:
+    """The committed source file for a slug: BOOKS_DIR/<slug>.<ext>."""
+    for ext in (".pdf", ".epub", ".txt"):
+        p = BOOKS_DIR / f"{slug}{ext}"
+        if p.exists():
+            return p
+    raise ExtractError(f"no stored file for '{slug}' in {BOOKS_DIR}", code="NO_FILE")
+
+
 def do_inspect(path: Path) -> dict:
     ex = extract(path)
     kept = ex.kept_text
@@ -225,20 +234,13 @@ def _run_step(args: list[str]) -> dict:
 
 
 def do_commit(path: Path, slug: str, title: str, author: str, year, orig_filename: str,
-              run_pipeline: bool, text_source: str = "", engine: str = "") -> dict:
+              run_pipeline: bool) -> dict:
     path = Path(path)
-    # For PDFs the text source is a choice: the embedded layer (default) or our
-    # own re-OCR. OCR is cache-aware, so a prior compare/full run is reused.
-    src_label = None
-    pdf_ocr = None
-    if extract_mod.detect_format(path) == "pdf":
-        if text_source == "ocr":
-            texts, eng, n_new = ocr.ocr_pdf(path, engine or None)
-            print(f"commit: OCR source via {eng} ({n_new} pages newly OCRed)", file=sys.stderr)
-            pdf_ocr, src_label = texts, f"ocr:{eng}"
-        else:
-            src_label = "embedded"
-    ex = extract(path, pdf_ocr=pdf_ocr)
+    # Import is always fast: PDFs use their embedded text layer (a scan imports as a
+    # near-empty placeholder). Re-OCR + source switching happen later on the manage
+    # page (ingest.import_book --ocr-book / --reingest), so the browser never blocks.
+    ex = extract(path)
+    src_label = "embedded" if ex.fmt == "pdf" else None
     kept = ex.kept_text
     tokens, examples = book.tokenize(kept)
     chash = _content_hash(kept)
@@ -286,6 +288,119 @@ def do_commit(path: Path, slug: str, title: str, author: str, year, orig_filenam
             "candidates": n_cand, "dest": str(dest), "pipeline": steps}
 
 
+# ---- post-import OCR / source management (operate on the committed file) ---- #
+def do_ocr_book(slug: str, engine: str) -> dict:
+    """OCR every page of a committed PDF into its book-keyed cache (resumable).
+    Prints `ocr[E] page i (i/N)` to stderr for the background-job progress bar."""
+    path = book_file(slug)
+    if extract_mod.detect_format(path) != "pdf":
+        return {"ok": False, "code": "NOT_PDF", "error": f"'{slug}' is not a PDF."}
+    texts, eng, n_new = ocr.ocr_pdf(path, engine or None)
+    return {"ok": True, "slug": slug, "engine": eng,
+            "pages": len(texts), "newly_ocred": n_new}
+
+
+def do_ocr_status(slug: str) -> dict:
+    """Per-engine OCR cache state + embedded-layer state + current text source."""
+    path = book_file(slug)
+    con = connect()
+    row = con.execute("SELECT format, text_source FROM books WHERE slug = ?", (slug,)).fetchone()
+    con.close()
+    out = {"ok": True, "slug": slug, "format": row[0] if row else None,
+           "text_source": row[1] if row else None,
+           "is_pdf": extract_mod.detect_format(path) == "pdf"}
+    if not out["is_pdf"]:
+        return out
+    embedded = extract_mod.pdf_page_texts(path)
+    n_pages = len(embedded)
+    n_text = sum(1 for t in embedded if len(t.split()) >= 15)
+    st = ocr.engines()
+    out.update({
+        "n_pages": n_pages,
+        "n_text_pages": n_text,
+        "has_text_layer": n_text * 2 > n_pages,
+        "default_engine": ocr.default_engine() or "",
+        "engines": {
+            eng: {
+                "available": info["available"],
+                "detail": info["detail"],
+                "cached_pages": len(ocr.load_cache(path, eng)["pages"]),
+                "complete": n_pages > 0 and len(ocr.load_cache(path, eng)["pages"]) >= n_pages,
+            }
+            for eng, info in st.items()
+        },
+    })
+    return out
+
+
+def do_reingest(slug: str, text_source: str, run_pipeline: bool = True) -> dict:
+    """Re-tokenize a committed book from a chosen text source (embedded, or a cached
+    OCR engine — no re-OCR), replace its histogram, and re-score. Preserves the
+    book's metadata + tags (tags are keyed by slug+word in user.db)."""
+    path = book_file(slug)
+    con = connect()
+    row = con.execute(
+        "SELECT title, author, source, source_id, year, format, orig_filename "
+        "FROM books WHERE slug = ?", (slug,)
+    ).fetchone()
+    if not row:
+        con.close()
+        return {"ok": False, "code": "NO_BOOK", "error": f"no book '{slug}'"}
+    title, author, source, source_id, year, fmt, orig = row
+
+    pdf_ocr = None
+    src_label = "embedded"
+    if text_source.startswith("ocr"):
+        eng = ocr.require_engine(text_source.split(":", 1)[1] if ":" in text_source else None)
+        cache = ocr.load_cache(path, eng)
+        embedded = extract_mod.pdf_page_texts(path)
+        if len(cache["pages"]) < len(embedded):
+            con.close()
+            return {"ok": False, "code": "OCR_INCOMPLETE",
+                    "error": f"OCR cache for {eng} is incomplete "
+                             f"({len(cache['pages'])}/{len(embedded)} pages) — run OCR first."}
+        pdf_ocr = {int(k): v for k, v in cache["pages"].items()}
+        src_label = f"ocr:{eng}"
+
+    print("reingest: extract", file=sys.stderr, flush=True)
+    ex = extract(path, pdf_ocr=pdf_ocr)
+    tokens, examples = book.tokenize(ex.kept_text)
+    chash = _content_hash(ex.kept_text)
+    dup_slug, dup_title = _dup_lookup(con, chash, exclude_slug=slug)
+    if dup_slug:
+        con.close()
+        return {"ok": False, "code": "DUPLICATE",
+                "error": f"This text matches another book, '{dup_title}' ({dup_slug})."}
+    meta = {"title": title, "author": author, "source": source, "source_id": source_id,
+            "year": year, "content_hash": chash, "format": fmt, "orig_filename": orig,
+            "text_source": src_label}
+    print("reingest: ingest", file=sys.stderr, flush=True)
+    book_id, n_tokens, n_types, matched = book.ingest_tokens(con, slug, meta, tokens, examples)
+    con.close()
+
+    steps = []
+    if run_pipeline:
+        print("reingest: score", file=sys.stderr, flush=True)
+        steps.append(_run_step(["ingest.score", "--slug", slug]))
+        print("reingest: cluster", file=sys.stderr, flush=True)
+        steps.append(_run_step(["ingest.cluster", "--slug", slug]))
+    con = connect()
+    n_cand = con.execute(
+        "SELECT count(*) FROM candidates WHERE book_id = ? AND level = 0", (book_id,)
+    ).fetchone()[0]
+    con.close()
+    return {"ok": True, "slug": slug, "book_id": book_id, "text_source": src_label,
+            "n_tokens": n_tokens, "n_types": n_types, "candidates": n_cand, "pipeline": steps}
+
+
+def do_refresh_trajectory() -> dict:
+    """Re-run the global per-decade usage pass (covers any new words after a source
+    switch). Slow — streams the ngram shards; run as a background job."""
+    print("trajectory: refreshing usage charts", file=sys.stderr, flush=True)
+    step = _run_step(["ingest.trajectory"])
+    return {"ok": step["ok"], "step": step}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=True)
@@ -293,6 +408,14 @@ def main() -> None:
     g.add_argument("--commit", metavar="PATH")
     g.add_argument("--ocr-compare", metavar="PATH",
                    help="OCR a sample of pages and diff against the embedded text layer")
+    g.add_argument("--ocr-book", metavar="SLUG", dest="ocr_book",
+                   help="OCR a committed PDF into its book-keyed cache (background job)")
+    g.add_argument("--reingest", metavar="SLUG",
+                   help="re-tokenize a committed book from a chosen --text-source")
+    g.add_argument("--ocr-status", metavar="SLUG", dest="ocr_status",
+                   help="report OCR cache + text-source state for a committed book")
+    g.add_argument("--refresh-trajectory", action="store_true", dest="refresh_trajectory",
+                   help="re-run the global usage-over-time pass (background job)")
     ap.add_argument("--slug", default="")
     ap.add_argument("--title", default="")
     ap.add_argument("--author", default="")
@@ -302,7 +425,7 @@ def main() -> None:
     ap.add_argument("--engine", default="", help="OCR engine: tesseract | rapidocr (default: auto)")
     ap.add_argument("--pages", default="", help="pages for --ocr-compare, 1-based: '1,5,9-12'")
     ap.add_argument("--text-source", default="", dest="text_source",
-                    help="PDF commit text source: embedded (default) | ocr")
+                    help="--reingest source: embedded | ocr:<engine>")
     args = ap.parse_args()
 
     try:
@@ -310,13 +433,22 @@ def main() -> None:
             result = do_inspect(Path(args.inspect))
         elif args.ocr_compare:
             result = do_ocr_compare(Path(args.ocr_compare), args.engine, args.pages)
+        elif args.ocr_book:
+            result = do_ocr_book(args.ocr_book, args.engine)
+        elif args.ocr_status:
+            result = do_ocr_status(args.ocr_status)
+        elif args.reingest:
+            if not args.text_source:
+                raise SystemExit("--reingest requires --text-source embedded|ocr:<engine>")
+            result = do_reingest(args.reingest, args.text_source, run_pipeline=not args.no_pipeline)
+        elif args.refresh_trajectory:
+            result = do_refresh_trajectory()
         else:
             if not args.slug:
                 raise SystemExit("--commit requires --slug")
             year = int(args.year) if re.fullmatch(r"\d{3,4}", args.year.strip()) else None
             result = do_commit(Path(args.commit), args.slug, args.title, args.author,
-                               year, args.orig_filename, run_pipeline=not args.no_pipeline,
-                               text_source=args.text_source, engine=args.engine)
+                               year, args.orig_filename, run_pipeline=not args.no_pipeline)
     except (ExtractError, OcrError) as e:
         result = {"ok": False, "code": e.code, "error": str(e)}
     except Exception as e:  # surface any failure as JSON the UI can show

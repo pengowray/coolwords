@@ -414,6 +414,69 @@ pub struct ImportResult {
     pub candidates: i64,
 }
 
+/// A background job's serializable progress snapshot (polled by the manage page).
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct JobProgress {
+    pub id: String,
+    pub kind: String,   // "ocr" | "reingest" | "trajectory"
+    pub book_id: i64,
+    pub tag: String,    // engine (ocr) / source (reingest) — for dedup + display
+    pub status: String, // "queued" | "running" | "done" | "failed" | "cancelled"
+    pub percent: f32,   // -1 = indeterminate
+    pub message: String,
+    pub updated: u64,
+}
+
+/// One book row for the management page.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct BookAdmin {
+    pub id: i64,
+    pub slug: String,
+    pub title: String,
+    pub author: String,
+    pub year: Option<i64>,
+    pub format: String,
+    pub source: String,
+    pub text_source: String,
+    pub n_tokens: i64,
+    pub n_types: i64,
+    pub n_selected: i64,
+    pub ingested_at: String,
+}
+
+/// PDF OCR / text-source state for a book (from `--ocr-status`). Named …OcrStatus
+/// to avoid the `BookOcrStatus` args struct the #[server] macro derives from the
+/// `book_ocr_status` server fn.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct OcrStatus {
+    #[serde(default)]
+    pub is_pdf: bool,
+    #[serde(default)]
+    pub text_source: Option<String>,
+    #[serde(default)]
+    pub n_pages: i64,
+    #[serde(default)]
+    pub n_text_pages: i64,
+    #[serde(default)]
+    pub has_text_layer: bool,
+    #[serde(default)]
+    pub default_engine: String,
+    #[serde(default)]
+    pub engines: HashMap<String, OcrEngineStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct OcrEngineStatus {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub cached_pages: i64,
+    #[serde(default)]
+    pub complete: bool,
+}
+
 #[cfg(feature = "ssr")]
 fn db_path() -> String {
     if let Ok(p) = std::env::var("COOLWORDS_DB") {
@@ -493,7 +556,7 @@ fn open_conn() -> Result<rusqlite::Connection, ServerFnError> {
 /// invoked with the same cwd its package imports expect. Mirrors db_path()'s
 /// "../ vs ." probing.
 #[cfg(feature = "ssr")]
-fn repo_root() -> String {
+pub(crate) fn repo_root() -> String {
     for p in ["..", "."] {
         if std::path::Path::new(p).join("ingest").is_dir() {
             return p.to_string();
@@ -505,7 +568,7 @@ fn repo_root() -> String {
 /// Where dropped books are copied. Precedence: COOLWORDS_BOOKS_DIR env > repo
 /// `.env` (same file ingest/paths.py reads) > default. Kept in sync with Python.
 #[cfg(feature = "ssr")]
-fn books_dir() -> std::path::PathBuf {
+pub(crate) fn books_dir() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("COOLWORDS_BOOKS_DIR") {
         if !p.trim().is_empty() {
             return p.into();
@@ -541,7 +604,7 @@ fn staging_dir() -> std::path::PathBuf {
 }
 
 #[cfg(feature = "ssr")]
-fn python_exe() -> String {
+pub(crate) fn python_exe() -> String {
     std::env::var("COOLWORDS_PYTHON").unwrap_or_else(|_| "python".to_string())
 }
 
@@ -1646,8 +1709,6 @@ pub async fn confirm_import(
     author: String,
     year: String,
     orig_filename: String,
-    text_source: String,
-    engine: String,
 ) -> Result<ImportResult, ServerFnError> {
     if token.is_empty() || token.contains('/') || token.contains('\\') || token.contains("..") {
         return Err(ServerFnError::new("invalid upload token"));
@@ -1660,6 +1721,7 @@ pub async fn confirm_import(
     if !staged.exists() {
         return Err(ServerFnError::new("upload expired — please drop the file again"));
     }
+    // Import is always fast (embedded text for PDFs); OCR is done later on /books.
     let mut args: Vec<String> = vec![
         "--commit".into(),
         staged.to_string_lossy().to_string(),
@@ -1677,52 +1739,193 @@ pub async fn confirm_import(
         args.push("--year".into());
         args.push(y.to_string());
     }
-    if !text_source.is_empty() {
-        args.push("--text-source".into());
-        args.push(text_source);
-    }
-    if !engine.is_empty() {
-        args.push("--engine".into());
-        args.push(engine);
-    }
     let argref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let v = run_importer(&argref)?;
     let res: ImportResult =
         serde_json::from_value(v).map_err(|e| ServerFnError::new(format!("parse result: {e}")))?;
     let _ = std::fs::remove_file(&staged);
-    // drop any OCR cache sidecars (<token>.ocr.<engine>.json) left in staging
-    if let Ok(rd) = std::fs::read_dir(staging_dir()) {
+    Ok(res)
+}
+
+// ---- book management (/books): admin + OCR/source jobs ---- #
+
+/// (slug, extension) for a book id, e.g. ("gutenberg-2701", "txt").
+#[cfg(feature = "ssr")]
+fn book_slug_ext(conn: &rusqlite::Connection, book_id: i64) -> Result<(String, String), ServerFnError> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(String, Option<String>)> = conn
+        .query_row("SELECT slug, format FROM books WHERE id = ?1", [book_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let (slug, fmt) = row.ok_or_else(|| ServerFnError::new("book not found"))?;
+    let ext = match fmt.as_deref() {
+        Some("epub") => "epub",
+        Some("pdf") => "pdf",
+        _ => "txt",
+    };
+    Ok((slug, ext.to_string()))
+}
+
+/// All books with the fields the management page edits/shows.
+#[server]
+pub async fn list_books_admin() -> Result<Vec<BookAdmin>, ServerFnError> {
+    let conn = open_conn()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT b.id, b.slug, COALESCE(b.title,''), COALESCE(b.author,''), b.year,
+                    COALESCE(b.format,''), COALESCE(b.source,''), COALESCE(b.text_source,''),
+                    COALESCE(b.n_tokens,0), COALESCE(b.n_types,0), COALESCE(b.ingested_at,''),
+                    (SELECT count(DISTINCT t.word) FROM u.word_tags t JOIN u.tags g ON g.name=t.tag
+                     LEFT JOIN words w ON w.word=t.word
+                     LEFT JOIN book_occurrences bo ON bo.word_id=w.id AND bo.book_id=b.id
+                     WHERE g.interest='interesting'
+                       AND (t.book_slug=b.slug OR (t.book_slug='*' AND bo.word_id IS NOT NULL)))
+             FROM books b ORDER BY b.id",
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(BookAdmin {
+                id: r.get(0)?,
+                slug: r.get(1)?,
+                title: r.get(2)?,
+                author: r.get(3)?,
+                year: r.get(4)?,
+                format: r.get(5)?,
+                source: r.get(6)?,
+                text_source: r.get(7)?,
+                n_tokens: r.get(8)?,
+                n_types: r.get(9)?,
+                ingested_at: r.get(10)?,
+                n_selected: r.get(11)?,
+            })
+        })
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| ServerFnError::new(e.to_string()))?);
+    }
+    Ok(out)
+}
+
+/// Edit a book's display details (not the slug — it keys tags + the stored file).
+#[server]
+pub async fn update_book(book_id: i64, title: String, author: String, year: String) -> Result<(), ServerFnError> {
+    let yr: Option<i64> = year.trim().parse().ok().filter(|y| (1000..=2200).contains(y));
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    conn.execute(
+        "UPDATE books SET title=?1, author=?2, year=?3 WHERE id=?4",
+        rusqlite::params![title.trim(), author.trim(), yr, book_id],
+    )
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(())
+}
+
+/// Delete a book: its rows + stored file + OCR sidecars. Tags (text-keyed in
+/// user.db) are left dormant and resurrect if the book is re-imported.
+#[server]
+pub async fn delete_book(book_id: i64) -> Result<(), ServerFnError> {
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let (slug, ext) = book_slug_ext(&conn, book_id)?;
+    for t in ["book_occurrences", "candidates", "ratings"] {
+        let _ = conn.execute(&format!("DELETE FROM {t} WHERE book_id=?1"), [book_id]);
+    }
+    conn.execute("DELETE FROM books WHERE id=?1", [book_id])
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    // remove the committed file + any <slug>.<ext>.ocr.*.json sidecars
+    let dir = books_dir();
+    let _ = std::fs::remove_file(dir.join(format!("{slug}.{ext}")));
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        let prefix = format!("{slug}.{ext}.ocr.");
         for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with(&token) && name != token {
+            if e.file_name().to_string_lossy().starts_with(&prefix) {
                 let _ = std::fs::remove_file(e.path());
             }
         }
     }
-    Ok(res)
+    Ok(())
 }
 
-/// OCR a sample of a staged PDF's pages and diff against its embedded text layer,
-/// so the user can judge whether to import the embedded text or our re-OCR.
+/// PDF OCR / text-source state for a book (engine cache sizes, page counts).
 #[server]
-pub async fn ocr_compare(token: String, engine: String) -> Result<OcrCompareResult, ServerFnError> {
-    if token.is_empty() || token.contains('/') || token.contains('\\') || token.contains("..") {
-        return Err(ServerFnError::new("invalid upload token"));
-    }
-    let staged = staging_dir().join(&token);
-    if !staged.exists() {
-        return Err(ServerFnError::new("upload expired — please drop the file again"));
-    }
-    let path = staged.to_string_lossy().to_string();
+pub async fn book_ocr_status(book_id: i64) -> Result<OcrStatus, ServerFnError> {
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let (slug, _) = book_slug_ext(&conn, book_id)?;
+    let v = run_importer(&["--ocr-status", &slug])?;
+    serde_json::from_value(v).map_err(|e| ServerFnError::new(format!("parse status: {e}")))
+}
+
+/// Compare a committed PDF's embedded text vs re-OCR on sampled pages (book-keyed cache).
+#[server]
+pub async fn ocr_compare_book(book_id: i64, engine: String) -> Result<OcrCompareResult, ServerFnError> {
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let (slug, ext) = book_slug_ext(&conn, book_id)?;
+    let path = books_dir().join(format!("{slug}.{ext}"));
+    let path = path.to_string_lossy().to_string();
     let mut args: Vec<String> = vec!["--ocr-compare".into(), path];
     if !engine.is_empty() {
         args.push("--engine".into());
         args.push(engine);
     }
     let argref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    // run_importer errors on {ok:false}; surface OCR-missing etc. as the error text.
     let v = run_importer(&argref)?;
     serde_json::from_value(v).map_err(|e| ServerFnError::new(format!("parse compare: {e}")))
+}
+
+/// Delete one engine's OCR cache for a book.
+#[server]
+pub async fn delete_ocr(book_id: i64, engine: String) -> Result<(), ServerFnError> {
+    if !engine.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(ServerFnError::new("bad engine"));
+    }
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let (slug, ext) = book_slug_ext(&conn, book_id)?;
+    let p = books_dir().join(format!("{slug}.{ext}.ocr.{engine}.json"));
+    let _ = std::fs::remove_file(p);
+    Ok(())
+}
+
+/// Start a background OCR job for a book+engine; returns the (deduped) job id.
+#[server]
+pub async fn start_ocr(book_id: i64, engine: String) -> Result<String, ServerFnError> {
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let (slug, _) = book_slug_ext(&conn, book_id)?;
+    let eng = if engine.is_empty() { "auto".to_string() } else { engine };
+    let mut args = vec!["--ocr-book".to_string(), slug];
+    if eng != "auto" {
+        args.push("--engine".into());
+        args.push(eng.clone());
+    }
+    Ok(crate::jobs::start("ocr", book_id, &eng, &format!("OCR ({eng})…"), args))
+}
+
+/// Start a background re-ingest from a chosen text source (embedded | ocr:<engine>).
+#[server]
+pub async fn start_reingest(book_id: i64, source: String) -> Result<String, ServerFnError> {
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let (slug, _) = book_slug_ext(&conn, book_id)?;
+    let args = vec!["--reingest".to_string(), slug, "--text-source".into(), source.clone()];
+    Ok(crate::jobs::start("reingest", book_id, &source, &format!("switching to {source}…"), args))
+}
+
+/// Start a background global usage-chart (trajectory) refresh.
+#[server]
+pub async fn refresh_trajectory() -> Result<String, ServerFnError> {
+    Ok(crate::jobs::start("trajectory", 0, "", "refreshing usage charts…",
+        vec!["--refresh-trajectory".to_string()]))
+}
+
+#[server]
+pub async fn job_status(id: String) -> Result<Option<JobProgress>, ServerFnError> {
+    Ok(crate::jobs::status(&id))
+}
+
+#[server]
+pub async fn cancel_job(id: String) -> Result<(), ServerFnError> {
+    crate::jobs::cancel(&id);
+    Ok(())
 }
 
 /// Re-segment an already-imported book's stored file, for the "view stripping" page.
@@ -1798,6 +2001,7 @@ pub fn App() -> impl IntoView {
                 <Routes fallback=|| "Page not found.".into_view()>
                     <Route path=StaticSegment("") view=HomePage/>
                     <Route path=StaticSegment("tags") view=TagsPage/>
+                    <Route path=StaticSegment("books") view=BooksAdminPage/>
                     <Route path=StaticSegment("import") view=ImportPage/>
                     <Route path=StaticSegment("source") view=BookSourcePage/>
                 </Routes>
@@ -2199,6 +2403,7 @@ fn HomePage() -> impl IntoView {
                 " hide rejected"
             </label>
             <a class="toggle managelink" href="/tags">"manage tags ↗"</a>
+            <a class="toggle managelink" href="/books">"manage books ↗"</a>
         </div>
 
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
@@ -2689,23 +2894,17 @@ fn ImportPage() -> impl IntoView {
     let f_author = RwSignal::new(String::new());
     let f_year = RwSignal::new(String::new());
     let f_slug = RwSignal::new(String::new());
-    let f_source = RwSignal::new(String::from("embedded")); // PDF text source
-    let f_engine = RwSignal::new(String::new());            // OCR engine
-    let compare = RwSignal::new(CompareState::Idle);
     let committing = RwSignal::new(false);
     let commit_err = RwSignal::new(None::<String>);
     let file_input: NodeRef<leptos::html::Input> = NodeRef::new();
 
-    // Seed the editable form (and PDF source/engine) from each fresh inspection.
+    // Seed the editable form from each fresh inspection.
     Effect::new(move |_| {
         if let UploadState::Done(insp) = state.get() {
             f_title.set(insp.title.clone());
             f_author.set(insp.author.clone());
             f_year.set(insp.year.map(|y| y.to_string()).unwrap_or_default());
             f_slug.set(insp.suggested_slug.clone());
-            f_source.set(if insp.needs_ocr { "ocr".into() } else { "embedded".into() });
-            f_engine.set(insp.ocr.as_ref().map(|o| o.default_engine.clone()).unwrap_or_default());
-            compare.set(CompareState::Idle);
         }
     });
 
@@ -2723,19 +2922,8 @@ fn ImportPage() -> impl IntoView {
         }
     };
 
-    let do_compare = move |_| {
-        let UploadState::Done(insp) = state.get() else { return };
-        let token = insp.token.clone();
-        let engine = f_engine.get();
-        compare.set(CompareState::Loading);
-        leptos::task::spawn_local(async move {
-            match ocr_compare(token, engine).await {
-                Ok(c) => compare.set(CompareState::Done(Box::new(c))),
-                Err(e) => compare.set(CompareState::Failed(e.to_string())),
-            }
-        });
-    };
-
+    // Import is always fast (embedded). A scanned PDF imports as a placeholder and
+    // we auto-start a background OCR job, then send the user to the manage page.
     let do_commit = move |_| {
         let UploadState::Done(insp) = state.get() else { return };
         committing.set(true);
@@ -2743,16 +2931,19 @@ fn ImportPage() -> impl IntoView {
         let token = insp.token.clone();
         let orig = insp.orig_filename.clone();
         let (title, author, year, slug) = (f_title.get(), f_author.get(), f_year.get(), f_slug.get());
-        // text_source/engine only matter for PDFs; harmlessly ignored otherwise.
-        let (source, engine) = if insp.pdf.is_some() {
-            (f_source.get(), f_engine.get())
-        } else {
-            (String::new(), String::new())
-        };
+        let needs_ocr = insp.needs_ocr;
+        let engine = insp.ocr.as_ref().map(|o| o.default_engine.clone()).unwrap_or_default();
         let navigate = use_navigate();
         leptos::task::spawn_local(async move {
-            match confirm_import(token, slug, title, author, year, orig, source, engine).await {
-                Ok(res) => navigate(&format!("/?book={}", res.book_id), Default::default()),
+            match confirm_import(token, slug, title, author, year, orig).await {
+                Ok(res) => {
+                    if needs_ocr && !engine.is_empty() {
+                        let _ = start_ocr(res.book_id, engine).await; // fire-and-forget
+                        navigate("/books", Default::default());
+                    } else {
+                        navigate(&format!("/?book={}", res.book_id), Default::default());
+                    }
+                }
                 Err(e) => {
                     commit_err.set(Some(e.to_string()));
                     committing.set(false);
@@ -2796,17 +2987,6 @@ fn ImportPage() -> impl IntoView {
                 let segs = insp.segments.clone();
                 let pdf = insp.pdf.clone();
                 let needs_ocr = insp.needs_ocr;
-                let engines_avail: Vec<String> = insp.ocr.as_ref().map(|o| {
-                    let mut v: Vec<String> = o.engines.iter().filter(|(_, e)| e.available)
-                        .map(|(k, _)| k.clone()).collect();
-                    v.sort();
-                    v
-                }).unwrap_or_default();
-                let engines_missing: Vec<String> = insp.ocr.as_ref().map(|o| {
-                    o.engines.iter().filter(|(_, e)| !e.available)
-                        .map(|(k, e)| format!("{k}: {}", e.detail)).collect()
-                }).unwrap_or_default();
-                let has_engines = !engines_avail.is_empty();
                 view! {
                     {dup_banner}
                     <div class="meta-form">
@@ -2832,37 +3012,11 @@ fn ImportPage() -> impl IntoView {
                             <p class="counts">{stats}</p>
                             {needs_ocr.then(|| view! {
                                 <div class="dup-banner ocr-banner">
-                                    "No embedded text layer — this looks like a scan, so text will come from OCR."
+                                    "No embedded text layer — this looks like a scan. It imports now as a "
+                                    "placeholder and OCR runs automatically in the background; manage it on "
+                                    <A href="/books">"the books page"</A>"."
                                 </div>
                             })}
-                            <div class="ocr-controls">
-                                <span class="picklbl">"text source: "</span>
-                                <label><input type="radio" name="src" disabled=needs_ocr
-                                    prop:checked=move || f_source.get() == "embedded"
-                                    on:change=move |_| f_source.set("embedded".into())/>" embedded"</label>
-                                <label><input type="radio" name="src"
-                                    prop:checked=move || f_source.get() == "ocr"
-                                    on:change=move |_| f_source.set("ocr".into())/>" re-OCR"</label>
-                                {has_engines.then(|| view! {
-                                    <select class="intsel" prop:value=move || f_engine.get()
-                                        on:change=move |e| f_engine.set(event_target_value(&e))>
-                                        {engines_avail.clone().into_iter()
-                                            .map(|n| { let v = n.clone(); view! { <option value=v>{n}</option> } }).collect_view()}
-                                    </select>
-                                    <button type="button" class="chip" on:click=do_compare>
-                                        "Compare OCR (sample)"</button>
-                                })}
-                            </div>
-                            {(!engines_missing.is_empty()).then(|| view! {
-                                <p class="yr-note">{format!("OCR engines not installed — {}", engines_missing.join("; "))}</p>
-                            })}
-                            {move || match compare.get() {
-                                CompareState::Idle => ().into_any(),
-                                CompareState::Loading => view! {
-                                    <p class="loading">"OCR-ing sample pages…"</p> }.into_any(),
-                                CompareState::Failed(e) => view! { <p class="err">{e}</p> }.into_any(),
-                                CompareState::Done(c) => view! { <OcrCompareView cmp=*c/> }.into_any(),
-                            }}
                         }
                     })}
                     <div class="detail-actions">
@@ -2905,6 +3059,254 @@ fn BookSourcePage() -> impl IntoView {
                         {format!("{} · {} · {} tokens", insp.title, insp.format, insp.n_tokens)}
                     </p>
                     <SegmentView segments=insp.segments/>
+                }.into_any(),
+            })}
+        </Suspense>
+    }
+}
+
+// ---- book management page (/books) ---- #
+
+/// Polls a background job (~800 ms) and renders a progress bar + Cancel while it's
+/// live. Clears `job` and fires `on_done` when it finishes. Reused for OCR /
+/// reingest / trajectory jobs.
+#[component]
+fn JobProgressBar(job: RwSignal<Option<String>>, #[prop(optional)] on_done: Option<Callback<()>>) -> impl IntoView {
+    let prog = RwSignal::new(None::<JobProgress>);
+    Effect::new(move |_| {
+        // client-only (effects don't run on SSR); one poller for this bar's lifetime.
+        let h = leptos::prelude::set_interval_with_handle(
+            move || {
+                if let Some(id) = job.get_untracked() {
+                    leptos::task::spawn_local(async move {
+                        if let Ok(p) = job_status(id).await {
+                            let live = matches!(p.as_ref().map(|x| x.status.as_str()),
+                                Some("queued") | Some("running"));
+                            prog.set(p);
+                            if !live {
+                                job.set(None);
+                                if let Some(cb) = on_done {
+                                    cb.run(());
+                                }
+                            }
+                        }
+                    });
+                }
+            },
+            std::time::Duration::from_millis(800),
+        );
+        if let Ok(h) = h {
+            on_cleanup(move || h.clear());
+        }
+    });
+    let cancel = move |_| {
+        if let Some(id) = job.get() {
+            leptos::task::spawn_local(async move { let _ = cancel_job(id).await; });
+        }
+    };
+    view! {
+        {move || prog.get().filter(|p| matches!(p.status.as_str(), "queued" | "running")).map(|p| {
+            let pct = p.percent;
+            view! {
+                <div class="jobbar">
+                    <span class="busy"><span class="spinner"></span>{p.message.clone()}</span>
+                    {(pct >= 0.0).then(|| view! { <progress class="jobprog" max="100" value=pct></progress> })}
+                    <button type="button" class="chip" on:click=cancel>"Cancel"</button>
+                </div>
+            }
+        })}
+    }
+}
+
+/// PDF OCR + text-source controls for one book: per-engine cache state, Run OCR
+/// (background) / Compare / Delete cache, and a source selector that re-ingests.
+#[component]
+fn OcrPanel(book_id: i64) -> impl IntoView {
+    let refresh = RwSignal::new(0u32);
+    let status = Resource::new(move || (book_id, refresh.get()), move |(b, _)| book_ocr_status(b));
+    let job = RwSignal::new(None::<String>);
+    let compare = RwSignal::new(CompareState::Idle);
+    let sel_source = RwSignal::new(String::new());
+
+    // seed the source selector to the book's current source, once.
+    Effect::new(move |_| {
+        if let Some(Ok(s)) = status.get() {
+            if sel_source.get_untracked().is_empty() {
+                sel_source.set(s.text_source.unwrap_or_else(|| "embedded".into()));
+            }
+        }
+    });
+
+    let run_ocr = move |engine: String| {
+        leptos::task::spawn_local(async move {
+            if let Ok(id) = start_ocr(book_id, engine).await {
+                job.set(Some(id));
+            }
+        });
+    };
+    let do_compare = move |engine: String| {
+        compare.set(CompareState::Loading);
+        leptos::task::spawn_local(async move {
+            match ocr_compare_book(book_id, engine).await {
+                Ok(c) => compare.set(CompareState::Done(Box::new(c))),
+                Err(e) => compare.set(CompareState::Failed(e.to_string())),
+            }
+        });
+    };
+    let del_cache = move |engine: String| {
+        leptos::task::spawn_local(async move {
+            let _ = delete_ocr(book_id, engine).await;
+            refresh.update(|n| *n += 1);
+        });
+    };
+    let apply_source = move |_| {
+        let src = sel_source.get();
+        if src.is_empty() {
+            return;
+        }
+        leptos::task::spawn_local(async move {
+            if let Ok(id) = start_reingest(book_id, src).await {
+                job.set(Some(id));
+            }
+        });
+    };
+
+    view! {
+        <div class="ocrpanel">
+            <Suspense fallback=move || view! { <span class="loading">"…"</span> }>
+                {move || status.get().map(|res| match res {
+                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    Ok(s) if !s.is_pdf => ().into_any(),
+                    Ok(s) => {
+                        let cur = s.text_source.clone().unwrap_or_else(|| "embedded".into());
+                        let npages = s.n_pages;
+                        let mut engs: Vec<(String, OcrEngineStatus)> = s.engines.into_iter().collect();
+                        engs.sort_by(|a, b| a.0.cmp(&b.0));
+                        let mut sources = vec!["embedded".to_string()];
+                        for (n, e) in &engs {
+                            if e.complete {
+                                sources.push(format!("ocr:{n}"));
+                            }
+                        }
+                        view! {
+                            <p class="ocr-cur">{format!("current source: {cur} · {npages} pages")}</p>
+                            <ul class="ocr-engs">
+                                {engs.into_iter().map(|(name, e)| {
+                                    if !e.available {
+                                        return view! { <li class="ocr-eng off">{format!("{name}: not installed")}</li> }.into_any();
+                                    }
+                                    let (n1, n2, n3) = (name.clone(), name.clone(), name.clone());
+                                    let cache_lbl = if e.complete { format!("{}/{} ✓", e.cached_pages, npages) }
+                                        else if e.cached_pages > 0 { format!("{}/{} partial", e.cached_pages, npages) }
+                                        else { "not cached".to_string() };
+                                    view! {
+                                        <li class="ocr-eng">
+                                            <span class="eng-name">{name}</span>
+                                            <span class="eng-cache">{cache_lbl}</span>
+                                            <button type="button" class="chip" on:click=move |_| run_ocr(n1.clone())>"Run OCR"</button>
+                                            <button type="button" class="chip" on:click=move |_| do_compare(n2.clone())>"Compare"</button>
+                                            {(e.cached_pages > 0).then(|| view! {
+                                                <button type="button" class="chip" on:click=move |_| del_cache(n3.clone())>"Delete cache"</button>
+                                            })}
+                                        </li>
+                                    }.into_any()
+                                }).collect_view()}
+                            </ul>
+                            <div class="ocr-source">
+                                <span class="picklbl">"use text from: "</span>
+                                <select class="intsel" prop:value=move || sel_source.get()
+                                    on:change=move |e| sel_source.set(event_target_value(&e))>
+                                    {sources.into_iter().map(|s| { let v = s.clone(); view! { <option value=v>{s}</option> } }).collect_view()}
+                                </select>
+                                <button type="button" class="chip" on:click=apply_source>"Apply"</button>
+                            </div>
+                        }.into_any()
+                    }
+                })}
+            </Suspense>
+            <JobProgressBar job=job on_done=Callback::new(move |()| refresh.update(|n| *n += 1))/>
+            {move || match compare.get() {
+                CompareState::Idle => ().into_any(),
+                CompareState::Loading => view! { <p class="loading">"OCR-ing sample pages…"</p> }.into_any(),
+                CompareState::Failed(e) => view! { <p class="err">{e}</p> }.into_any(),
+                CompareState::Done(c) => view! { <OcrCompareView cmp=*c/> }.into_any(),
+            }}
+        </div>
+    }
+}
+
+/// One editable book row on the manage page.
+#[component]
+fn BookCard(b: BookAdmin, edit: ServerAction<UpdateBook>, del: ServerAction<DeleteBook>) -> impl IntoView {
+    let BookAdmin {
+        id, slug, title: t0, author: a0, year: y0, format, source, text_source,
+        n_tokens, n_types, n_selected, ingested_at,
+    } = b;
+    let title = RwSignal::new(t0);
+    let author = RwSignal::new(a0);
+    let year = RwSignal::new(y0.map(|y| y.to_string()).unwrap_or_default());
+    let is_pdf = format == "pdf";
+    let save = move || edit.dispatch(UpdateBook {
+        book_id: id, title: title.get(), author: author.get(), year: year.get(),
+    });
+    let del_slug = slug.clone();
+    let do_delete = move |_| {
+        let msg = format!("Delete '{del_slug}' and its analysis data? (your tags are kept and will return if you re-import.)");
+        if web_sys::window().and_then(|w| w.confirm_with_message(&msg).ok()).unwrap_or(false) {
+            del.dispatch(DeleteBook { book_id: id });
+        }
+    };
+    let src = if text_source.is_empty() { source } else { text_source };
+    view! {
+        <div class="bookcard">
+            <div class="bk-fields">
+                <input class="bk-title" prop:value=move || title.get()
+                    on:input=move |e| title.set(event_target_value(&e)) on:change=move |_| { save(); }/>
+                <input class="bk-author" placeholder="author" prop:value=move || author.get()
+                    on:input=move |e| author.set(event_target_value(&e)) on:change=move |_| { save(); }/>
+                <input class="bk-year" placeholder="year" prop:value=move || year.get()
+                    on:input=move |e| year.set(event_target_value(&e)) on:change=move |_| { save(); }/>
+                <button type="button" class="catx" title="delete book" on:click=do_delete>"✕"</button>
+            </div>
+            <p class="bk-meta">
+                <a class="reltgt" href=format!("/?book={id}")>{slug}</a>
+                {format!(" · {format} · {src} · {n_tokens} tokens · {n_types} types · {n_selected}★ · {ingested_at}")}
+            </p>
+            {is_pdf.then(|| view! { <OcrPanel book_id=id/> })}
+        </div>
+    }
+}
+
+/// The book management page: edit details, delete, and (for PDFs) manage OCR +
+/// switch text source — all heavy work runs as background jobs.
+#[component]
+fn BooksAdminPage() -> impl IntoView {
+    let edit = ServerAction::<UpdateBook>::new();
+    let del = ServerAction::<DeleteBook>::new();
+    let books = Resource::new(move || del.version().get(), |_| list_books_admin());
+    let traj_job = RwSignal::new(None::<String>);
+    let do_traj = move |_| {
+        leptos::task::spawn_local(async move {
+            if let Ok(id) = refresh_trajectory().await {
+                traj_job.set(Some(id));
+            }
+        });
+    };
+    view! {
+        <h1>"books"</h1>
+        <p class="sub"><A href="/">"← back to words"</A>" · "<A href="/import">"+ import a book"</A>
+            " · edit details, manage PDF OCR, switch text source."</p>
+        <div class="bar">
+            <button type="button" class="chip" on:click=do_traj>"refresh usage charts (all books)"</button>
+            <JobProgressBar job=traj_job/>
+        </div>
+        <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
+            {move || books.get().map(|res| match res {
+                Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                Ok(list) => view! {
+                    <div class="booklist">
+                        {list.into_iter().map(|b| view! { <BookCard b=b edit=edit del=del/> }).collect_view()}
+                    </div>
                 }.into_any(),
             })}
         </Suspense>

@@ -326,3 +326,29 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
 .d-gap { color: #bbb; font-style: italic; }
 .d-del { color: #c0392b; text-decoration: line-through; }
 .d-ins { color: #1e8449; background: #2ecc7118; }
+
+/* ---- book management page (/books) ---- */
+.booklist { display: flex; flex-direction: column; gap: 0.8rem; margin-top: 0.8rem; }
+.bookcard { border: 1px solid #8884; border-radius: 10px; padding: 0.7rem 0.9rem; }
+.bk-fields { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.bk-fields input {
+  font-size: 0.92rem; padding: 0.25rem 0.5rem; border: 1px solid #8884;
+  border-radius: 6px; background: Canvas; color: inherit;
+}
+.bk-title { flex: 1; min-width: 14rem; font-weight: 600; }
+.bk-author { width: 12rem; }
+.bk-year { width: 5rem; }
+.bk-meta { color: #888; font-size: 0.82rem; margin: 0.35rem 0 0; }
+.bk-meta a.reltgt { color: #2980b9; }
+
+.ocrpanel { margin-top: 0.6rem; border-top: 1px dashed #8883; padding-top: 0.5rem; }
+.ocr-cur { font-size: 0.85rem; color: #777; margin: 0 0 0.3rem; }
+.ocr-engs { list-style: none; padding: 0; margin: 0 0 0.4rem; display: flex; flex-direction: column; gap: 0.3rem; }
+.ocr-eng { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; font-size: 0.85rem; }
+.ocr-eng.off { color: #aaa; font-style: italic; }
+.eng-name { font-weight: 600; min-width: 5rem; }
+.eng-cache { color: #888; min-width: 6rem; }
+.ocr-source { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin: 0.2rem 0; }
+
+.jobbar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 0.4rem 0; }
+.jobprog { width: 12rem; height: 0.7rem; }
