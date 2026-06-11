@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, MetaTags, Stylesheet, Title};
 use leptos_router::components::{Route, Router, Routes, A};
-use leptos_router::hooks::{query_signal, query_signal_with_options, use_navigate};
+use leptos_router::hooks::{query_signal, query_signal_with_options, use_location, use_navigate};
 use leptos_router::{NavigateOptions, StaticSegment};
 use serde::{Deserialize, Serialize};
 
@@ -1990,14 +1990,68 @@ fn toggle_tag(t: Tagger, book_id: i64, word_id: i64, tag: &str) {
     t.action.dispatch(SetTag { book_id, word_id, tag: tag.to_string(), on: next });
 }
 
+/// The book the user last looked at, shared across pages so the nav "words" link
+/// (and a bare `/`) returns you where you were rather than to the first book.
+/// Backed by localStorage so it survives reloads; updated by the home page.
+#[derive(Clone, Copy)]
+struct CurrentBook(RwSignal<Option<i64>>);
+
+/// Recall / remember the last-viewed book id (client-only; no-ops on the server,
+/// where there's no `window`).
+fn stored_book() -> Option<i64> {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item("coolwords.book").ok().flatten())
+        .and_then(|v| v.parse::<i64>().ok())
+}
+fn remember_book(id: i64) {
+    if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = s.set_item("coolwords.book", &id.to_string());
+    }
+}
+
+/// Persistent top menu shown on every page: brand + the three sections + a single
+/// consistent "import" action. The active page is highlighted, and "words" carries
+/// the current book so you land back where you left off.
+#[component]
+fn NavBar() -> impl IntoView {
+    let current = expect_context::<CurrentBook>();
+    let path = use_location().pathname;
+    let words_href = move || match current.0.get() {
+        Some(id) => format!("/?book={id}"),
+        None => "/".to_string(),
+    };
+    let cls = move |p: &'static str, base: &'static str| {
+        move || if path.get() == p { format!("{base} active") } else { base.to_string() }
+    };
+    view! {
+        <nav class="navbar">
+            <span class="brand">"coolwords"</span>
+            <A href=words_href attr:class=cls("/", "navlink")>"words"</A>
+            <A href="/books" attr:class=cls("/books", "navlink")>"books"</A>
+            <A href="/tags" attr:class=cls("/tags", "navlink")>"tags"</A>
+            <A href="/import" attr:class=cls("/import", "navimport")>"+ import book"</A>
+        </nav>
+    }
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
+    let current = CurrentBook(RwSignal::new(None));
+    provide_context(current);
+    // Seed the shared "current book" from localStorage on first load (client-only).
+    Effect::new(move |_| {
+        if let Some(id) = stored_book() {
+            current.0.set(Some(id));
+        }
+    });
     view! {
         <Stylesheet id="leptos" href="/pkg/coolwords_ui.css"/>
         <Title text="coolwords — interesting words"/>
         <Router>
             <main>
+                <NavBar/>
                 <Routes fallback=|| "Page not found.".into_view()>
                     <Route path=StaticSegment("") view=HomePage/>
                     <Route path=StaticSegment("tags") view=TagsPage/>
@@ -2256,7 +2310,8 @@ fn HomePage() -> impl IntoView {
         query_signal_with_options::<i64>("word", NavigateOptions { scroll: false, ..Default::default() });
     // stemming aggressiveness: 0 none / 1 inflectional / 2 derivational / 3 aggressive
     let (lvl_q, set_lvl) = query_signal::<i64>("lvl");
-    let book = Memo::new(move |_| book_q.get().unwrap_or(1));
+    // No explicit ?book → resume the last-viewed book (localStorage), else the first.
+    let book = Memo::new(move |_| book_q.get().or_else(stored_book).unwrap_or(1));
     let level = Memo::new(move |_| lvl_q.get().unwrap_or(0));
     let only_top = RwSignal::new(false);
     let hide_rejected = RwSignal::new(false);
@@ -2275,6 +2330,15 @@ fn HomePage() -> impl IntoView {
         just_global: RwSignal::new(HashSet::new()),
     };
     provide_context(tagger);
+
+    // Keep the shared "current book" + its localStorage copy in sync, so the nav
+    // "words" link and a bare `/` resume this book.
+    let current = expect_context::<CurrentBook>();
+    Effect::new(move |_| {
+        let b = book.get();
+        remember_book(b);
+        current.0.set(Some(b));
+    });
 
     // The tag collection (builtin + custom), refetched after any tag-collection edit.
     let tag_defs = Resource::new(move || tagger_rev(tagger), |_| list_tags());
@@ -2341,7 +2405,6 @@ fn HomePage() -> impl IntoView {
                     }.into_any(),
                 })}
             </Suspense>
-            <A href="/import" attr:class="importlink">"+ import book"</A>
             <a class="srclink" href=move || format!("/source?book={}", book.get())
                 title="see which parts of this book were kept vs stripped">"view stripping"</a>
             <select class="lvlsel" title="merge related word forms: none keeps every form separate; higher levels group inflections, then derivations, then aggressively (untrembling→tremble) — frequency is combined across the family"
@@ -2402,8 +2465,6 @@ fn HomePage() -> impl IntoView {
                     on:change=move |_| hide_rejected.update(|v| *v = !*v)/>
                 " hide rejected"
             </label>
-            <a class="toggle managelink" href="/tags">"manage tags ↗"</a>
-            <a class="toggle managelink" href="/books">"manage books ↗"</a>
         </div>
 
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
@@ -2742,8 +2803,7 @@ fn TagsPage() -> impl IntoView {
     };
     view! {
         <h1>"tags"</h1>
-        <p class="sub"><a href="/">"← back to words"</a>
-            " · interesting tags favourite a word; uninteresting tags mark it as junk (hideable)."</p>
+        <p class="sub">"interesting tags favourite a word; uninteresting tags mark it as junk (hideable)."</p>
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
             {move || tags.get().map(|res| match res {
                 Err(e) => view! { <p class="err">{format!("{e}")}</p> }.into_any(),
@@ -2954,8 +3014,7 @@ fn ImportPage() -> impl IntoView {
 
     view! {
         <h1>"Import a book"</h1>
-        <p class="sub"><A href="/">"← back to words"</A>
-            " · drop a .txt, .epub or .pdf; we detect title/author and show what gets stripped. "
+        <p class="sub">"Drop a .txt, .epub or .pdf; we detect title/author and show what gets stripped. "
             "PDFs can be re-OCR'd and compared to the embedded text."</p>
 
         <div class="dropzone" on:drop=on_drop on:dragover=on_dragover>
@@ -3050,7 +3109,7 @@ fn BookSourcePage() -> impl IntoView {
     let src = Resource::new(move || book.get(), view_source);
     view! {
         <h1>"Book source — kept vs stripped"</h1>
-        <p class="sub"><A href="/">"← back to words"</A></p>
+        <p class="sub">"Kept regions are analysed; stripped boilerplate (license, TOC, front-matter) is ignored."</p>
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
             {move || src.get().map(|res| match res {
                 Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
@@ -3294,8 +3353,7 @@ fn BooksAdminPage() -> impl IntoView {
     };
     view! {
         <h1>"books"</h1>
-        <p class="sub"><A href="/">"← back to words"</A>" · "<A href="/import">"+ import a book"</A>
-            " · edit details, manage PDF OCR, switch text source."</p>
+        <p class="sub">"Edit details, manage PDF OCR, switch text source."</p>
         <div class="bar">
             <button type="button" class="chip" on:click=do_traj>"refresh usage charts (all books)"</button>
             <JobProgressBar job=traj_job/>

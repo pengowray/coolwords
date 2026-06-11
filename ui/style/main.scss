@@ -28,6 +28,26 @@ h1 { margin-bottom: 0; }
   .spinner, .loading::before { animation-duration: 2.4s; }
 }
 
+/* ---- persistent top navigation menu ---- */
+.navbar {
+  display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap;
+  margin: 0 0 1.3rem; padding-bottom: 0.6rem; border-bottom: 1px solid #8883;
+}
+.navbar .brand { font-weight: 700; font-size: 1.05rem; color: #16a085; margin-right: 0.5rem; }
+.navbar .navlink {
+  color: inherit; text-decoration: none; border-radius: 6px; line-height: 1;
+  padding: 0.45rem 0.8rem; font-size: 0.95rem;
+}
+.navbar .navlink:hover { background: #8881; }
+.navbar .navlink.active { background: #3498db; color: #fff; }
+.navbar .navimport {
+  margin-left: auto; text-decoration: none; font-weight: 600; line-height: 1;
+  border: 1px solid #16a085; color: #16a085; border-radius: 6px;
+  padding: 0.45rem 0.85rem; font-size: 0.95rem;
+}
+.navbar .navimport:hover { background: #16a08518; }
+.navbar .navimport.active { background: #16a085; color: #fff; border-color: #16a085; }
+
 .bar { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; margin: 0.8rem 0; }
 .bar .label { color: #888; }
 .bar > button {
@@ -178,7 +198,7 @@ th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color
   padding: 0.25rem 0.7rem; text-decoration: none; font-weight: 600;
 }
 .importlink:hover { background: #16a08518; }
-.srclink { color: #888; font-size: 0.85rem; text-decoration: none; }
+.srclink { color: #2980b9; font-size: 0.9rem; text-decoration: none; }
 .srclink:hover { text-decoration: underline; }
 
 .dropzone {
@@ -253,7 +273,7 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
 .scopegrp.global { border-color: #16a08555; background: #16a0850a; }
 .draghint { color: #aaa; font-size: 0.68rem; }
 .chip[draggable="true"] { cursor: grab; }
-.managelink { color: #2980b9; font-size: 0.72rem; text-decoration: none; margin-left: auto; white-space: nowrap; }
+.managelink { color: #2980b9; font-size: 0.85rem; text-decoration: none; margin-left: auto; white-space: nowrap; }
 .managelink:hover { text-decoration: underline; }
 
 /* row states driven by a word's effective interest */

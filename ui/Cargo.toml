@@ -23,7 +23,7 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 # web-sys features used by the import drop-zone + tag drag/confirm (client side).
 web-sys = { version = "0.3", features = [
     "DragEvent", "DataTransfer", "File", "FileList", "FormData", "Blob",
-    "HtmlInputElement", "Window",
+    "HtmlInputElement", "Window", "Storage",
 ] }
 
 [features]
