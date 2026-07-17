@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1
-# Built by CI (.github/workflows/build.yml) with the REPO ROOT as context, so the
-# COPY paths below reach ui/ ingest/ schema/. Not built on the HAOS box.
+# ONE Dockerfile, two callers, both with the REPO ROOT as build context:
+#   - Home Assistant local add-on build  (context = /addons/coolwords, i.e. this repo
+#     copied onto the HAOS box; see config.yaml + LOCAL.md)
+#   - GitHub Actions -> GHCR             (.github/workflows/build.yml, file: Dockerfile)
+# The COPY paths below (ui/ schema/ ingest/ coolwords/run.sh) resolve from the root.
 
 # ---- stage 1: compile the Leptos SSR server + hydrate wasm + site assets ----
 FROM rust:1-bookworm AS build

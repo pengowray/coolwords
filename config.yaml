@@ -1,0 +1,30 @@
+# Home Assistant LOCAL add-on manifest (root of the repo). Because there is NO `image:`
+# key here, the Supervisor BUILDS this add-on on the HAOS box from ./Dockerfile, with
+# this whole folder as the build context — no GHCR, no GitHub. Deploy by copying the
+# repo to /addons/coolwords/ on the box (see LOCAL.md).
+#
+# (coolwords/config.yaml is the OTHER, GHCR-pull variant; ignore it for local builds.)
+name: Coolwords (local build)
+version: "0.1.0"
+slug: coolwords
+description: Find rare and interesting words in public-domain books (Leptos/axum + Python OCR).
+url: https://github.com/pengowray/coolwords
+# HAOS here is x86/64. Add aarch64 here only if you also build for it.
+arch:
+  - amd64
+# Single process (the server); we provide our own CMD, no s6 init needed.
+init: false
+host_network: false
+ports:
+  7575/tcp: 7575
+ports_description:
+  7575/tcp: Web UI (put a Cloudflare tunnel + Access in front for words.ffff.network)
+# The databases, embeddings, and imported books live in /share (persist across
+# updates/rebuilds); see LOCAL.md for seeding them.
+map:
+  - share:rw
+options:
+  bind: 0.0.0.0:7575
+schema:
+  bind: str
+webui: http://[HOST]:[PORT:7575]
