@@ -54,6 +54,13 @@ bin-default-features = false
 lib-features = ["hydrate"]
 lib-default-features = false
 
+# Local dev builds (cargo leptos watch, i.e. run.bat) default to debug=true, which on
+# Windows/MSVC emits .pdb symbol files next to the binaries. We don't debug through
+# them, so turn debuginfo off — no more .pdb clutter. (Release/container build already
+# has debug=false; this doesn't affect it.)
+[profile.dev]
+debug = false
+
 [profile.wasm-release]
 inherits = "release"
 opt-level = 'z'
