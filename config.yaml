@@ -2,8 +2,6 @@
 # key here, the Supervisor BUILDS this add-on on the HAOS box from ./Dockerfile, with
 # this whole folder as the build context — no GHCR, no GitHub. Deploy by copying the
 # repo to /addons/coolwords/ on the box (see LOCAL.md).
-#
-# (coolwords/config.yaml is the OTHER, GHCR-pull variant; ignore it for local builds.)
 name: Coolwords (local build)
 version: "0.1.0"
 slug: coolwords

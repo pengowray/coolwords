@@ -4,7 +4,7 @@ This runs the add-on **without GHCR or GitHub**: you copy the repo onto the HAOS
 and the Supervisor compiles the image locally from [`Dockerfile`](Dockerfile). The
 manifest that makes this a *local build* is [`config.yaml`](config.yaml) at the repo
 root — it has **no `image:` key**, which is what tells the Supervisor to build instead
-of pull. (`coolwords/config.yaml` is the separate GHCR-pull variant; ignore it here.)
+of pull.
 
 Data (`coolwords.db`, `coolwords_emb.npy`, `user.db`, `books/`) lives in
 `/share/coolwords/`, not in the image, so it survives every rebuild.
@@ -73,6 +73,20 @@ A healthy start logs:
 ```
 Open the **Web UI** link on the add-on page to confirm it loads on the LAN.
 
+### Already installed the old GHCR (image-based) version?
+If the Supervisor is failing with `ghcr.io/...: [401] unauthorized`, an image-based
+install is still registered and editing files won't switch it to local-build. Reset it:
+
+1. **Uninstall** the Coolwords add-on in HA (removes the image-based registration; your
+   `/share` data is untouched).
+2. On the box, make sure `/addons/coolwords/` holds the **repo root** — i.e.
+   `/addons/coolwords/config.yaml` is the one with **no `image:` line** (`grep -i image
+   /addons/coolwords/config.yaml` should print nothing). If you copied only the inner
+   folder, delete `/addons/coolwords/` and re-copy the whole repo.
+3. Reload: Add-on Store → ⋮ → **Check for updates** (or restart the Supervisor:
+   `ha supervisor reload`, or Settings → System → ⋮ → *Restart Supervisor*).
+4. Open **Coolwords (local build)** under **Local add-ons** → **Install** (this builds).
+
 ---
 
 ## Updating (code changes, still no GitHub)
@@ -86,9 +100,9 @@ you do bump it HA will surface a normal **Update** button too.
 ---
 
 ## Exposing it (optional)
-The Cloudflare tunnel + Access (Google login) at `words.ffff.network` is identical to
-the GHCR flow — see the "Expose it" section in [`coolwords/DOCS.md`](coolwords/DOCS.md).
-Point the tunnel's public hostname at `http://<ha-ip>:7575`.
+To put the Cloudflare tunnel + Access (Google login) at `words.ffff.network` in front,
+see [`coolwords/DOCS.md`](coolwords/DOCS.md). Point the tunnel's public hostname at
+`http://<ha-ip>:7575`.
 
 ---
 
