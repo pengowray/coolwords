@@ -23,7 +23,7 @@ FROM debian:bookworm-slim
 # keep the image small — tesseract is the default engine (add it later if wanted).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      python3 python3-numpy python3-pip tesseract-ocr ca-certificates jq bash \
+      python3 python3-numpy python3-pip tesseract-ocr tesseract-ocr-eng ca-certificates jq bash \
  && pip3 install --no-cache-dir --break-system-packages pymupdf \
  && apt-get purge -y python3-pip \
  && apt-get autoremove -y \
