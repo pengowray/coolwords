@@ -4,6 +4,9 @@
 set -euo pipefail
 
 OPTS=/data/options.json
+# Must stay 0.0.0.0 so Home Assistant ingress (the sidebar panel) can reach the
+# server over the container network; 127.0.0.1 would break ingress. Publishing the
+# port to the LAN is controlled separately by `ports:` in config.yaml, not by this.
 BIND="0.0.0.0:7575"
 if [ -f "$OPTS" ]; then
   BIND="$(jq -r '.bind // "0.0.0.0:7575"' "$OPTS")"

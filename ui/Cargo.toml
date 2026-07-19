@@ -24,6 +24,8 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 web-sys = { version = "0.3", features = [
     "DragEvent", "DataTransfer", "File", "FileList", "FormData", "Blob",
     "HtmlInputElement", "Window", "Storage",
+    # Ingress base recovery on the client: read <html data-base> and the page origin.
+    "Document", "Element", "Location",
 ] }
 
 [features]

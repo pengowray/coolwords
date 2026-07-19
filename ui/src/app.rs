@@ -9,6 +9,49 @@ use leptos_router::hooks::{query_signal, query_signal_with_options, use_location
 use leptos_router::{NavigateOptions, StaticSegment};
 use serde::{Deserialize, Serialize};
 
+/// Home Assistant ingress serves the whole app under a per-session path prefix
+/// (e.g. `/api/hassio_ingress/<token>`). HA strips that prefix before forwarding the
+/// request to us and passes it back in the `X-Ingress-Path` header. To make asset
+/// URLs, router links, and server-function calls resolve against that prefix instead
+/// of the HA root, we thread it through the app as a "base". It is the empty string
+/// for normal (non-ingress) access, so every `format!("{base}/…")` below reduces to
+/// the original absolute path and behaviour is unchanged off ingress.
+#[derive(Clone)]
+pub struct BasePath(pub String);
+
+/// Resolve the ingress base (no trailing slash), or "" when not behind ingress.
+/// On the server we read the `X-Ingress-Path` request header; in the browser we read
+/// the `data-base` attribute the server stamped onto `<html>` in [`shell`].
+pub fn ingress_base() -> String {
+    #[cfg(feature = "ssr")]
+    {
+        use_context::<axum::http::request::Parts>()
+            .and_then(|p| {
+                p.headers
+                    .get("x-ingress-path")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.trim_end_matches('/').to_string())
+            })
+            .unwrap_or_default()
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.document_element())
+            .and_then(|e| e.get_attribute("data-base"))
+            .map(|s| s.trim_end_matches('/').to_string())
+            .unwrap_or_default()
+    }
+}
+
+/// The ingress base provided by [`App`] via context ("" when not behind ingress).
+/// Prefix internal paths with this before use: leptos_router leaves absolute hrefs
+/// (`/books`) untouched, so the base must be applied by hand.
+fn base_path() -> String {
+    use_context::<BasePath>().map(|b| b.0).unwrap_or_default()
+}
+
 /// A tag definition in the user's collection (builtin defaults + custom tags).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TagDef {
@@ -161,14 +204,18 @@ fn group_interest(t: Tagger, book_id: i64, members: &[i64]) -> Option<Interest> 
 }
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
+    // Behind ingress this is the path prefix; "" otherwise. Stamped onto <html> so the
+    // hydrating wasm can recover it (no request headers on the client), and passed to
+    // HydrationScripts as `root` so the /pkg JS+WASM load from under the prefix.
+    let base = ingress_base();
     view! {
         <!DOCTYPE html>
-        <html lang="en">
+        <html lang="en" attr:data-base=base.clone()>
             <head>
                 <meta charset="utf-8"/>
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
                 <AutoReload options=options.clone() />
-                <HydrationScripts options/>
+                <HydrationScripts options root=base.clone()/>
                 <MetaTags/>
             </head>
             <body>
@@ -2027,20 +2074,33 @@ fn remember_book(_id: i64) {}
 fn NavBar() -> impl IntoView {
     let current = expect_context::<CurrentBook>();
     let path = use_location().pathname;
-    let words_href = move || match current.0.get() {
-        Some(id) => format!("/?book={id}"),
-        None => "/".to_string(),
+    let ibase = base_path();
+    let words_href = {
+        let b = ibase.clone();
+        move || match current.0.get() {
+            Some(id) => format!("{b}/?book={id}"),
+            None => format!("{b}/"),
+        }
     };
-    let cls = move |p: &'static str, base: &'static str| {
-        move || if path.get() == p { format!("{base} active") } else { base.to_string() }
+    // `path` is the raw browser pathname (includes the ingress prefix), so strip the
+    // base before comparing against the app-relative route to set the active class.
+    let cls = move |p: &'static str, klass: &'static str| {
+        let b = ibase.clone();
+        move || {
+            let full = path.get();
+            let rel = full.strip_prefix(b.as_str()).unwrap_or(&full);
+            let rel = if rel.is_empty() { "/" } else { rel };
+            if rel == p { format!("{klass} active") } else { klass.to_string() }
+        }
     };
+    let base = base_path();
     view! {
         <nav class="navbar">
             <span class="brand">"coolwords"</span>
             <A href=words_href attr:class=cls("/", "navlink")>"words"</A>
-            <A href="/books" attr:class=cls("/books", "navlink")>"books"</A>
-            <A href="/tags" attr:class=cls("/tags", "navlink")>"tags"</A>
-            <A href="/import" attr:class=cls("/import", "navimport")>"+ import book"</A>
+            <A href=format!("{base}/books") attr:class=cls("/books", "navlink")>"books"</A>
+            <A href=format!("{base}/tags") attr:class=cls("/tags", "navlink")>"tags"</A>
+            <A href=format!("{base}/import") attr:class=cls("/import", "navimport")>"+ import book"</A>
         </nav>
     }
 }
@@ -2048,6 +2108,10 @@ fn NavBar() -> impl IntoView {
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
+    // Same value on the server (from the header) and the client (from <html data-base>),
+    // so hydration matches. Shared with the rest of the tree via context.
+    let base = ingress_base();
+    provide_context(BasePath(base.clone()));
     let current = CurrentBook(RwSignal::new(None));
     provide_context(current);
     // Seed the shared "current book" from localStorage on first load (client-only).
@@ -2057,9 +2121,9 @@ pub fn App() -> impl IntoView {
         }
     });
     view! {
-        <Stylesheet id="leptos" href="/pkg/coolwords_ui.css"/>
+        <Stylesheet id="leptos" href=format!("{base}/pkg/coolwords_ui.css")/>
         <Title text="coolwords — interesting words"/>
-        <Router>
+        <Router base=base>
             <main>
                 <NavBar/>
                 <Routes fallback=|| "Page not found.".into_view()>
@@ -2262,7 +2326,7 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                     on:input=move |ev| new_comment.set(event_target_value(&ev))
                     on:keydown=move |ev| if ev.key() == "Enter" { add_new(); }/>
                 <button type="button" class="chip add" on:click=move |_| add_new()>"add"</button>
-                <a class="managelink" href="/tags">"manage ↗"</a>
+                <a class="managelink" href=format!("{}/tags", base_path())>"manage ↗"</a>
             </div>
         </div>
     }
@@ -2415,7 +2479,7 @@ fn HomePage() -> impl IntoView {
                     }.into_any(),
                 })}
             </Suspense>
-            <a class="srclink" href=move || format!("/source?book={}", book.get())
+            <a class="srclink" href={let b = base_path(); move || format!("{b}/source?book={}", book.get())}
                 title="see which parts of this book were kept vs stripped">"view stripping"</a>
             <select class="lvlsel" title="merge related word forms: none keeps every form separate; higher levels group inflections, then derivations, then aggressively (untrembling→tremble) — frequency is combined across the family"
                 prop:value=move || level.get().to_string()
@@ -3004,14 +3068,15 @@ fn ImportPage() -> impl IntoView {
         let needs_ocr = insp.needs_ocr;
         let engine = insp.ocr.as_ref().map(|o| o.default_engine.clone()).unwrap_or_default();
         let navigate = use_navigate();
+        let base = base_path();
         leptos::task::spawn_local(async move {
             match confirm_import(token, slug, title, author, year, orig).await {
                 Ok(res) => {
                     if needs_ocr && !engine.is_empty() {
                         let _ = start_ocr(res.book_id, engine).await; // fire-and-forget
-                        navigate("/books", Default::default());
+                        navigate(&format!("{base}/books"), Default::default());
                     } else {
-                        navigate(&format!("/?book={}", res.book_id), Default::default());
+                        navigate(&format!("{base}/?book={}", res.book_id), Default::default());
                     }
                 }
                 Err(e) => {
@@ -3083,7 +3148,7 @@ fn ImportPage() -> impl IntoView {
                                 <div class="dup-banner ocr-banner">
                                     "No embedded text layer — this looks like a scan. It imports now as a "
                                     "placeholder and OCR runs automatically in the background; manage it on "
-                                    <A href="/books">"the books page"</A>"."
+                                    <A href=format!("{}/books", base_path())>"the books page"</A>"."
                                 </div>
                             })}
                         }
@@ -3338,7 +3403,7 @@ fn BookCard(b: BookAdmin, edit: ServerAction<UpdateBook>, del: ServerAction<Dele
                 <button type="button" class="catx" title="delete book" on:click=do_delete>"✕"</button>
             </div>
             <p class="bk-meta">
-                <a class="reltgt" href=format!("/?book={id}")>{slug}</a>
+                <a class="reltgt" href=format!("{}/?book={id}", base_path())>{slug}</a>
                 {format!(" · {format} · {src} · {n_tokens} tokens · {n_types} types · {n_selected}★ · {ingested_at}")}
             </p>
             {is_pdf.then(|| view! { <OcrPanel book_id=id/> })}

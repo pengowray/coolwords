@@ -13,16 +13,30 @@ arch:
 # Single process (the server); we provide our own CMD, no s6 init needed.
 init: false
 host_network: false
+# Sidebar / authenticated access through Home Assistant. Ingress reaches the
+# add-on over the internal container network (from 172.30.32.2), so the server
+# MUST listen on 0.0.0.0 inside the container for this to work — see `bind` below.
+ingress: true
+ingress_port: 7575
+panel_icon: mdi:book-alphabet
+panel_title: Coolwords
+# Direct LAN port. Default `null` = NOT published, so out of the box the ONLY way
+# in is the authenticated HA sidebar (private by default). To also expose it on the
+# LAN (e.g. to put a Cloudflare tunnel + Access in front for words.ffff.network),
+# assign a host port here or in the add-on's Network panel.
 ports:
-  7575/tcp: 7575
+  7575/tcp: null
 ports_description:
-  7575/tcp: Web UI (put a Cloudflare tunnel + Access in front for words.ffff.network)
+  7575/tcp: Optional direct LAN access — ingress/sidebar works without publishing this
 # The databases, embeddings, and imported books live in /share (persist across
 # updates/rebuilds); see LOCAL.md for seeding them.
 map:
   - share:rw
+# `bind` is the address the server listens on INSIDE the container. Keep 0.0.0.0 so
+# ingress (the sidebar) can reach it; that does NOT expose it on the LAN unless you
+# also publish the port above. 127.0.0.1 would only be reachable from inside the
+# container itself — it breaks ingress — so don't use it here.
 options:
   bind: 0.0.0.0:7575
 schema:
   bind: str
-webui: http://[HOST]:[PORT:7575]
