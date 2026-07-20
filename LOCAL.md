@@ -99,10 +99,11 @@ you do bump it HA will surface a normal **Update** button too.
 
 ---
 
-## Exposing it (optional)
-To put the Cloudflare tunnel + Access (Google login) at `words.ffff.network` in front,
-see [`coolwords/DOCS.md`](coolwords/DOCS.md). Point the tunnel's public hostname at
-`http://<ha-ip>:7575`.
+## Access (private by default) + exposing it
+Once started, the add-on is reachable **privately through the HA sidebar** (ingress) —
+no ports exposed. To also put it behind a Cloudflare tunnel + Access (Google login) at
+`words.ffff.network`, and for how the sidebar / ports / public toggle fit together, see
+[`coolwords/DOCS.md`](coolwords/DOCS.md).
 
 ---
 
