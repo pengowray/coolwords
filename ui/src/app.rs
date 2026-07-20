@@ -305,6 +305,9 @@ pub struct CollectionEntry {
     pub tags: Vec<(String, String)>,
     /// Books this word (with these tags) reaches: (book_id, title).
     pub books: Vec<(i64, String)>,
+    /// Ranking number for a "smart" collection (e.g. net favourite − negative
+    /// all-books tags), shown as a badge. `None` for an ordinary tag/all view.
+    pub metric: Option<i64>,
 }
 
 /// One entry in the filter dropdown. `value` is what goes in the `cat` query
@@ -1575,13 +1578,19 @@ pub async fn book_tags(book_id: i64) -> Result<Vec<(i64, Vec<String>)>, ServerFn
 }
 
 /// Words carrying the user's collection tags, across every book — the data for the
-/// Collection page. Optionally narrowed to a single `tag`. Book-scoped applications
-/// resolve to their one book; word-scoped ('*') applications resolve to every book
-/// whose text actually contains the word. Aggregated one row per word.
+/// Collection page. `filter` is None (all), a tag name (that tag only), or the
+/// special key `"special:top-global"` (words with a positive net of favourite −
+/// negative all-books tags, ranked by that net). Book-scoped applications resolve
+/// to their one book; word-scoped ('*') applications resolve to every book whose
+/// text actually contains the word. Aggregated one row per word.
 #[server]
-pub async fn collection_words(tag: Option<String>) -> Result<Vec<CollectionEntry>, ServerFnError> {
+pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEntry>, ServerFnError> {
     use rusqlite::OptionalExtension;
     let conn = open_conn()?;
+    // The special "top all-books favourites" view ignores any tag filter and needs
+    // every application to compute each word's net; a real tag name narrows the rows.
+    let special = filter.as_deref() == Some("special:top-global");
+    let tag = if special { None } else { filter };
     // slug -> (id, title) for every book, to resolve book-scoped applications.
     let mut books_by_slug: HashMap<String, (i64, String)> = HashMap::new();
     {
@@ -1601,8 +1610,9 @@ pub async fn collection_words(tag: Option<String>) -> Result<Vec<CollectionEntry
     struct Acc {
         word_id: i64,
         gloss: Option<String>,
-        tags: Vec<(String, String)>, // (name, interest), deduped
-        books: Vec<(i64, String)>,   // deduped by id
+        tags: Vec<(String, String)>,        // (name, interest), deduped
+        books: Vec<(i64, String)>,          // deduped by id
+        global_tags: Vec<(String, String)>, // word-scoped ('*') tags only, deduped — drives the net metric
     }
     let mut by_word: HashMap<String, Acc> = HashMap::new();
     // Cache the book list for each word-scoped word (avoids repeat queries).
@@ -1666,9 +1676,14 @@ pub async fn collection_words(tag: Option<String>) -> Result<Vec<CollectionEntry
                 .optional()
                 .map_err(|e| ServerFnError::new(e.to_string()))?
                 .unwrap_or((0, None));
-            by_word.insert(word.clone(), Acc { word_id: wid, gloss, tags: Vec::new(), books: Vec::new() });
+            by_word.insert(word.clone(), Acc {
+                word_id: wid, gloss, tags: Vec::new(), books: Vec::new(), global_tags: Vec::new(),
+            });
         }
         let acc = by_word.get_mut(&word).unwrap();
+        if book_slug == "*" && !acc.global_tags.iter().any(|(n, _)| n == &tagname) {
+            acc.global_tags.push((tagname.clone(), interest.clone()));
+        }
         if !acc.tags.iter().any(|(n, _)| n == &tagname) {
             acc.tags.push((tagname, interest));
         }
@@ -1690,15 +1705,47 @@ pub async fn collection_words(tag: Option<String>) -> Result<Vec<CollectionEntry
         }
     };
     let int_rank = |i: &str| match i { "interesting" => 0, "neutral" => 1, _ => 2 };
+    let net = |gt: &[(String, String)]| -> i64 {
+        gt.iter().filter(|(_, i)| i == "interesting").count() as i64
+            - gt.iter().filter(|(_, i)| i == "uninteresting").count() as i64
+    };
     let mut out: Vec<CollectionEntry> = by_word
         .into_iter()
         .map(|(word, a)| {
             let mut tags = a.tags;
             tags.sort_by(|x, y| int_rank(&x.1).cmp(&int_rank(&y.1)).then_with(|| x.0.cmp(&y.0)));
-            CollectionEntry { interest: eff(&tags), word, word_id: a.word_id, gloss: a.gloss, tags, books: a.books }
+            let metric = special.then(|| net(&a.global_tags));
+            CollectionEntry { interest: eff(&tags), word, word_id: a.word_id, gloss: a.gloss, tags, books: a.books, metric }
         })
         .collect();
-    out.sort_by(|x, y| int_rank(&x.interest).cmp(&int_rank(&y.interest)).then_with(|| x.word.cmp(&y.word)));
+    if special {
+        // keep only words with a positive net of all-books favourites; rank by it.
+        out.retain(|e| e.metric.unwrap_or(0) > 0);
+        out.sort_by(|x, y| y.metric.cmp(&x.metric).then_with(|| x.word.cmp(&y.word)));
+    } else {
+        out.sort_by(|x, y| int_rank(&x.interest).cmp(&int_rank(&y.interest)).then_with(|| x.word.cmp(&y.word)));
+    }
+    Ok(out)
+}
+
+/// The user's collection tags with how many distinct words each is applied to —
+/// the counts shown in the Collection page's filter dropdown. Ordered like the
+/// tag collection (sort, name). Includes tags with a zero count.
+#[server]
+pub async fn collection_tags() -> Result<Vec<(String, i64)>, ServerFnError> {
+    let conn = open_user()?;
+    let mut s = conn
+        .prepare(
+            "SELECT g.name, count(DISTINCT t.word) FROM tags g \
+             LEFT JOIN word_tags t ON t.tag = g.name AND t.rater = 'me' \
+             GROUP BY g.name ORDER BY g.sort, g.name",
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let out = s
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .filter_map(Result::ok)
+        .collect();
     Ok(out)
 }
 
@@ -3451,8 +3498,9 @@ fn TagsPage() -> impl IntoView {
 #[component]
 fn CollectionPage() -> impl IntoView {
     let (tag_q, set_tag) = query_signal::<String>("tag");
+    let (sort_q, set_sort) = query_signal::<String>("sort");
     let base = base_path();
-    let tags = Resource::new(|| (), |_| list_tags());
+    let tags = Resource::new(|| (), |_| collection_tags());
     let words = Resource::new(move || tag_q.get(), collection_words);
 
     view! {
@@ -3471,28 +3519,52 @@ fn CollectionPage() -> impl IntoView {
                                 if v.is_empty() { set_tag.set(None); } else { set_tag.set(Some(v)); }
                             }>
                             <option value="">"all tags"</option>
-                            {list.into_iter().map(|d| { let n = d.name.clone(); view! {
-                                <option value=d.name>{n}</option>
-                            } }).collect_view()}
+                            <option value="special:top-global">"★ most all-books favourites"</option>
+                            <optgroup label="tags">
+                                {list.into_iter().map(|(name, n)| { let v = name.clone(); view! {
+                                    <option value=v>{format!("{name} ({n})")}</option>
+                                } }).collect_view()}
+                            </optgroup>
                         </select>
                     }.into_any(),
                 })}
             </Suspense>
+            <select class="catsel" title="sort"
+                prop:value=move || sort_q.get().unwrap_or_default()
+                on:change=move |ev| {
+                    let v = event_target_value(&ev);
+                    if v.is_empty() { set_sort.set(None); } else { set_sort.set(Some(v)); }
+                }>
+                <option value="">"sort: default"</option>
+                <option value="interest">"sort: favourites first"</option>
+                <option value="az">"sort: A–Z"</option>
+                <option value="tags">"sort: most tags"</option>
+                <option value="books">"sort: most books"</option>
+            </select>
             <Show when=move || tag_q.get().is_some() fallback=|| ()>
-                <button class="catx" title="clear tag filter" on:click=move |_| set_tag.set(None)>"×"</button>
+                <button class="catx" title="clear filter" on:click=move |_| set_tag.set(None)>"×"</button>
             </Show>
         </div>
 
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
             {move || words.get().map(|res| match res {
                 Err(e) => view! { <p class="err">{format!("Error: {e}")}</p> }.into_any(),
-                Ok(list) => {
+                Ok(mut list) => {
                     if list.is_empty() {
-                        return view! { <p class="sub">"no tagged words yet — favourite (★) or tag words on the words page."</p> }.into_any();
+                        return view! { <p class="sub">"no tagged words here yet — favourite (★) or tag words on the words page."</p> }.into_any();
+                    }
+                    // client-side re-sort (server returns interest- or metric-ordered by default).
+                    let int_rank = |i: &str| match i { "interesting" => 0, "neutral" => 1, _ => 2 };
+                    match sort_q.get().as_deref() {
+                        Some("az") => list.sort_by(|a, b| a.word.cmp(&b.word)),
+                        Some("tags") => list.sort_by(|a, b| b.tags.len().cmp(&a.tags.len()).then_with(|| a.word.cmp(&b.word))),
+                        Some("books") => list.sort_by(|a, b| b.books.len().cmp(&a.books.len()).then_with(|| a.word.cmp(&b.word))),
+                        Some("interest") => list.sort_by(|a, b| int_rank(&a.interest).cmp(&int_rank(&b.interest)).then_with(|| a.word.cmp(&b.word))),
+                        _ => {} // keep server order
                     }
                     let base = base.clone();
                     view! {
-                        <p class="counts">{format!("{} tagged words", list.len())}</p>
+                        <p class="counts">{format!("{} words", list.len())}</p>
                         <div class="wlist">
                             {list.into_iter().map(|e| {
                                 let word_href = (e.word_id > 0).then(|| {
@@ -3502,9 +3574,11 @@ fn CollectionPage() -> impl IntoView {
                                 let has_gloss = !gloss.is_empty();
                                 let cls = format!("wcard ccard int-{}", e.interest);
                                 let word = e.word.clone();
+                                let metric = e.metric;
                                 view! {
                                     <article class=cls>
                                         <div class="wc-body">
+                                            {metric.map(|m| view! { <span class="cc-metric" title="net all-books favourites (favourite − negative)">{format!("+{m}")}</span> })}
                                             {match word_href {
                                                 Some(h) => view! { <a class="word" href=h>{word}</a> }.into_any(),
                                                 None => view! { <span class="word">{word}</span> }.into_any(),

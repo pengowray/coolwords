@@ -228,6 +228,11 @@ h1 { margin-bottom: 0; }
 .cc-books { margin-top: 0.4rem; font-size: 0.82rem; color: #999; display: flex; flex-wrap: wrap; gap: 0.15rem 0.5rem; }
 .cc-book { color: #2980b9; text-decoration: none; }
 .cc-book:hover { text-decoration: underline; }
+.cc-metric {
+  display: inline-block; margin-right: 0.4rem; font-weight: 700; font-size: 0.85rem;
+  color: #fff; background: #16a085; border-radius: 9px; padding: 0.05rem 0.45rem;
+  vertical-align: 0.05rem;
+}
 .catsel, .lvlsel { padding: 0.2rem 0.3rem; border-radius: 6px; }
 .forms { color: #16a085; font-size: 0.72rem; font-weight: 600; }
 .catx {
