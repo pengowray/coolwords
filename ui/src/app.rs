@@ -203,6 +203,49 @@ fn group_interest(t: Tagger, book_id: i64, members: &[i64]) -> Option<Interest> 
     acc
 }
 
+/// The distinct collection tags applied anywhere in a merged family, each paired
+/// with its interest. `pick:` contextual buckets are excluded (they're not the
+/// user's own labels), so the card strip only surfaces real tags. Sorted
+/// interesting → neutral → uninteresting, then by name, for a stable display.
+fn group_tags(t: Tagger, book_id: i64, members: &[i64]) -> Vec<(String, Interest)> {
+    let mut names: HashSet<String> = HashSet::new();
+    t.store.with(|m| {
+        for &w in members {
+            if let Some(set) = m.get(&(book_id, w)) {
+                for tag in set {
+                    if !tag.starts_with("pick:") {
+                        names.insert(tag.clone());
+                    }
+                }
+            }
+        }
+    });
+    let mut out: Vec<(String, Interest)> =
+        names.into_iter().map(|n| { let i = tag_interest(t, &n); (n, i) }).collect();
+    let rank = |i: &Interest| match i {
+        Interest::Interesting => 0,
+        Interest::Neutral => 1,
+        Interest::Uninteresting => 2,
+    };
+    out.sort_by(|a, b| rank(&a.1).cmp(&rank(&b.1)).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// Per-interest counts of a family's applied collection tags: (interesting,
+/// neutral, uninteresting). Used for the compact count pills when a word carries
+/// too many tags to list as chips.
+fn group_tag_counts(t: Tagger, book_id: i64, members: &[i64]) -> (usize, usize, usize) {
+    let mut c = (0usize, 0usize, 0usize);
+    for (_, i) in group_tags(t, book_id, members) {
+        match i {
+            Interest::Interesting => c.0 += 1,
+            Interest::Neutral => c.1 += 1,
+            Interest::Uninteresting => c.2 += 1,
+        }
+    }
+    c
+}
+
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     // Behind ingress this is the path prefix; "" otherwise. Stamped onto <html> so the
     // hydrating wasm can recover it (no request headers on the client), and passed to
@@ -230,6 +273,22 @@ pub struct Book {
     pub id: i64,
     pub title: String,
     pub n_selected: i64,
+}
+
+/// One tagged word on the cross-book Collection page: which of the user's tags it
+/// carries (each with its interest, for colouring) and which books it appears in.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CollectionEntry {
+    pub word: String,
+    /// Dictionary word id, for linking into a book's word detail (0 if unresolved).
+    pub word_id: i64,
+    pub gloss: Option<String>,
+    /// Effective interest ("interesting" | "neutral" | "uninteresting"), for sort/section.
+    pub interest: String,
+    /// Applied collection tags: (name, interest). `pick:` buckets are excluded.
+    pub tags: Vec<(String, String)>,
+    /// Books this word (with these tags) reaches: (book_id, title).
+    pub books: Vec<(i64, String)>,
 }
 
 /// One entry in the filter dropdown. `value` is what goes in the `cat` query
@@ -1498,6 +1557,134 @@ pub async fn book_tags(book_id: i64) -> Result<Vec<(i64, Vec<String>)>, ServerFn
     Ok(load_tags(&conn, book_id)?.into_iter().collect())
 }
 
+/// Words carrying the user's collection tags, across every book — the data for the
+/// Collection page. Optionally narrowed to a single `tag`. Book-scoped applications
+/// resolve to their one book; word-scoped ('*') applications resolve to every book
+/// whose text actually contains the word. Aggregated one row per word.
+#[server]
+pub async fn collection_words(tag: Option<String>) -> Result<Vec<CollectionEntry>, ServerFnError> {
+    use rusqlite::OptionalExtension;
+    let conn = open_conn()?;
+    // slug -> (id, title) for every book, to resolve book-scoped applications.
+    let mut books_by_slug: HashMap<String, (i64, String)> = HashMap::new();
+    {
+        let mut s = conn
+            .prepare("SELECT id, slug, COALESCE(title, slug) FROM books")
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        for r in s
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+            .map_err(|e| ServerFnError::new(e.to_string()))?
+            .filter_map(Result::ok)
+        {
+            books_by_slug.insert(r.1, (r.0, r.2));
+        }
+    }
+
+    // One accumulator per word.
+    struct Acc {
+        word_id: i64,
+        gloss: Option<String>,
+        tags: Vec<(String, String)>, // (name, interest), deduped
+        books: Vec<(i64, String)>,   // deduped by id
+    }
+    let mut by_word: HashMap<String, Acc> = HashMap::new();
+    // Cache the book list for each word-scoped word (avoids repeat queries).
+    let mut word_books: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+
+    // Every collection-tag application (the JOIN drops `pick:` buckets, which aren't
+    // registered in u.tags). Filter to one tag when requested.
+    let base_sql = "SELECT t.word, t.tag, g.interest, t.book_slug \
+                    FROM u.word_tags t JOIN u.tags g ON g.name = t.tag \
+                    WHERE t.rater = 'me'";
+    let rows: Vec<(String, String, String, String)> = if let Some(tg) = tag.as_deref() {
+        let mut s = conn
+            .prepare(&format!("{base_sql} AND t.tag = ?1"))
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        let v = s
+            .query_map([tg], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(|e| ServerFnError::new(e.to_string()))?
+            .filter_map(Result::ok)
+            .collect();
+        v
+    } else {
+        let mut s = conn.prepare(base_sql).map_err(|e| ServerFnError::new(e.to_string()))?;
+        let v = s
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(|e| ServerFnError::new(e.to_string()))?
+            .filter_map(Result::ok)
+            .collect();
+        v
+    };
+
+    for (word, tagname, interest, book_slug) in rows {
+        // Resolve this application's books.
+        let app_books: Vec<(i64, String)> = if book_slug == "*" {
+            if let Some(v) = word_books.get(&word) {
+                v.clone()
+            } else {
+                let mut s = conn
+                    .prepare(
+                        "SELECT b.id, COALESCE(b.title, b.slug) FROM books b \
+                         JOIN book_occurrences bo ON bo.book_id = b.id \
+                         JOIN words w ON w.id = bo.word_id WHERE w.word = ?1 ORDER BY b.id",
+                    )
+                    .map_err(|e| ServerFnError::new(e.to_string()))?;
+                let v: Vec<(i64, String)> = s
+                    .query_map([&word], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                    .map_err(|e| ServerFnError::new(e.to_string()))?
+                    .filter_map(Result::ok)
+                    .collect();
+                word_books.insert(word.clone(), v.clone());
+                v
+            }
+        } else {
+            books_by_slug.get(&book_slug).cloned().into_iter().collect()
+        };
+
+        if !by_word.contains_key(&word) {
+            let (wid, gloss): (i64, Option<String>) = conn
+                .query_row("SELECT id, gloss FROM words WHERE word = ?1", [&word], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()
+                .map_err(|e| ServerFnError::new(e.to_string()))?
+                .unwrap_or((0, None));
+            by_word.insert(word.clone(), Acc { word_id: wid, gloss, tags: Vec::new(), books: Vec::new() });
+        }
+        let acc = by_word.get_mut(&word).unwrap();
+        if !acc.tags.iter().any(|(n, _)| n == &tagname) {
+            acc.tags.push((tagname, interest));
+        }
+        for b in app_books {
+            if !acc.books.iter().any(|(id, _)| *id == b.0) {
+                acc.books.push(b);
+            }
+        }
+    }
+
+    // Effective interest for sort/section: interesting > uninteresting > neutral.
+    let eff = |tags: &[(String, String)]| -> String {
+        if tags.iter().any(|(_, i)| i == "interesting") {
+            "interesting".to_string()
+        } else if tags.iter().any(|(_, i)| i == "uninteresting") {
+            "uninteresting".to_string()
+        } else {
+            "neutral".to_string()
+        }
+    };
+    let int_rank = |i: &str| match i { "interesting" => 0, "neutral" => 1, _ => 2 };
+    let mut out: Vec<CollectionEntry> = by_word
+        .into_iter()
+        .map(|(word, a)| {
+            let mut tags = a.tags;
+            tags.sort_by(|x, y| int_rank(&x.1).cmp(&int_rank(&y.1)).then_with(|| x.0.cmp(&y.0)));
+            CollectionEntry { interest: eff(&tags), word, word_id: a.word_id, gloss: a.gloss, tags, books: a.books }
+        })
+        .collect();
+    out.sort_by(|x, y| int_rank(&x.interest).cmp(&int_rank(&y.interest)).then_with(|| x.word.cmp(&y.word)));
+    Ok(out)
+}
+
 /// The user's whole tag collection (builtin defaults + custom), for the picker.
 #[server]
 pub async fn list_tags() -> Result<Vec<TagDef>, ServerFnError> {
@@ -2098,6 +2285,7 @@ fn NavBar() -> impl IntoView {
         <nav class="navbar">
             <span class="brand">"coolwords"</span>
             <A href=words_href attr:class=cls("/", "navlink")>"words"</A>
+            <A href=format!("{base}/collection") attr:class=cls("/collection", "navlink")>"collection"</A>
             <A href=format!("{base}/books") attr:class=cls("/books", "navlink")>"books"</A>
             <A href=format!("{base}/tags") attr:class=cls("/tags", "navlink")>"tags"</A>
             <A href=format!("{base}/import") attr:class=cls("/import", "navimport")>"+ import book"</A>
@@ -2128,6 +2316,7 @@ pub fn App() -> impl IntoView {
                 <NavBar/>
                 <Routes fallback=|| "Page not found.".into_view()>
                     <Route path=StaticSegment("") view=HomePage/>
+                    <Route path=StaticSegment("collection") view=CollectionPage/>
                     <Route path=StaticSegment("tags") view=TagsPage/>
                     <Route path=StaticSegment("books") view=BooksAdminPage/>
                     <Route path=StaticSegment("import") view=ImportPage/>
@@ -2192,6 +2381,49 @@ fn Star(book_id: i64, word_id: i64) -> impl IntoView {
     }
 }
 
+/// CSS class fragment for an interest level (matches the `.int-*` colour rules).
+fn interest_class(i: Interest) -> &'static str {
+    match i {
+        Interest::Interesting => "interesting",
+        Interest::Neutral => "neutral",
+        Interest::Uninteresting => "uninteresting",
+    }
+}
+
+/// The applied-tags strip shown on a word card: the family's own tags as small
+/// interest-coloured labels, collapsing to per-kind count pills when there are too
+/// many to list (green = interesting, grey = neutral, red = uninteresting).
+#[component]
+fn TagStrip(book_id: i64, members: Vec<i64>) -> impl IntoView {
+    let t = expect_context::<Tagger>();
+    // How many labels before we collapse to counts.
+    const MAX_CHIPS: usize = 3;
+    move || {
+        let tags = group_tags(t, book_id, &members);
+        if tags.is_empty() {
+            return ().into_any();
+        }
+        if tags.len() <= MAX_CHIPS {
+            return view! {
+                <span class="tagstrip">
+                    {tags.into_iter().map(|(n, i)| {
+                        let cls = format!("taglabel int-{}", interest_class(i));
+                        view! { <span class=cls>{n}</span> }
+                    }).collect_view()}
+                </span>
+            }.into_any();
+        }
+        let (g, ne, r) = group_tag_counts(t, book_id, &members);
+        view! {
+            <span class="tagsummary" title="tags on this word (by kind)">
+                {(g > 0).then(|| view! { <span class="tagcount int-interesting">{g}</span> })}
+                {(ne > 0).then(|| view! { <span class="tagcount int-neutral">{ne}</span> })}
+                {(r > 0).then(|| view! { <span class="tagcount int-uninteresting">{r}</span> })}
+            </span>
+        }.into_any()
+    }
+}
+
 /// The tag picker: the user's tag collection split into two drag groups — "this
 /// book" (book-scoped, above) and "all books" (word-scoped, below) — coloured by
 /// interest, plus per-word "good for: <bucket>" picks and an inline new-tag adder.
@@ -2203,7 +2435,6 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
     let has_buckets = !buckets.is_empty();
     let new_name = RwSignal::new(String::new());
     let new_comment = RwSignal::new(String::new());
-    let drag = RwSignal::new(None::<String>);
     let add_new = move || {
         let raw = new_name.get();
         let Some(clean) = sanitize_tag(&raw) else { return };
@@ -2254,50 +2485,46 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
     };
 
     // Reactive chips for one scope group (book or word), minus the ★ quick-tag.
+    // Each chip is a toggle (apply/remove) plus a small ⇄ button that moves the tag
+    // to the *other* scope — the touch-friendly replacement for the old drag-drop.
     let chips = move |is_word: bool| {
         t.tags.get().into_iter()
             .filter(move |d| d.name != "star" && (d.scope == SCOPE_WORD) == is_word)
             .map(|d| {
                 let name = d.name.clone();
                 let on_name = name.clone();
+                let btn_name = name.clone();
                 let click_name = name.clone();
-                let drag_name = name.clone();
+                let move_name = name.clone();
                 let title = d.comment.clone().unwrap_or_default();
                 let cls = format!("chip int-{}", d.interest);
+                // book group → move to word scope; word group → move to book scope.
+                let to_word = !is_word;
+                let move_title = if to_word { "make this tag apply to this word in all books" } else { "make this tag apply to this book only" };
                 view! {
-                    <button type="button" class=cls draggable="true" title=title
-                        class:on=move || has_tag(t, key, &on_name)
-                        on:dragstart=move |ev: web_sys::DragEvent| {
-                            drag.set(Some(drag_name.clone()));
-                            // a non-empty payload makes the drag valid in all browsers
-                            if let Some(dt) = ev.data_transfer() { let _ = dt.set_data("text/plain", &drag_name); }
-                        }
-                        on:click=move |_| toggle_tag(t, book_id, word_id, &click_name)>
-                        {name}
-                    </button>
+                    <span class="chipwrap" class:on=move || has_tag(t, key, &on_name)>
+                        <button type="button" class=cls title=title
+                            class:on=move || has_tag(t, key, &btn_name)
+                            on:click=move |_| toggle_tag(t, book_id, word_id, &click_name)>
+                            {name}
+                        </button>
+                        <button type="button" class="chipmove" title=move_title
+                            on:click=move |_| move_scope(move_name.clone(), to_word)>"⇄"</button>
+                    </span>
                 }
             })
             .collect_view()
     };
-    let drop_to = move |to_word: bool| {
-        move |ev: web_sys::DragEvent| {
-            ev.prevent_default();
-            if let Some(n) = drag.get() {
-                drag.set(None);
-                move_scope(n, to_word);
-            }
-        }
-    };
 
     view! {
         <div class="picker tagpick">
-            <div class="scopegrp" on:dragover=move |ev| ev.prevent_default() on:drop=drop_to(false)>
+            <div class="scopegrp">
                 <span class="picklbl">"this book"</span>
                 {move || chips(false)}
             </div>
-            <div class="scopegrp global" on:dragover=move |ev| ev.prevent_default() on:drop=drop_to(true)>
+            <div class="scopegrp global">
                 <span class="picklbl" title="word-scoped: applies to this word in every book">
-                    "all books "<span class="draghint">"⇕ drag"</span>
+                    "all books "<span class="draghint" title="use ⇄ on a tag to move it between scopes">"(⇄ to move)"</span>
                 </span>
                 {move || chips(true)}
             </div>
@@ -2551,73 +2778,82 @@ fn HomePage() -> impl IntoView {
                     let total = list.len();
                     view! {
                         <p class="counts">{format!("{total} shown")}</p>
-                        <table>
-                            <thead><tr>
-                                <th></th><th>"word"</th><th>"gloss"</th><th>"in bk"</th><th>"score"</th>
-                                <th>"origin"</th><th>"category"</th><th>"cl"</th><th>"tags"</th>
-                            </tr></thead>
-                            <tbody>
-                                {list.into_iter().map(|c| {
-                                    let wid = c.word_id;
-                                    let bk = c.buckets.clone();
-                                    let star = if c.selected { "•" } else { "" };
-                                    let nforms = c.n_forms;
-                                    let members = c.members.clone();
-                                    let members_has = c.members.clone();
-                                    let members_rej = c.members.clone();
-                                    let members_hid = c.members.clone();
-                                    let gloss = short(&c.gloss, 90);
-                                    let example = c.example.clone().unwrap_or_default();
-                                    let origin_disp = c.origin_name.clone().or_else(|| c.origin_code.clone()).unwrap_or_default();
-                                    let origin_title = c.origin_code.clone().unwrap_or_default();
-                                    let cat = c.category.clone();
-                                    let cat_click = cat.clone();
-                                    let cluster_txt = c.cluster.map(|n| n.to_string()).unwrap_or_default();
-                                    view! {
-                                        <tr class="row"
-                                            class:interesting=move || group_interest(tagger, b, &members) == Some(Interest::Interesting)
-                                            class:rejected=move || group_interest(tagger, b, &members_rej) == Some(Interest::Uninteresting)
-                                            class:hidden=move || hide_rejected.get() && group_interest(tagger, b, &members_hid) == Some(Interest::Uninteresting)>
-                                            <td class="sel">{star}</td>
-                                            <td class="word" title=example on:click=move |_| set_word.set(Some(wid))>
-                                                {c.word.clone()}
-                                                {(nforms > 1).then(|| view! {
-                                                    <small class="forms" title="surface forms merged into this group at the current level">{format!(" +{}", nforms - 1)}</small>
-                                                })}
-                                            </td>
-                                            <td class="gloss">{gloss}</td>
-                                            <td class="num">{c.in_book}</td>
-                                            <td class="num">{format!("{:.1}", c.score)}</td>
-                                            <td title=origin_title>{origin_disp}</td>
-                                            <td class="cat"
-                                                on:click=move |_| { if let Some(cc) = cat_click.clone() { set_cat.set(Some(cc)); } }>
-                                                {cat.clone().unwrap_or_default()}
-                                            </td>
-                                            <td class="num">{cluster_txt}</td>
-                                            <td class="tagcell">
-                                                <Star book_id=b word_id=wid/>
-                                                <button type="button" class="tagbtn"
-                                                    class:has=move || group_has_other(tagger, b, &members_has)
-                                                    on:click=move |_| open_picker.update(|o| *o = if *o == Some(wid) { None } else { Some(wid) })>
-                                                    "tags"
-                                                </button>
-                                                <Show when=move || open_picker.get() == Some(wid) fallback=|| ()>
-                                                    <TagPicker book_id=b word_id=wid buckets=bk.clone()/>
-                                                </Show>
-                                            </td>
-                                        </tr>
-                                    }
-                                }).collect_view()}
-                            </tbody>
-                        </table>
+                        <div class="wlist">
+                            {list.into_iter().map(|c| {
+                                let wid = c.word_id;
+                                let bk = c.buckets.clone();
+                                let selected_dot = c.selected;
+                                let nforms = c.n_forms;
+                                let members = c.members.clone();
+                                let members_rej = c.members.clone();
+                                let members_hid = c.members.clone();
+                                let members_has = c.members.clone();
+                                let members_strip = c.members.clone();
+                                let word = c.word.clone();
+                                let gloss = c.gloss.clone().unwrap_or_default();
+                                let has_gloss = !gloss.is_empty();
+                                let in_book = c.in_book;
+                                let score = c.score;
+                                let origin_disp = c.origin_name.clone().or_else(|| c.origin_code.clone()).unwrap_or_default();
+                                let has_origin = !origin_disp.is_empty();
+                                let origin_title = c.origin_code.clone().unwrap_or_default();
+                                let cat = c.category.clone();
+                                view! {
+                                    <article class="wcard"
+                                        class:interesting=move || group_interest(tagger, b, &members) == Some(Interest::Interesting)
+                                        class:rejected=move || group_interest(tagger, b, &members_rej) == Some(Interest::Uninteresting)
+                                        class:hidden=move || hide_rejected.get() && group_interest(tagger, b, &members_hid) == Some(Interest::Uninteresting)>
+                                        <div class="wc-main">
+                                            <Star book_id=b word_id=wid/>
+                                            <div class="wc-body" on:click=move |_| set_word.set(Some(wid))>
+                                                <div class="wc-head">
+                                                    <span class="word">
+                                                        {word}
+                                                        {(nforms > 1).then(|| view! {
+                                                            <small class="forms" title="surface forms merged into this group at the current level">{format!(" +{}", nforms - 1)}</small>
+                                                        })}
+                                                    </span>
+                                                    {selected_dot.then(|| view! { <span class="seldot" title="in the varied top-20">"•"</span> })}
+                                                </div>
+                                                {has_gloss.then(|| view! { <p class="gloss">{gloss}</p> })}
+                                                <div class="wc-meta">
+                                                    <span title="times in this book">{format!("{in_book}×")}</span>
+                                                    <span title="interestingness score">{format!("score {:.1}", score)}</span>
+                                                    {has_origin.then(|| view! { <span class="wc-origin" title=origin_title>{origin_disp}</span> })}
+                                                </div>
+                                            </div>
+                                            <div class="wc-side">
+                                                {cat.map(|cc| { let cc2 = cc.clone(); view! {
+                                                    <button type="button" class="catchip" title="filter by this category"
+                                                        on:click=move |_| set_cat.set(Some(cc2.clone()))>{cc}</button>
+                                                } })}
+                                            </div>
+                                        </div>
+                                        <div class="wc-tags">
+                                            <TagStrip book_id=b members=members_strip/>
+                                            <button type="button" class="tagbtn"
+                                                class:has=move || group_has_other(tagger, b, &members_has)
+                                                class:open=move || open_picker.get() == Some(wid)
+                                                on:click=move |_| open_picker.update(|o| *o = if *o == Some(wid) { None } else { Some(wid) })>
+                                                {move || if open_picker.get() == Some(wid) { "− tag" } else { "＋ tag" }}
+                                            </button>
+                                        </div>
+                                        <Show when=move || open_picker.get() == Some(wid) fallback=|| ()>
+                                            <TagPicker book_id=b word_id=wid buckets=bk.clone()/>
+                                        </Show>
+                                    </article>
+                                }
+                            }).collect_view()}
+                        </div>
                     }.into_any()
                 }
             })}
         </Suspense>
 
         <Show when=move || selected.get().is_some() fallback=|| ()>
+            <div class="detail-backdrop" on:click=move |_| set_word.set(None)></div>
             <aside class="detail">
-                <button class="close" on:click=move |_| set_word.set(None)>"×"</button>
+                <button class="close" title="back to the list" on:click=move |_| set_word.set(None)>"← back"</button>
                 <Suspense fallback=move || view! { <p class="loading">"…"</p> }>
                     {move || detail.get().map(|res| match res {
                         Err(e) => view! { <p class="err">{format!("{e}")}</p> }.into_any(),
@@ -2909,6 +3145,103 @@ fn TagsPage() -> impl IntoView {
                 on:keydown=move |ev| if ev.key() == "Enter" { add_new(); }/>
             <button class="chip add" on:click=move |_| add_new()>"add tag"</button>
         </div>
+    }
+}
+
+// ---- collection: tagged words across all books ----
+
+/// A cross-book view of every word you've tagged, filterable to one tag. Each word
+/// links back into a book's detail; word-scoped tags list all the books they reach.
+#[component]
+fn CollectionPage() -> impl IntoView {
+    let (tag_q, set_tag) = query_signal::<String>("tag");
+    let base = base_path();
+    let tags = Resource::new(|| (), |_| list_tags());
+    let words = Resource::new(move || tag_q.get(), collection_words);
+
+    view! {
+        <h1>"collection"</h1>
+        <p class="sub">"every word you've tagged, across all books. Filter by a tag; click a word to open it in a book."</p>
+
+        <div class="bar">
+            <Suspense fallback=|| ()>
+                {move || tags.get().map(|res| match res {
+                    Err(_) => ().into_any(),
+                    Ok(list) => view! {
+                        <select class="catsel"
+                            prop:value=move || tag_q.get().unwrap_or_default()
+                            on:change=move |ev| {
+                                let v = event_target_value(&ev);
+                                if v.is_empty() { set_tag.set(None); } else { set_tag.set(Some(v)); }
+                            }>
+                            <option value="">"all tags"</option>
+                            {list.into_iter().map(|d| { let n = d.name.clone(); view! {
+                                <option value=d.name>{n}</option>
+                            } }).collect_view()}
+                        </select>
+                    }.into_any(),
+                })}
+            </Suspense>
+            <Show when=move || tag_q.get().is_some() fallback=|| ()>
+                <button class="catx" title="clear tag filter" on:click=move |_| set_tag.set(None)>"×"</button>
+            </Show>
+        </div>
+
+        <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
+            {move || words.get().map(|res| match res {
+                Err(e) => view! { <p class="err">{format!("Error: {e}")}</p> }.into_any(),
+                Ok(list) => {
+                    if list.is_empty() {
+                        return view! { <p class="sub">"no tagged words yet — favourite (★) or tag words on the words page."</p> }.into_any();
+                    }
+                    let base = base.clone();
+                    view! {
+                        <p class="counts">{format!("{} tagged words", list.len())}</p>
+                        <div class="wlist">
+                            {list.into_iter().map(|e| {
+                                let word_href = (e.word_id > 0).then(|| {
+                                    e.books.first().map(|(bid, _)| format!("{base}/?book={bid}&word={}", e.word_id))
+                                }).flatten();
+                                let gloss = short(&e.gloss, 140);
+                                let has_gloss = !gloss.is_empty();
+                                let cls = format!("wcard ccard int-{}", e.interest);
+                                let word = e.word.clone();
+                                view! {
+                                    <article class=cls>
+                                        <div class="wc-body">
+                                            {match word_href {
+                                                Some(h) => view! { <a class="word" href=h>{word}</a> }.into_any(),
+                                                None => view! { <span class="word">{word}</span> }.into_any(),
+                                            }}
+                                            {has_gloss.then(|| view! { <p class="gloss">{gloss}</p> })}
+                                        </div>
+                                        <div class="wc-tags">
+                                            <span class="tagstrip">
+                                                {e.tags.into_iter().map(|(n, i)| {
+                                                    let cls = format!("taglabel int-{i}");
+                                                    view! { <span class=cls>{n}</span> }
+                                                }).collect_view()}
+                                            </span>
+                                        </div>
+                                        <div class="cc-books">
+                                            <span class="cc-in">"in: "</span>
+                                            {e.books.into_iter().map(|(bid, title)| {
+                                                let href = (e.word_id > 0)
+                                                    .then(|| format!("{base}/?book={bid}&word={}", e.word_id));
+                                                match href {
+                                                    Some(h) => view! { <a class="cc-book" href=h>{title}</a> }.into_any(),
+                                                    None => view! { <span class="cc-book">{title}</span> }.into_any(),
+                                                }
+                                            }).collect_view()}
+                                        </div>
+                                    </article>
+                                }
+                            }).collect_view()}
+                        </div>
+                    }.into_any()
+                }
+            })}
+        </Suspense>
     }
 }
 

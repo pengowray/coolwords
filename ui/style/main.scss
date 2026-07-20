@@ -71,17 +71,24 @@ h1 { margin-bottom: 0; }
 }
 .catchip { margin: 0 0.25rem 0.25rem 0; color: #2980b9; }
 
-/* detail side panel */
+/* detail sheet — a dimmed backdrop plus a panel. On wide screens it's a centered
+   modal; on phones (see the media query below) it becomes a full-screen sheet. */
+.detail-backdrop {
+  position: fixed; inset: 0; z-index: 40; background: #0006;
+}
 .detail {
-  position: fixed; top: 0; right: 0; width: 24rem; height: 100vh; overflow-y: auto;
-  background: Canvas; border-left: 1px solid #8886; box-shadow: -4px 0 16px #0002;
-  padding: 1.2rem 1.4rem;
+  position: fixed; z-index: 41; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  width: min(32rem, calc(100vw - 2rem)); max-height: calc(100vh - 2rem); overflow-y: auto;
+  background: Canvas; border: 1px solid #8886; border-radius: 12px;
+  box-shadow: 0 12px 40px #0005; padding: 1.2rem 1.4rem 2rem;
 }
-.detail h2 { margin: 0 1.5rem 0.2rem 0; }
+.detail h2 { margin: 0.4rem 4.5rem 0.2rem 0; font-size: 1.6rem; }
 .detail .close {
-  position: absolute; top: 0.6rem; right: 0.8rem; border: none; background: transparent;
-  font-size: 1.4rem; cursor: pointer; color: #888;
+  position: sticky; top: 0; float: right; margin: -0.4rem -0.4rem 0 0;
+  border: 1px solid #8884; background: Canvas; border-radius: 8px;
+  font-size: 0.9rem; cursor: pointer; color: #888; padding: 0.35rem 0.7rem; line-height: 1;
 }
+.detail .close:hover { border-color: #888; color: inherit; }
 .detail .ex { border-left: 3px solid #8884; margin: 0.6rem 0; padding: 0.2rem 0.8rem; color: #777; font-style: italic; }
 .detail .meta { list-style: none; padding: 0; color: #666; font-size: 0.9rem; }
 .detail .meta li { display: inline-block; margin-right: 1rem; }
@@ -100,38 +107,107 @@ h1 { margin-bottom: 0; }
 .star:hover { color: #f1c40f88; }
 .star.on { color: #f1c40f; }
 .tagbtn {
-  border: 1px solid #8884; background: transparent; border-radius: 10px;
-  padding: 0 0.5rem; font-size: 0.72rem; cursor: pointer; color: #999; margin-left: 0.2rem;
+  border: 1px solid #8884; background: transparent; border-radius: 14px;
+  padding: 0.25rem 0.7rem; font-size: 0.8rem; cursor: pointer; color: #888; white-space: nowrap;
 }
 .tagbtn:hover { border-color: #888; }
-.tagbtn.has { background: #3498db; color: #fff; border-color: #3498db; }
-.row.tagged { background: #f1c40f10; }
-.tagcell { position: relative; white-space: nowrap; }
+.tagbtn.has { border-color: #3498db99; color: #2980b9; }
+.tagbtn.open { background: #3498db; color: #fff; border-color: #3498db; }
 
 .picker {
-  position: absolute; right: 0; top: 100%; z-index: 30;
   background: Canvas; border: 1px solid #8886; border-radius: 8px;
-  box-shadow: 0 6px 18px #0003; padding: 0.5rem; width: max-content; max-width: 22rem;
+  box-shadow: 0 6px 18px #0003; padding: 0.6rem; max-width: 26rem;
 }
-.detail-tags .picker { position: static; box-shadow: none; border: none; padding: 0; }
-.pickgroup { display: flex; flex-wrap: wrap; align-items: center; gap: 3px; margin: 2px 0; }
+/* inside a word card the picker is an inline block that spans the card width */
+.wcard .picker { box-shadow: none; margin-top: 0.5rem; max-width: 100%; }
+.detail-tags .picker { box-shadow: none; border: none; padding: 0; }
+.pickgroup { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin: 3px 0; }
 .picklbl { color: #999; font-size: 0.75rem; }
 .chip {
-  border: 1px solid #8884; background: transparent; border-radius: 10px;
-  padding: 0 7px; font-size: 0.75rem; line-height: 1.6; cursor: pointer; color: #888; white-space: nowrap;
+  border: 1px solid #8884; background: transparent; border-radius: 12px;
+  padding: 0.25rem 0.6rem; font-size: 0.82rem; line-height: 1.2; cursor: pointer;
+  color: #888; white-space: nowrap;
 }
 .chip:hover { border-color: #888; }
 .chip.on { background: #3498db; color: #fff; border-color: #3498db; }
 .chip.pick.on { background: #16a085; border-color: #16a085; }
-.pickgroup.newtag { gap: 4px; margin-top: 5px; border-top: 1px solid #8883; padding-top: 5px; }
+/* a chip + its ⇄ scope-move button share a rounded pill */
+.chipwrap { display: inline-flex; align-items: stretch; }
+.chipwrap .chip { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.chipmove {
+  border: 1px solid #8884; border-left: none; background: transparent; cursor: pointer;
+  color: #aaa; font-size: 0.82rem; padding: 0 0.4rem; border-radius: 0 12px 12px 0; line-height: 1;
+}
+.chipmove:hover { color: #16a085; border-color: #888; }
+.pickgroup.newtag { gap: 5px; margin-top: 6px; border-top: 1px solid #8883; padding-top: 6px; }
 .newtag input {
-  font-size: 0.75rem; padding: 1px 6px; border: 1px solid #8884; border-radius: 8px;
+  font-size: 0.85rem; padding: 0.3rem 0.5rem; border: 1px solid #8884; border-radius: 8px;
   background: Canvas; color: inherit;
 }
-.newtag-name { width: 7rem; }
-.newtag-comment { width: 10rem; }
-.chip.add { background: #16a085; color: #fff; border-color: #16a085; }
-.detail-tags { display: flex; align-items: flex-start; gap: 0.4rem; margin: 0.3rem 0 0.6rem; }
+.newtag-name { width: 8rem; }
+.newtag-comment { width: 11rem; }
+.chip.add { background: #16a085; color: #fff; border-color: #16a085; padding: 0.25rem 0.8rem; }
+.detail-tags { display: block; margin: 0.3rem 0 0.8rem; }
+.detail-tags .star { font-size: 1.4rem; }
+
+/* ---- word cards (the main list) ---- */
+.wlist { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.4rem; }
+.wcard {
+  border: 1px solid #8883; border-radius: 10px; padding: 0.6rem 0.8rem;
+  transition: border-color 0.12s, background 0.12s;
+}
+.wcard:hover { border-color: #8886; }
+.wc-main { display: flex; align-items: flex-start; gap: 0.5rem; }
+.wc-main .star { font-size: 1.3rem; padding-top: 0.05rem; }
+.wc-body { flex: 1; min-width: 0; cursor: pointer; }
+.wc-head { display: flex; align-items: baseline; gap: 0.4rem; }
+.wc-body .word { font-weight: 600; font-size: 1.15rem; }
+.wc-body:hover .word { text-decoration: underline; }
+.seldot { color: #3498db; font-size: 1.1rem; line-height: 1; }
+.wc-body .gloss {
+  color: #999; font-size: 0.9rem; margin: 0.15rem 0 0.25rem; max-width: none;
+  display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.wc-meta { display: flex; flex-wrap: wrap; gap: 0.15rem 0.8rem; color: #999; font-size: 0.8rem; }
+.wc-meta .wc-origin { color: #888; }
+.wc-side { flex: none; display: flex; align-items: flex-start; }
+.wc-side .catchip { margin: 0; }
+.wc-tags {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem;
+  margin-top: 0.4rem; padding-left: calc(1.3rem + 0.5rem); /* align under the word, past the star */
+}
+
+/* applied-tag labels on a card + the collapsed per-kind count pills */
+.tagstrip { display: inline-flex; flex-wrap: wrap; gap: 0.3rem; }
+.taglabel {
+  font-size: 0.75rem; padding: 0.1rem 0.5rem; border-radius: 10px;
+  border: 1px solid #8884; color: #888; white-space: nowrap;
+}
+.taglabel.int-interesting   { background: #16a08518; border-color: #16a08555; color: #12876f; }
+.taglabel.int-neutral       { background: #7f8c8d18; border-color: #7f8c8d55; color: #6c7a7b; }
+.taglabel.int-uninteresting { background: #c0392b14; border-color: #c0392b55; color: #b53225; }
+.tagsummary { display: inline-flex; gap: 0.3rem; }
+.tagcount {
+  font-size: 0.75rem; font-weight: 700; min-width: 1.3rem; text-align: center;
+  padding: 0.05rem 0.35rem; border-radius: 9px; color: #fff;
+}
+.tagcount.int-interesting   { background: #16a085; }
+.tagcount.int-neutral       { background: #7f8c8d; }
+.tagcount.int-uninteresting { background: #c0392b; }
+
+/* ---- collection page cards ---- */
+.ccard .wc-body { cursor: default; }
+.ccard .word { font-weight: 600; font-size: 1.15rem; }
+.ccard a.word { color: #2980b9; text-decoration: none; cursor: pointer; }
+.ccard a.word:hover { text-decoration: underline; }
+.ccard .gloss {
+  color: #999; font-size: 0.9rem; margin: 0.15rem 0 0.3rem;
+  display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.ccard .wc-tags { padding-left: 0; }
+.cc-books { margin-top: 0.4rem; font-size: 0.82rem; color: #999; display: flex; flex-wrap: wrap; gap: 0.15rem 0.5rem; }
+.cc-book { color: #2980b9; text-decoration: none; }
+.cc-book:hover { text-decoration: underline; }
 .catsel, .lvlsel { padding: 0.2rem 0.3rem; border-radius: 6px; }
 .forms { color: #16a085; font-size: 0.72rem; font-weight: 600; }
 .catx {
@@ -264,23 +340,23 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
 .chip.int-uninteresting.on  { background: #c0392b; border-color: #c0392b; color: #fff; }
 .chip.int-interesting.on    { background: #16a085; border-color: #16a085; color: #fff; }
 
-/* the two scope drop-groups in the picker */
+/* the two scope groups in the picker */
 .scopegrp {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 3px;
-  border: 1px dashed #8883; border-radius: 8px; padding: 3px 6px; margin: 3px 0;
-  min-height: 1.7rem;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+  border: 1px dashed #8883; border-radius: 8px; padding: 5px 7px; margin: 4px 0;
+  min-height: 2rem;
 }
 .scopegrp.global { border-color: #16a08555; background: #16a0850a; }
 .draghint { color: #aaa; font-size: 0.68rem; }
-.chip[draggable="true"] { cursor: grab; }
 .managelink { color: #2980b9; font-size: 0.85rem; text-decoration: none; margin-left: auto; white-space: nowrap; }
 .managelink:hover { text-decoration: underline; }
 
-/* row states driven by a word's effective interest */
-.row.interesting { background: #16a0850f; }
-.row.rejected { opacity: 0.5; }
-.row.rejected .word { text-decoration: line-through; }
-.row.hidden { display: none; }
+/* card states driven by a word's effective interest */
+.wcard.interesting { background: #16a0850f; border-color: #16a08533; }
+.wcard.rejected { opacity: 0.55; }
+.wcard.rejected .word { text-decoration: line-through; }
+.wcard.hidden { display: none; }
+.ccard.int-uninteresting { opacity: 0.7; }
 
 /* "also in other books" list in the sidebar */
 .alsoin { font-size: 0.85rem; margin: 0.2rem 0 0.4rem; line-height: 1.7; }
@@ -372,3 +448,32 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
 
 .jobbar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 0.4rem 0; }
 .jobprog { width: 12rem; height: 0.7rem; }
+
+/* ---- mobile ---- */
+@media (max-width: 40rem) {
+  body { margin: 1rem auto; padding: 0 0.7rem; }
+  h1 { font-size: 1.6rem; }
+
+  /* let the filter bar breathe; book buttons scroll horizontally instead of wrapping tall */
+  .bar { gap: 0.5rem; }
+  .bar > button, .catsel, .lvlsel, .catx { padding: 0.4rem 0.7rem; font-size: 0.95rem; }
+  .toggle { margin-left: 0; }
+
+  /* the detail becomes a full-screen sheet with an explicit back button */
+  .detail {
+    top: 0; left: 0; transform: none; width: 100vw; max-width: 100vw;
+    height: 100dvh; max-height: 100dvh; border: none; border-radius: 0;
+    padding: 1rem 1rem 3rem;
+  }
+  .detail .close {
+    margin: 0 0 0.6rem; float: none; display: inline-block; font-size: 1rem;
+    padding: 0.5rem 0.9rem;
+  }
+  .detail h2 { margin-right: 0; }
+
+  /* comfortable tap targets in the tag editor */
+  .chip, .tagbtn, .chipmove { padding-top: 0.45rem; padding-bottom: 0.45rem; }
+  .newtag-name, .newtag-comment { width: 100%; }
+  .pickgroup.newtag { flex-direction: column; align-items: stretch; }
+  .managelink { margin-left: 0; }
+}
