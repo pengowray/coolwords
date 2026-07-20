@@ -2606,6 +2606,9 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
     let new_word = RwSignal::new(false); // scope: false = this book, true = all books
     let new_interest = RwSignal::new("interesting".to_string());
     let drag = RwSignal::new(None::<String>);
+    // "descriptions" mode: expand every chip to show + edit its comment (the only
+    // way to read a tag's description on touch, where the title tooltip is dead).
+    let describe = RwSignal::new(false);
 
     let add_new = move || {
         let raw = new_name.get();
@@ -2638,7 +2641,9 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
     };
 
     // One scope group (book or word): section subheadings + draggable, tappable chips.
+    // In "descriptions" mode each chip expands to a row with an editable comment.
     let group_view = move |is_word: bool| {
+        let describing = describe.get();
         let scoped: Vec<TagDef> = t.tags.get().into_iter()
             .filter(|d| d.name != "star" && (d.scope == SCOPE_WORD) == is_word)
             .collect();
@@ -2664,9 +2669,11 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                     let click_name = name.clone();
                     let drag_name = name.clone();
                     let drop_name = name.clone();
+                    let desc_name = name.clone();
+                    let comment_val = d.comment.clone().unwrap_or_default();
                     let title = d.comment.clone().unwrap_or_default();
                     let cls = format!("chip int-{}", d.interest);
-                    view! {
+                    let chip = view! {
                         <button type="button" class=cls title=title draggable="true"
                             class:on=move || has_tag(t, key, &on_name)
                             on:dragstart=move |ev: web_sys::DragEvent| { drag.set(Some(drag_name.clone()));
@@ -2678,6 +2685,22 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                             on:click=move |_| toggle_tag(t, book_id, word_id, &click_name)>
                             {name}
                         </button>
+                    };
+                    if describing {
+                        view! {
+                            <div class="chipcell">
+                                {chip}
+                                <input class="chipdesc" placeholder="describe this tag…" prop:value=comment_val
+                                    on:change=move |ev| {
+                                        let c = event_target_value(&ev);
+                                        t.add.dispatch(AddTag { name: desc_name.clone(), comment: c.clone() });
+                                        t.tags.update(|v| { if let Some(dd) = v.iter_mut().find(|dd| dd.name == desc_name) {
+                                            dd.comment = (!c.trim().is_empty()).then(|| c.clone()); } });
+                                    }/>
+                            </div>
+                        }.into_any()
+                    } else {
+                        chip.into_any()
                     }
                 }).collect_view()}
             }
@@ -2691,6 +2714,11 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
 
     view! {
         <div class="picker tagpick">
+            <div class="pickhead">
+                <button type="button" class="descbtn" class:on=move || describe.get()
+                    title="show / edit each tag's description"
+                    on:click=move |_| describe.update(|d| *d = !*d)>"ⓘ descriptions"</button>
+            </div>
             <div class="scopegrp" on:dragover=move |ev| ev.prevent_default() on:drop=drop_end(false)>
                 <span class="picklbl">"this book"</span>
                 {move || group_view(false)}
