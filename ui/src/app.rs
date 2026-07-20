@@ -63,6 +63,9 @@ pub struct TagDef {
     /// 'interesting' (favourites) | 'neutral' (note) | 'uninteresting' (negative).
     pub interest: String,
     pub sort: i64,
+    /// User subheading within a scope ('' = ungrouped). Tags with the same section
+    /// (kept contiguous by `sort`) render under one subheading.
+    pub section: String,
 }
 
 /// Normalize a free-text tag name to its canonical collection form, or None if
@@ -83,6 +86,18 @@ pub fn sanitize_tag(name: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Normalize a subheading label: trim, collapse internal whitespace, keep only
+/// alphanumerics/space/dash, cap at 40 chars. Case is preserved (headings read
+/// better cased). Empty string is valid and means "ungrouped". Pure (client+server).
+pub fn sanitize_section(s: &str) -> String {
+    let kept: String = s
+        .trim()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-')
+        .collect();
+    kept.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(40).collect()
 }
 
 /// A tag value is allowed if it's a contextual `pick:<bucket>` tag or a clean
@@ -116,27 +131,28 @@ pub struct Tagger {
     pub action: ServerAction<SetTag>,
     pub tags: RwSignal<Vec<TagDef>>,
     pub add: ServerAction<AddTag>,
+    /// Create a tag with an explicit scope + interest (picker / manager adders).
+    pub create: ServerAction<CreateTag>,
     // tag-collection mutations (editor + drag); the picker/editor refetch the
     // collection (and book tags) whenever any of their versions change.
     pub scope: ServerAction<SetTagScope>,
     pub interest: ServerAction<SetTagInterest>,
     pub rename: ServerAction<RenameTag>,
     pub del: ServerAction<DeleteTag>,
-    pub reorder: ServerAction<ReorderTag>,
-    /// Tags moved/added to global *this session* with no prior global history — the
-    /// global→local "just added, moved straight back ⇒ no warning" exception.
-    pub just_global: RwSignal<HashSet<String>>,
+    /// Drag-drop reorder + section reassignment within a scope.
+    pub layout: ServerAction<SetScopeLayout>,
 }
 
 /// Combined version of every tag-collection mutation — Resources watch this to
 /// refetch `list_tags` / `book_tags` after any edit.
 fn tagger_rev(t: Tagger) -> usize {
     t.add.version().get()
+        + t.create.version().get()
         + t.scope.version().get()
         + t.interest.version().get()
         + t.rename.version().get()
         + t.del.version().get()
-        + t.reorder.version().get()
+        + t.layout.version().get()
 }
 
 /// Version of just the mutations that change *applications* (word_tags rows), so
@@ -626,7 +642,8 @@ fn migrate_user(u: &rusqlite::Connection) -> Result<(), ServerFnError> {
         }
     }
     for (name, decl) in [("scope", "TEXT NOT NULL DEFAULT 'book'"),
-                         ("interest", "TEXT NOT NULL DEFAULT 'interesting'")] {
+                         ("interest", "TEXT NOT NULL DEFAULT 'interesting'"),
+                         ("section", "TEXT NOT NULL DEFAULT ''")] {
         if !have.contains(name) {
             u.execute(&format!("ALTER TABLE tags ADD COLUMN {name} {decl}"), [])
                 .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -1690,7 +1707,7 @@ pub async fn collection_words(tag: Option<String>) -> Result<Vec<CollectionEntry
 pub async fn list_tags() -> Result<Vec<TagDef>, ServerFnError> {
     let conn = open_user()?;
     let mut stmt = conn
-        .prepare("SELECT name, comment, builtin, scope, interest, sort FROM tags ORDER BY sort, name")
+        .prepare("SELECT name, comment, builtin, scope, interest, sort, section FROM tags ORDER BY sort, name")
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     let out = stmt
         .query_map([], |r| {
@@ -1701,6 +1718,7 @@ pub async fn list_tags() -> Result<Vec<TagDef>, ServerFnError> {
                 scope: r.get(3)?,
                 interest: r.get(4)?,
                 sort: r.get(5)?,
+                section: r.get(6)?,
             })
         })
         .map_err(|e| ServerFnError::new(e.to_string()))?
@@ -1723,6 +1741,51 @@ pub async fn add_tag(name: String, comment: String) -> Result<String, ServerFnEr
         rusqlite::params![clean, comment_opt],
     )
     .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(clean)
+}
+
+/// Create a tag with an explicit scope + interest (the picker/manager adders).
+/// scope/interest apply only to a *brand-new* tag; re-adding an existing name only
+/// refreshes its comment. If the (resulting) tag is word-scoped, its applications
+/// are collapsed to the global '*' sentinel so create-then-apply is order-safe.
+#[server]
+pub async fn create_tag(name: String, comment: String, scope: String, interest: String) -> Result<String, ServerFnError> {
+    use rusqlite::OptionalExtension;
+    let clean = sanitize_tag(&name).ok_or_else(|| ServerFnError::new("invalid tag name"))?;
+    if !valid_scope(&scope) {
+        return Err(ServerFnError::new("invalid scope"));
+    }
+    if !valid_interest(&interest) {
+        return Err(ServerFnError::new("invalid interest level"));
+    }
+    let comment = comment.trim();
+    let comment_opt: Option<&str> = (!comment.is_empty()).then_some(comment);
+    let conn = open_user()?;
+    conn.execute(
+        "INSERT INTO tags(name, comment, builtin, sort, created, scope, interest)
+         VALUES (?1, ?2, 0, 100, datetime('now'), ?3, ?4)
+         ON CONFLICT(name) DO UPDATE SET comment = COALESCE(excluded.comment, tags.comment)",
+        rusqlite::params![clean, comment_opt, scope, interest],
+    )
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    // If this tag ends up word-scoped, collapse any book-keyed applications into the
+    // global '*' sentinel (mirrors set_tag_scope's book→word migration) so a racing
+    // set_tag that auto-registered it book-scoped can't leave the rows mis-keyed.
+    let actual: String = conn
+        .query_row("SELECT scope FROM tags WHERE name = ?1", [&clean], |r| r.get(0))
+        .optional()
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .unwrap_or_else(|| SCOPE_BOOK.to_string());
+    if actual == SCOPE_WORD {
+        conn.execute(
+            "INSERT OR IGNORE INTO word_tags(book_slug, word, tag, rater, ts)
+             SELECT '*', word, tag, rater, ts FROM word_tags WHERE tag = ?1 AND book_slug <> '*'",
+            [&clean],
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        conn.execute("DELETE FROM word_tags WHERE tag = ?1 AND book_slug <> '*'", [&clean])
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+    }
     Ok(clean)
 }
 
@@ -1852,35 +1915,24 @@ pub async fn set_tag_scope(name: String, scope: String, convert_book: i64) -> Re
     Ok(())
 }
 
-/// Move a tag one step up/down within its scope group (dense-renumbers the group).
+/// Apply a scope group's full drag-drop layout: `items` is the scope's tags in the
+/// new display order as (name, section). Renumbers `sort = index` and sets each
+/// tag's `section`, in one transaction. Expresses reorder AND section reassignment.
+/// Only rows actually in `scope` are touched (a stale name is ignored).
 #[server]
-pub async fn reorder_tag(name: String, up: bool) -> Result<(), ServerFnError> {
-    use rusqlite::OptionalExtension;
+pub async fn set_scope_layout(scope: String, items: Vec<(String, String)>) -> Result<(), ServerFnError> {
+    if !valid_scope(&scope) {
+        return Err(ServerFnError::new("invalid scope"));
+    }
     let mut conn = open_user()?;
-    let Some(scope) = conn
-        .query_row("SELECT scope FROM tags WHERE name = ?1", [&name], |r| r.get::<_, String>(0))
-        .optional()
-        .map_err(|e| ServerFnError::new(e.to_string()))?
-    else {
-        return Ok(());
-    };
-    let mut stmt = conn
-        .prepare("SELECT name FROM tags WHERE scope = ?1 ORDER BY sort, name")
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let mut names: Vec<String> = stmt
-        .query_map([&scope], |r| r.get::<_, String>(0))
-        .map_err(|e| ServerFnError::new(e.to_string()))?
-        .filter_map(Result::ok)
-        .collect();
-    drop(stmt); // release the borrow on conn before opening the transaction
-    let Some(i) = names.iter().position(|n| n == &name) else { return Ok(()) };
-    let j = if up { i.checked_sub(1) } else { (i + 1 < names.len()).then_some(i + 1) };
-    let Some(j) = j else { return Ok(()) }; // already at the edge
-    names.swap(i, j);
     let tx = conn.transaction().map_err(|e| ServerFnError::new(e.to_string()))?;
-    for (k, n) in names.iter().enumerate() {
-        tx.execute("UPDATE tags SET sort = ?1 WHERE name = ?2", rusqlite::params![k as i64, n])
-            .map_err(|e| ServerFnError::new(e.to_string()))?;
+    for (i, (name, section)) in items.iter().enumerate() {
+        let section = sanitize_section(section);
+        tx.execute(
+            "UPDATE tags SET sort = ?1, section = ?2 WHERE name = ?3 AND scope = ?4",
+            rusqlite::params![i as i64, section, name, scope],
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
     }
     tx.commit().map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(())
@@ -2424,10 +2476,126 @@ fn TagStrip(book_id: i64, members: Vec<i64>) -> impl IntoView {
     }
 }
 
-/// The tag picker: the user's tag collection split into two drag groups — "this
-/// book" (book-scoped, above) and "all books" (word-scoped, below) — coloured by
-/// interest, plus per-word "good for: <bucket>" picks and an inline new-tag adder.
-/// Dragging a chip between the groups changes that tag's scope.
+/// Where a dragged chip/row was dropped within its scope group.
+#[derive(Clone)]
+enum DropAt {
+    /// Immediately before this tag (adopting that tag's section).
+    Before(String),
+    /// Into this named section (appended to the section's run).
+    Section(String),
+    /// The end of the scope group (adopting the last tag's section).
+    End,
+}
+
+/// A scope's tags (incl. ★) as (name, section) in current display order.
+fn scope_layout(tags: &[TagDef], is_word: bool) -> Vec<(String, String)> {
+    tags.iter()
+        .filter(|d| (d.scope == SCOPE_WORD) == is_word)
+        .map(|d| (d.name.clone(), d.section.clone()))
+        .collect()
+}
+
+/// Fold a scope's ordered tags into contiguous (section, tags) runs. A run's
+/// heading is its section label ('' = ungrouped, rendered without a heading).
+fn section_runs(tags: Vec<TagDef>) -> Vec<(String, Vec<TagDef>)> {
+    let mut out: Vec<(String, Vec<TagDef>)> = Vec::new();
+    for d in tags {
+        match out.last_mut() {
+            Some((s, items)) if *s == d.section => items.push(d),
+            _ => out.push((d.section.clone(), vec![d])),
+        }
+    }
+    out
+}
+
+/// New (name, section) order for a scope after dropping `dragged` at `drop`. The
+/// dragged tag adopts the section of wherever it lands, keeping section runs contiguous.
+fn compute_reorder(mut list: Vec<(String, String)>, dragged: &str, drop: DropAt) -> Vec<(String, String)> {
+    let Some(pos) = list.iter().position(|(n, _)| n == dragged) else { return list };
+    let (dname, _) = list.remove(pos);
+    let (idx, sect) = match drop {
+        DropAt::Before(t) => {
+            let p = list.iter().position(|(n, _)| n == &t).unwrap_or(list.len());
+            let s = list.get(p).map(|(_, s)| s.clone()).unwrap_or_default();
+            (p, s)
+        }
+        DropAt::Section(s) => match list.iter().rposition(|(_, sc)| sc == &s) {
+            Some(p) => (p + 1, s),
+            None => (list.len(), s),
+        },
+        DropAt::End => (list.len(), list.last().map(|(_, s)| s.clone()).unwrap_or_default()),
+    };
+    list.insert(idx, (dname, sect));
+    list
+}
+
+/// Apply a drag-drop within a scope: optimistically reorder `tags` + set the
+/// dragged tag's section, then persist via `set_scope_layout`. Cross-scope drops
+/// are ignored (scope changes only happen on the manage page). Shared by the
+/// picker and the manage page (each passes its own tags signal + layout action).
+fn do_drop(
+    tags: RwSignal<Vec<TagDef>>,
+    layout: ServerAction<SetScopeLayout>,
+    is_word: bool,
+    dragged: String,
+    drop: DropAt,
+) {
+    let same = tags.with(|v| {
+        v.iter().find(|d| d.name == dragged).map(|d| (d.scope == SCOPE_WORD) == is_word).unwrap_or(false)
+    });
+    if !same {
+        return;
+    }
+    let list = tags.with(|v| scope_layout(v, is_word));
+    let new_list = compute_reorder(list, &dragged, drop);
+    // optimistic: reorder this scope's slots in the vector + apply new sections.
+    tags.update(|v| {
+        let sect: HashMap<String, String> = new_list.iter().cloned().collect();
+        for d in v.iter_mut() {
+            if let Some(s) = sect.get(&d.name) {
+                d.section = s.clone();
+            }
+        }
+        let slots: Vec<usize> = v.iter().enumerate()
+            .filter(|(_, d)| (d.scope == SCOPE_WORD) == is_word).map(|(i, _)| i).collect();
+        let byname: HashMap<String, TagDef> =
+            slots.iter().map(|&i| (v[i].name.clone(), v[i].clone())).collect();
+        for (&slot, (name, _)) in slots.iter().zip(new_list.iter()) {
+            if let Some(td) = byname.get(name) {
+                v[slot] = td.clone();
+            }
+        }
+    });
+    let scope = if is_word { SCOPE_WORD } else { SCOPE_BOOK };
+    layout.dispatch(SetScopeLayout { scope: scope.into(), items: new_list });
+}
+
+/// Reassign a tag's section without changing order (the per-row section input on
+/// the manage page): patch the tag in `tags` optimistically, then persist the
+/// scope's whole layout so the new section sticks.
+fn set_section(
+    tags: RwSignal<Vec<TagDef>>,
+    layout: ServerAction<SetScopeLayout>,
+    name: String,
+    is_word: bool,
+    section: String,
+) {
+    let section = sanitize_section(&section);
+    tags.update(|v| {
+        if let Some(d) = v.iter_mut().find(|d| d.name == name) {
+            d.section = section.clone();
+        }
+    });
+    let items = tags.with(|v| scope_layout(v, is_word));
+    let scope = if is_word { SCOPE_WORD } else { SCOPE_BOOK };
+    layout.dispatch(SetScopeLayout { scope: scope.into(), items });
+}
+
+/// The tag picker: the user's collection split into "this book" (book-scoped) and
+/// "all books" (word-scoped) groups, each divided into custom section subheadings.
+/// Tap a chip to apply/remove; drag a chip to reorder it or drop it under another
+/// subheading to reassign it. Scope is chosen when creating a tag and only changed
+/// on the manage page. Plus per-word "good for: <bucket>" picks and a new-tag adder.
 #[component]
 fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView {
     let t = expect_context::<Tagger>();
@@ -2435,10 +2603,33 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
     let has_buckets = !buckets.is_empty();
     let new_name = RwSignal::new(String::new());
     let new_comment = RwSignal::new(String::new());
+    let new_word = RwSignal::new(false); // scope: false = this book, true = all books
+    let new_interest = RwSignal::new("interesting".to_string());
+    let drag = RwSignal::new(None::<String>);
+
     let add_new = move || {
         let raw = new_name.get();
         let Some(clean) = sanitize_tag(&raw) else { return };
-        t.add.dispatch(AddTag { name: raw, comment: new_comment.get() });
+        let scope = if new_word.get() { SCOPE_WORD } else { SCOPE_BOOK };
+        let interest = new_interest.get();
+        let comment = new_comment.get();
+        t.create.dispatch(CreateTag {
+            name: raw, comment: comment.clone(), scope: scope.into(), interest: interest.clone(),
+        });
+        // optimistically register it so the chip appears in the right group immediately.
+        t.tags.update(|v| {
+            if !v.iter().any(|d| d.name == clean) {
+                v.push(TagDef {
+                    name: clean.clone(),
+                    comment: (!comment.trim().is_empty()).then(|| comment.clone()),
+                    builtin: false,
+                    scope: scope.into(),
+                    interest,
+                    sort: 999,
+                    section: String::new(),
+                });
+            }
+        });
         if !has_tag(t, key, &clean) {
             toggle_tag(t, book_id, word_id, &clean);
         }
@@ -2446,87 +2637,67 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
         new_comment.set(String::new());
     };
 
-    // Change a dragged tag's scope per the local↔global rules.
-    let move_scope = move |name: String, to_word: bool| {
-        let cur_word = t.tags
-            .with(|v| v.iter().find(|d| d.name == name).map(|d| d.scope == SCOPE_WORD))
-            .unwrap_or(false);
-        if cur_word == to_word {
-            return;
-        }
-        if to_word {
-            // local→global: non-destructive collapse; remember it's freshly global.
-            t.just_global.update(|s| { s.insert(name.clone()); });
-            t.tags.update(|v| { if let Some(d) = v.iter_mut().find(|d| d.name == name) { d.scope = SCOPE_WORD.into(); } });
-            t.scope.dispatch(SetTagScope { name, scope: SCOPE_WORD.into(), convert_book: 0 });
-        } else {
-            // global→local: warn before dropping established global applications,
-            // unless this tag was just added to global (then re-home to this book).
-            let just = t.just_global.with(|s| s.contains(&name));
-            leptos::task::spawn_local(async move {
-                let n = tag_global_usage(name.clone()).await.unwrap_or(0);
-                let (proceed, convert) = if n == 0 {
-                    (true, 0i64)
-                } else if just {
-                    (true, book_id)
-                } else {
-                    let msg = format!(
-                        "'{name}' is applied to {n} word(s) across all books.\nMake it book-only? This drops those applications.");
-                    let ok = web_sys::window().and_then(|w| w.confirm_with_message(&msg).ok()).unwrap_or(false);
-                    (ok, 0i64)
-                };
-                if proceed {
-                    t.just_global.update(|s| { s.remove(&name); });
-                    t.tags.update(|v| { if let Some(d) = v.iter_mut().find(|d| d.name == name) { d.scope = SCOPE_BOOK.into(); } });
-                    t.scope.dispatch(SetTagScope { name, scope: SCOPE_BOOK.into(), convert_book: convert });
-                }
-            });
-        }
-    };
-
-    // Reactive chips for one scope group (book or word), minus the ★ quick-tag.
-    // Each chip is a toggle (apply/remove) plus a small ⇄ button that moves the tag
-    // to the *other* scope — the touch-friendly replacement for the old drag-drop.
-    let chips = move |is_word: bool| {
-        t.tags.get().into_iter()
-            .filter(move |d| d.name != "star" && (d.scope == SCOPE_WORD) == is_word)
-            .map(|d| {
-                let name = d.name.clone();
-                let on_name = name.clone();
-                let btn_name = name.clone();
-                let click_name = name.clone();
-                let move_name = name.clone();
-                let title = d.comment.clone().unwrap_or_default();
-                let cls = format!("chip int-{}", d.interest);
-                // book group → move to word scope; word group → move to book scope.
-                let to_word = !is_word;
-                let move_title = if to_word { "make this tag apply to this word in all books" } else { "make this tag apply to this book only" };
-                view! {
-                    <span class="chipwrap" class:on=move || has_tag(t, key, &on_name)>
-                        <button type="button" class=cls title=title
-                            class:on=move || has_tag(t, key, &btn_name)
+    // One scope group (book or word): section subheadings + draggable, tappable chips.
+    let group_view = move |is_word: bool| {
+        let scoped: Vec<TagDef> = t.tags.get().into_iter()
+            .filter(|d| d.name != "star" && (d.scope == SCOPE_WORD) == is_word)
+            .collect();
+        section_runs(scoped).into_iter().map(move |(section, items)| {
+            let has_heading = !section.is_empty();
+            let head_sect = section.clone();
+            view! {
+                {has_heading.then(|| {
+                    let s = head_sect.clone();
+                    let lbl = head_sect.clone();
+                    view! {
+                        <div class="tagsection"
+                            on:dragover=move |ev: web_sys::DragEvent| ev.prevent_default()
+                            on:drop=move |ev: web_sys::DragEvent| { ev.prevent_default();
+                                if let Some(d) = drag.get() { drag.set(None); do_drop(t.tags, t.layout, is_word, d, DropAt::Section(s.clone())); } }>
+                            {lbl}
+                        </div>
+                    }
+                })}
+                {items.into_iter().map(|d| {
+                    let name = d.name.clone();
+                    let on_name = name.clone();
+                    let click_name = name.clone();
+                    let drag_name = name.clone();
+                    let drop_name = name.clone();
+                    let title = d.comment.clone().unwrap_or_default();
+                    let cls = format!("chip int-{}", d.interest);
+                    view! {
+                        <button type="button" class=cls title=title draggable="true"
+                            class:on=move || has_tag(t, key, &on_name)
+                            on:dragstart=move |ev: web_sys::DragEvent| { drag.set(Some(drag_name.clone()));
+                                if let Some(dt) = ev.data_transfer() { let _ = dt.set_data("text/plain", &drag_name); } }
+                            on:dragover=move |ev: web_sys::DragEvent| ev.prevent_default()
+                            on:drop=move |ev: web_sys::DragEvent| { ev.prevent_default();
+                                if let Some(dd) = drag.get() { drag.set(None);
+                                    if dd != drop_name { do_drop(t.tags, t.layout, is_word, dd, DropAt::Before(drop_name.clone())); } } }
                             on:click=move |_| toggle_tag(t, book_id, word_id, &click_name)>
                             {name}
                         </button>
-                        <button type="button" class="chipmove" title=move_title
-                            on:click=move |_| move_scope(move_name.clone(), to_word)>"⇄"</button>
-                    </span>
-                }
-            })
-            .collect_view()
+                    }
+                }).collect_view()}
+            }
+        }).collect_view()
+    };
+    // Drop onto empty space at the end of a scope group → move to the end.
+    let drop_end = move |is_word: bool| move |ev: web_sys::DragEvent| {
+        ev.prevent_default();
+        if let Some(d) = drag.get() { drag.set(None); do_drop(t.tags, t.layout, is_word, d, DropAt::End); }
     };
 
     view! {
         <div class="picker tagpick">
-            <div class="scopegrp">
+            <div class="scopegrp" on:dragover=move |ev| ev.prevent_default() on:drop=drop_end(false)>
                 <span class="picklbl">"this book"</span>
-                {move || chips(false)}
+                {move || group_view(false)}
             </div>
-            <div class="scopegrp global">
-                <span class="picklbl" title="word-scoped: applies to this word in every book">
-                    "all books "<span class="draghint" title="use ⇄ on a tag to move it between scopes">"(⇄ to move)"</span>
-                </span>
-                {move || chips(true)}
+            <div class="scopegrp global" on:dragover=move |ev| ev.prevent_default() on:drop=drop_end(true)>
+                <span class="picklbl" title="word-scoped: applies to this word in every book">"all books"</span>
+                {move || group_view(true)}
             </div>
             {has_buckets.then(|| view! {
                 <div class="pickgroup">
@@ -2552,6 +2723,17 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                     prop:value=move || new_comment.get()
                     on:input=move |ev| new_comment.set(event_target_value(&ev))
                     on:keydown=move |ev| if ev.key() == "Enter" { add_new(); }/>
+                <select class="newtag-sel" title="scope" prop:value=move || if new_word.get() { "word" } else { "book" }
+                    on:change=move |ev| new_word.set(event_target_value(&ev) == "word")>
+                    <option value="book">"this book"</option>
+                    <option value="word">"all books"</option>
+                </select>
+                <select class="newtag-sel" title="interest" prop:value=move || new_interest.get()
+                    on:change=move |ev| new_interest.set(event_target_value(&ev))>
+                    <option value="interesting">"favourite"</option>
+                    <option value="neutral">"note"</option>
+                    <option value="uninteresting">"negative"</option>
+                </select>
                 <button type="button" class="chip add" on:click=move |_| add_new()>"add"</button>
                 <a class="managelink" href=format!("{}/tags", base_path())>"manage ↗"</a>
             </div>
@@ -2623,12 +2805,12 @@ fn HomePage() -> impl IntoView {
         action: ServerAction::<SetTag>::new(),
         tags: RwSignal::new(Vec::new()),
         add: ServerAction::<AddTag>::new(),
+        create: ServerAction::<CreateTag>::new(),
         scope: ServerAction::<SetTagScope>::new(),
         interest: ServerAction::<SetTagInterest>::new(),
         rename: ServerAction::<RenameTag>::new(),
         del: ServerAction::<DeleteTag>::new(),
-        reorder: ServerAction::<ReorderTag>::new(),
-        just_global: RwSignal::new(HashSet::new()),
+        layout: ServerAction::<SetScopeLayout>::new(),
     };
     provide_context(tagger);
 
@@ -2994,15 +3176,18 @@ fn HomePage() -> impl IntoView {
 
 // ---- tag editor (/tags) ----
 
-/// One editable row in the tag manager: reorder, rename, comment, scope, interest, delete.
+/// One editable row in the tag manager: drag to reorder, rename, comment, section,
+/// scope, interest, delete. `all`/`layout` back the drag-reorder + section edits.
 #[component]
 fn TagRow(
     d: TagDef,
+    all: RwSignal<Vec<TagDef>>,
+    layout: ServerAction<SetScopeLayout>,
+    drag: RwSignal<Option<String>>,
     rename: ServerAction<RenameTag>,
     del: ServerAction<DeleteTag>,
     interest: ServerAction<SetTagInterest>,
     scope: ServerAction<SetTagScope>,
-    reorder: ServerAction<ReorderTag>,
     comment_act: ServerAction<AddTag>,
 ) -> impl IntoView {
     let name = d.name.clone();
@@ -3011,8 +3196,9 @@ fn TagRow(
     let cur_interest = d.interest.clone();
     let int_cls = d.interest.clone();
     let comment = d.comment.clone().unwrap_or_default();
-    let (n_up, n_down, n_ren, n_com, n_int, n_scope, n_del) = (
-        name.clone(), name.clone(), name.clone(), name.clone(), name.clone(), name.clone(), name.clone(),
+    let section = d.section.clone();
+    let (n_ren, n_com, n_int, n_scope, n_del, n_sec, n_drag, n_drop) = (
+        name.clone(), name.clone(), name.clone(), name.clone(), name.clone(), name.clone(), name.clone(), name.clone(),
     );
 
     let toggle_scope = move |_| {
@@ -3044,11 +3230,14 @@ fn TagRow(
     };
 
     view! {
-        <tr class=format!("tagrow int-{int_cls}")>
-            <td class="reorder">
-                <button class="mini" title="move up" on:click=move |_| { reorder.dispatch(ReorderTag { name: n_up.clone(), up: true }); }>"↑"</button>
-                <button class="mini" title="move down" on:click=move |_| { reorder.dispatch(ReorderTag { name: n_down.clone(), up: false }); }>"↓"</button>
-            </td>
+        <tr class=format!("tagrow int-{int_cls}") draggable="true"
+            on:dragstart=move |ev: web_sys::DragEvent| { drag.set(Some(n_drag.clone()));
+                if let Some(dt) = ev.data_transfer() { let _ = dt.set_data("text/plain", &n_drag); } }
+            on:dragover=move |ev: web_sys::DragEvent| ev.prevent_default()
+            on:drop=move |ev: web_sys::DragEvent| { ev.prevent_default();
+                if let Some(dd) = drag.get() { drag.set(None);
+                    if dd != n_drop { do_drop(all, layout, is_word, dd, DropAt::Before(n_drop.clone())); } } }>
+            <td class="grip" title="drag to reorder">"⠿"</td>
             <td>
                 {if locked {
                     view! { <span class="tagname locked" title="the quick ★ tag can't be renamed or deleted">{name.clone()}" ★"</span> }.into_any()
@@ -3061,6 +3250,11 @@ fn TagRow(
             <td>
                 <input class="tagcomment" prop:value=comment placeholder="what it's for"
                     on:change=move |ev| { comment_act.dispatch(AddTag { name: n_com.clone(), comment: event_target_value(&ev) }); }/>
+            </td>
+            <td>
+                <input class="tagsectionin" list="tagsections" placeholder="—" prop:value=section
+                    title="subheading within this scope (type a new name to create a section)"
+                    on:change=move |ev| set_section(all, layout, n_sec.clone(), is_word, event_target_value(&ev))/>
             </td>
             <td>
                 <button class="scopebtn" class:global=is_word title="toggle book / word scope" on:click=toggle_scope>
@@ -3082,58 +3276,121 @@ fn TagRow(
     }
 }
 
-/// The tag manager page: rename / delete / reorder / re-scope / set interest, grouped
-/// into book-scoped and word-scoped tags.
+/// The tag manager page: drag to reorder / assign sections, rename, comment,
+/// re-scope, set interest, delete — grouped into book-scoped and word-scoped tags,
+/// each subdivided by the user's custom sections.
 #[component]
 fn TagsPage() -> impl IntoView {
     let add = ServerAction::<AddTag>::new();
+    let create = ServerAction::<CreateTag>::new();
     let rename = ServerAction::<RenameTag>::new();
     let del = ServerAction::<DeleteTag>::new();
     let interest = ServerAction::<SetTagInterest>::new();
     let scope = ServerAction::<SetTagScope>::new();
-    let reorder = ServerAction::<ReorderTag>::new();
+    let layout = ServerAction::<SetScopeLayout>::new();
     let rev = move || {
-        add.version().get() + rename.version().get() + del.version().get()
-            + interest.version().get() + scope.version().get() + reorder.version().get()
+        add.version().get() + create.version().get() + rename.version().get() + del.version().get()
+            + interest.version().get() + scope.version().get() + layout.version().get()
     };
     let tags = Resource::new(rev, |_| list_tags());
+    // Mirror the fetched collection into a signal we can reorder optimistically.
+    let all = RwSignal::new(Vec::<TagDef>::new());
+    Effect::new(move |_| {
+        if let Some(Ok(list)) = tags.get() {
+            all.set(list);
+        }
+    });
+    let drag = RwSignal::new(None::<String>);
+
     let new_name = RwSignal::new(String::new());
     let new_comment = RwSignal::new(String::new());
+    let new_word = RwSignal::new(false);
+    let new_interest = RwSignal::new("interesting".to_string());
     let add_new = move || {
         let raw = new_name.get();
-        if sanitize_tag(&raw).is_some() {
-            add.dispatch(AddTag { name: raw, comment: new_comment.get() });
-            new_name.set(String::new());
-            new_comment.set(String::new());
-        }
+        let Some(clean) = sanitize_tag(&raw) else { return };
+        let scope_s = if new_word.get() { SCOPE_WORD } else { SCOPE_BOOK };
+        let interest_s = new_interest.get();
+        let comment = new_comment.get();
+        create.dispatch(CreateTag {
+            name: raw, comment: comment.clone(), scope: scope_s.into(), interest: interest_s.clone(),
+        });
+        all.update(|v| {
+            if !v.iter().any(|d| d.name == clean) {
+                v.push(TagDef {
+                    name: clean.clone(),
+                    comment: (!comment.trim().is_empty()).then(|| comment.clone()),
+                    builtin: false,
+                    scope: scope_s.into(),
+                    interest: interest_s,
+                    sort: 999,
+                    section: String::new(),
+                });
+            }
+        });
+        new_name.set(String::new());
+        new_comment.set(String::new());
     };
 
-    let group = move |d: TagDef| view! {
-        <TagRow d=d rename=rename del=del interest=interest scope=scope reorder=reorder comment_act=add/>
+    // Rows for one scope: section subheading rows (drop targets) + draggable tag rows.
+    let scope_rows = move |is_word: bool| {
+        let scoped: Vec<TagDef> = all.get().into_iter().filter(|d| (d.scope == SCOPE_WORD) == is_word).collect();
+        section_runs(scoped).into_iter().map(move |(section, items)| {
+            let has_heading = !section.is_empty();
+            let s = section.clone();
+            view! {
+                {has_heading.then(|| { let s2 = s.clone(); let lbl = s.clone(); view! {
+                    <tr class="sectionhdr"
+                        on:dragover=move |ev: web_sys::DragEvent| ev.prevent_default()
+                        on:drop=move |ev: web_sys::DragEvent| { ev.prevent_default();
+                            if let Some(dd) = drag.get() { drag.set(None); do_drop(all, layout, is_word, dd, DropAt::Section(s2.clone())); } }>
+                        <td></td><td colspan="6">{lbl}</td>
+                    </tr>
+                } })}
+                {items.into_iter().map(|d| view! {
+                    <TagRow d=d all=all layout=layout drag=drag rename=rename del=del interest=interest scope=scope comment_act=add/>
+                }).collect_view()}
+            }
+        }).collect_view()
     };
+    let drop_end = move |is_word: bool| move |ev: web_sys::DragEvent| {
+        ev.prevent_default();
+        if let Some(dd) = drag.get() { drag.set(None); do_drop(all, layout, is_word, dd, DropAt::End); }
+    };
+
     view! {
         <h1>"tags"</h1>
-        <p class="sub">"interesting tags favourite a word; uninteresting tags mark it as junk (hideable)."</p>
+        <p class="sub">"drag rows to reorder or drop under a subheading to file them there. Interesting tags favourite a word; uninteresting tags mark it as junk (hideable)."</p>
+        <datalist id="tagsections">
+            {move || {
+                let mut secs: Vec<String> = all.get().into_iter().map(|d| d.section).filter(|s| !s.is_empty()).collect();
+                secs.sort(); secs.dedup();
+                secs.into_iter().map(|s| view! { <option value=s></option> }).collect_view()
+            }}
+        </datalist>
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
             {move || tags.get().map(|res| match res {
                 Err(e) => view! { <p class="err">{format!("{e}")}</p> }.into_any(),
-                Ok(list) => {
-                    let (bk, wd): (Vec<_>, Vec<_>) = list.into_iter().partition(|d| d.scope != SCOPE_WORD);
-                    view! {
-                        <table class="tagtable">
-                            <thead><tr>
-                                <th></th><th>"tag"</th><th>"comment / what it's for"</th>
-                                <th>"scope"</th><th>"interest"</th><th></th>
-                            </tr></thead>
-                            <tbody>
-                                <tr class="grouphdr"><td colspan="6">"book tags — a word in one book"</td></tr>
-                                {bk.into_iter().map(group).collect_view()}
-                                <tr class="grouphdr"><td colspan="6">"word tags — a word across all books"</td></tr>
-                                {wd.into_iter().map(group).collect_view()}
-                            </tbody>
-                        </table>
-                    }.into_any()
-                }
+                Ok(_) => view! {
+                    <table class="tagtable">
+                        <thead><tr>
+                            <th></th><th>"tag"</th><th>"comment / what it's for"</th>
+                            <th>"section"</th><th>"scope"</th><th>"interest"</th><th></th>
+                        </tr></thead>
+                        <tbody>
+                            <tr class="grouphdr"><td colspan="7">"book tags — a word in one book"</td></tr>
+                            {move || scope_rows(false)}
+                            <tr class="dropend" on:dragover=move |ev| ev.prevent_default() on:drop=drop_end(false)>
+                                <td colspan="7">"drop here → end of book tags"</td>
+                            </tr>
+                            <tr class="grouphdr"><td colspan="7">"word tags — a word across all books"</td></tr>
+                            {move || scope_rows(true)}
+                            <tr class="dropend" on:dragover=move |ev| ev.prevent_default() on:drop=drop_end(true)>
+                                <td colspan="7">"drop here → end of word tags"</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                }.into_any(),
             })}
         </Suspense>
         <div class="pickgroup newtag tagsadd">
@@ -3143,6 +3400,17 @@ fn TagsPage() -> impl IntoView {
             <input class="newtag-comment" placeholder="what it's for (optional)" prop:value=move || new_comment.get()
                 on:input=move |ev| new_comment.set(event_target_value(&ev))
                 on:keydown=move |ev| if ev.key() == "Enter" { add_new(); }/>
+            <select class="newtag-sel" title="scope" prop:value=move || if new_word.get() { "word" } else { "book" }
+                on:change=move |ev| new_word.set(event_target_value(&ev) == "word")>
+                <option value="book">"this book"</option>
+                <option value="word">"all books"</option>
+            </select>
+            <select class="newtag-sel" title="interest" prop:value=move || new_interest.get()
+                on:change=move |ev| new_interest.set(event_target_value(&ev))>
+                <option value="interesting">"favourite"</option>
+                <option value="neutral">"note"</option>
+                <option value="uninteresting">"negative"</option>
+            </select>
             <button class="chip add" on:click=move |_| add_new()>"add tag"</button>
         </div>
     }

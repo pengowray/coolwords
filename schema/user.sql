@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS tags (
     sort     INTEGER NOT NULL DEFAULT 100,
     created  TEXT,
     scope    TEXT NOT NULL DEFAULT 'book',
-    interest TEXT NOT NULL DEFAULT 'interesting'
+    interest TEXT NOT NULL DEFAULT 'interesting',
+    section  TEXT NOT NULL DEFAULT ''         -- user subheading within a scope ('' = ungrouped)
 );
 
 -- Tag applications. No foreign keys into the dictionary — fully self-contained.

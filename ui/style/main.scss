@@ -131,14 +131,20 @@ h1 { margin-bottom: 0; }
 .chip:hover { border-color: #888; }
 .chip.on { background: #3498db; color: #fff; border-color: #3498db; }
 .chip.pick.on { background: #16a085; border-color: #16a085; }
-/* a chip + its ⇄ scope-move button share a rounded pill */
-.chipwrap { display: inline-flex; align-items: stretch; }
-.chipwrap .chip { border-top-right-radius: 0; border-bottom-right-radius: 0; }
-.chipmove {
-  border: 1px solid #8884; border-left: none; background: transparent; cursor: pointer;
-  color: #aaa; font-size: 0.82rem; padding: 0 0.4rem; border-radius: 0 12px 12px 0; line-height: 1;
+/* chips are draggable to reorder / refile */
+.chip[draggable="true"] { cursor: grab; }
+.chip[draggable="true"]:active { cursor: grabbing; }
+/* section subheadings inside a scope group */
+.tagsection {
+  flex-basis: 100%; margin: 0.3rem 0 0.1rem; font-size: 0.7rem; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.04em; color: #999;
+  border-bottom: 1px dashed #8883; padding-bottom: 0.1rem;
 }
-.chipmove:hover { color: #16a085; border-color: #888; }
+/* scope + interest selects on the new-tag form */
+.newtag-sel {
+  font-size: 0.82rem; padding: 0.25rem 0.35rem; border: 1px solid #8884;
+  border-radius: 8px; background: Canvas; color: inherit;
+}
 .pickgroup.newtag { gap: 5px; margin-top: 6px; border-top: 1px solid #8883; padding-top: 6px; }
 .newtag input {
   font-size: 0.85rem; padding: 0.3rem 0.5rem; border: 1px solid #8884; border-radius: 8px;
@@ -375,19 +381,26 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
 .tagrow.int-interesting { border-left-color: #16a085; }
 .tagrow.int-neutral { border-left-color: #7f8c8d; }
 .tagrow.int-uninteresting { border-left-color: #c0392b; }
-.tagrow .reorder { white-space: nowrap; }
-.mini {
-  border: 1px solid #8884; background: transparent; border-radius: 4px;
-  cursor: pointer; color: #888; padding: 0 0.35rem; line-height: 1.3; font-size: 0.85rem;
+.tagrow[draggable="true"] { cursor: grab; }
+.tagrow[draggable="true"]:active { cursor: grabbing; }
+.tagtable .grip { color: #bbb; cursor: grab; user-select: none; text-align: center; width: 1.4rem; }
+/* section subheading row within a scope, and the end-of-scope drop target */
+.tagtable .sectionhdr td {
+  font-size: 0.72rem; font-weight: 700; color: #16a085; letter-spacing: 0.03em;
+  padding-top: 0.4rem; border-bottom: 1px dashed #16a08544;
 }
-.mini:hover { border-color: #888; color: inherit; }
-.tagname, .tagcomment {
+.tagtable .dropend td {
+  font-size: 0.72rem; color: #aaa; font-style: italic; text-align: center;
+  padding: 0.3rem; border: 1px dashed #8883;
+}
+.tagname, .tagcomment, .tagsectionin {
   font-size: 0.9rem; padding: 2px 6px; border: 1px solid #8884; border-radius: 6px;
   background: Canvas; color: inherit;
 }
 .tagname { width: 9rem; font-weight: 600; }
 .tagname.locked { border: none; background: transparent; }
-.tagcomment { width: 16rem; max-width: 100%; color: #888; font-weight: 400; }
+.tagcomment { width: 14rem; max-width: 100%; color: #888; font-weight: 400; }
+.tagsectionin { width: 8rem; max-width: 100%; color: #777; }
 .scopebtn {
   border: 1px solid #8884; background: transparent; border-radius: 10px;
   padding: 1px 0.6rem; cursor: pointer; color: #888; font-size: 0.78rem; white-space: nowrap;
