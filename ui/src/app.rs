@@ -3868,6 +3868,8 @@ fn HomePage() -> impl IntoView {
     });
     let only_top = RwSignal::new(false);
     let hide_rejected = RwSignal::new(false);
+    // Plain-text mode: swap the word cards for a copy-pasteable list of words (as on the verbarium).
+    let show_list = RwSignal::new(false);
     let open_picker = RwSignal::new(None::<i64>);
 
     let tagger = Tagger {
@@ -4020,6 +4022,9 @@ fn HomePage() -> impl IntoView {
                     on:change=move |_| hide_rejected.update(|v| *v = !*v)/>
                 " hide rejected"
             </label>
+            <button class="descbtn" class:on=move || show_list.get()
+                title="show a plain-text list of the words shown, for copy/paste"
+                on:click=move |_| show_list.update(|v| *v = !*v)>"▤ plain list"</button>
         </div>
 
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
@@ -4030,6 +4035,19 @@ fn HomePage() -> impl IntoView {
                     let top = only_top.get();
                     let list: Vec<Candidate> = all.into_iter().filter(|c| !top || c.selected).collect();
                     let total = list.len();
+                    // Plain-text mode: one word per line (in the shown order), with a copy button.
+                    if show_list.get() {
+                        let text = list.iter().map(|c| c.word.clone()).collect::<Vec<_>>().join("\n");
+                        let text_copy = text.clone();
+                        let rows = total.clamp(3, 24) as i32;
+                        return view! {
+                            <p class="counts">{format!("{total} shown")}
+                                <button class="listcopy" title="copy the list to the clipboard"
+                                    on:click=move |_| copy_to_clipboard(&text_copy)>"copy"</button>
+                            </p>
+                            <textarea class="plainlist" readonly=true rows=rows prop:value=text></textarea>
+                        }.into_any();
+                    }
                     view! {
                         <p class="counts">{format!("{total} shown")}</p>
                         <div class="wlist">
