@@ -3108,6 +3108,9 @@ fn apply_layout(
     is_word: bool,
     new_list: Vec<(String, String)>,
 ) {
+    // Fold any fragmented runs of the same named section back together first, so a
+    // drag / refile / relabel can never leave two headings with the same name.
+    let new_list = consolidate_sections(new_list);
     tags.update(|v| {
         let sect: HashMap<String, String> = new_list.iter().cloned().collect();
         for d in v.iter_mut() {
@@ -3127,6 +3130,35 @@ fn apply_layout(
     });
     let scope = if is_word { SCOPE_WORD } else { SCOPE_BOOK };
     layout.dispatch(SetScopeLayout { scope: scope.into(), items: new_list });
+}
+
+/// Pull every named section's tags into a single contiguous run (at the position of
+/// that section's first appearance), so `section_runs` renders exactly one heading
+/// per section name. Ungrouped ('') tags render no heading, so they're left in place.
+/// A no-op when sections are already contiguous. Guards drag / refile / relabel from
+/// ever producing duplicate section headings.
+fn consolidate_sections(list: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(list.len());
+    // Index of the last item of each named section's run in `out`, so a later,
+    // detached item of the same section can be spliced onto the end of that run.
+    let mut last_idx: HashMap<String, usize> = HashMap::new();
+    for (name, sect) in list {
+        if sect.is_empty() {
+            out.push((name, sect));
+        } else if let Some(&i) = last_idx.get(&sect) {
+            out.insert(i + 1, (name, sect.clone()));
+            for v in last_idx.values_mut() {
+                if *v >= i + 1 {
+                    *v += 1;
+                }
+            }
+            last_idx.insert(sect, i + 1);
+        } else {
+            out.push((name, sect.clone()));
+            last_idx.insert(sect, out.len() - 1);
+        }
+    }
+    out
 }
 
 /// Interest ordering for the "by interest" sort: interesting < neutral < uninteresting.
@@ -3166,6 +3198,29 @@ fn sort_scope(
             items.into_iter().map(move |d| (d.name, s.clone()))
         })
         .collect();
+    apply_layout(tags, layout, is_word, new_list);
+}
+
+/// Full canonical sort for a scope — the general-use "section" button. Regroups the
+/// whole scope: sections ordered alphabetically (ungrouped tags first, under no
+/// heading), and within each section by interest then A→Z. `star` is pinned to the
+/// very front. Also collapses any fragmented/duplicate section runs into one.
+fn sort_scope_sectioned(
+    tags: RwSignal<Vec<TagDef>>,
+    layout: ServerAction<SetScopeLayout>,
+    is_word: bool,
+) {
+    let mut scoped: Vec<TagDef> = tags.with(|v| {
+        v.iter().filter(|d| (d.scope == SCOPE_WORD) == is_word).cloned().collect()
+    });
+    scoped.sort_by(|a, b| {
+        let star = (b.name == "star").cmp(&(a.name == "star"));
+        star
+            .then_with(|| a.section.cmp(&b.section))
+            .then_with(|| interest_rank(&a.interest).cmp(&interest_rank(&b.interest)))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let new_list: Vec<(String, String)> = scoped.into_iter().map(|d| (d.name, d.section)).collect();
     apply_layout(tags, layout, is_word, new_list);
 }
 
@@ -4277,6 +4332,7 @@ fn TagRow(
                 on:pointerdown=down on:pointermove=mv on:pointerup=up
                 on:pointercancel=move |_| ds.reset()>"⠿"</td>
             <td>
+              <div class="namecell">
                 <button class="favpin" class:on=move || fav_sig.get()
                     title=move || if fav_sig.get() { "pinned in the verbarium — click to unpin" } else { "pin this tag for quick access in the verbarium" }
                     on:click=move |_| {
@@ -4311,6 +4367,7 @@ fn TagRow(
                                 }
                             } }/> }.into_any()
                 }}
+              </div>
             </td>
             <td>
                 <input class="tagcomment" prop:value=comment placeholder="what it's for"
@@ -4515,6 +4572,8 @@ fn TagsPage() -> impl IntoView {
     // Sort controls for one scope — sort within each section run, persisted as a layout.
     let sort_btns = move |is_word: bool| view! {
         <span class="sortbtns">
+            <button type="button" class="sortbtn primary" title="regroup by section, then interest, then A→Z (the usual tidy-up)"
+                on:click=move |_| sort_scope_sectioned(all, layout, is_word)>"section"</button>
             <button type="button" class="sortbtn" title="sort each section A→Z"
                 on:click=move |_| sort_scope(all, layout, is_word, false)>"A–Z"</button>
             <button type="button" class="sortbtn" title="sort each section by interest, then A→Z"

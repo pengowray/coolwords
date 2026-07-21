@@ -467,6 +467,11 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
   padding: 0.05rem 0.4rem; font-size: 0.72rem; cursor: pointer; color: #888; margin-left: 4px;
 }
 .sortbtn:hover { border-color: #888; }
+.sortbtn.primary { border-color: #16a085; color: #16a085; }
+.sortbtn.primary:hover { background: #16a0851a; }
+/* pin ★ + tag-name input on one baseline, never wrapping to two rows */
+.namecell { display: flex; align-items: center; gap: 0; }
+.namecell .favpin { flex: none; }
 .pickhead.tagsedit { justify-content: flex-start; margin: 0.3rem 0; }
 /* section subheading row within a scope, and the end-of-scope drop target */
 .tagtable .sectionhdr td {
