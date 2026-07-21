@@ -1,7 +1,7 @@
 // Same reason as lib.rs: the deeply nested view! trees push the trait solver past
 // its default depth (this bin monomorphizes the SSR render). Inner attribute → must
 // precede all items in the crate root.
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 #[cfg(feature = "ssr")]
 #[tokio::main]
