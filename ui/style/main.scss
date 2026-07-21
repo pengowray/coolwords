@@ -1,5 +1,10 @@
 :root { color-scheme: light dark; }
 
+/* Always reserve the scrollbar gutter so toggling tall/short content (e.g. the
+   plain-list view) never adds/removes the scrollbar and shifts the whole page
+   sideways — which used to move toolbar buttons out from under the cursor. */
+html { scrollbar-gutter: stable; overflow-y: scroll; }
+
 body {
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   margin: 2rem auto;
@@ -178,9 +183,15 @@ h1 { margin-bottom: 0; }
 }
 .descbtn:hover { border-color: #888; }
 .descbtn.on { background: #3498db; color: #fff; border-color: #3498db; }
-/* plain-list button + its ▾ options menu */
-.plwrap { position: relative; display: inline-flex; gap: 4px; }
-.plmore { padding-left: 0.4rem; padding-right: 0.4rem; }
+/* plain-list button + its ▾ options menu, joined as one segmented control */
+.plwrap { position: relative; display: inline-flex; }
+.plmain { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.plmore {
+  border-top-left-radius: 0; border-bottom-left-radius: 0; border-left: none;
+  padding: 0.2rem 0.55rem; font-size: 0.7rem;
+}
+/* click-away layer so the menu closes when you click elsewhere */
+.plmenu-backdrop { position: fixed; inset: 0; z-index: 19; }
 .plmenu {
   position: absolute; top: calc(100% + 4px); right: 0; z-index: 20;
   display: flex; flex-direction: column; gap: 0.3rem; white-space: nowrap;

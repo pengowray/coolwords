@@ -4079,12 +4079,13 @@ fn HomePage() -> impl IntoView {
                 " hide rejected"
             </label>
             <div class="plwrap">
-                <button class="descbtn" class:on=move || show_list.get()
+                <button class="descbtn plmain" class:on=move || show_list.get()
                     title="show a plain-text list of the words shown, for copy/paste"
                     on:click=move |_| show_list.update(|v| *v = !*v)>"▤ plain list"</button>
                 <button class="descbtn plmore" class:on=move || list_menu.get()
                     title="plain-list options" on:click=move |_| list_menu.update(|v| *v = !*v)>"▾"</button>
                 <Show when=move || list_menu.get() fallback=|| ()>
+                    <div class="plmenu-backdrop" on:click=move |_| list_menu.set(false)></div>
                     <div class="plmenu">
                         <label><input type="checkbox" prop:checked=move || show_forms.get()
                             on:change=move |_| { show_forms.update(|v| *v = !*v); show_list.set(true); }/>
