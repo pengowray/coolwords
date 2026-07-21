@@ -4442,8 +4442,7 @@ fn TagRow(
                 title="turn on “edit”, then drag this handle to reorder / refile"
                 on:pointerdown=down on:pointermove=mv on:pointerup=up
                 on:pointercancel=move |_| ds.reset()>"⠿"</td>
-            <td>
-              <div class="namecell">
+            <td class="favcol">
                 <button class="favpin" class:on=move || fav_sig.get()
                     title=move || if fav_sig.get() { "pinned in the verbarium — click to unpin" } else { "pin this tag for quick access in the verbarium" }
                     on:click=move |_| {
@@ -4454,6 +4453,8 @@ fn TagRow(
                     }>
                     {move || if fav_sig.get() { "★" } else { "☆" }}
                 </button>
+            </td>
+            <td>
                 {if locked {
                     view! { <span class="tagname locked" title="the quick ★ tag can't be renamed or deleted">{name.clone()}" ★"</span> }.into_any()
                 } else {
@@ -4478,7 +4479,6 @@ fn TagRow(
                                 }
                             } }/> }.into_any()
                 }}
-              </div>
             </td>
             <td>
                 <input class="tagcomment" prop:value=comment placeholder="what it's for"
@@ -4669,7 +4669,7 @@ fn TagsPage() -> impl IntoView {
                 {match item {
                     RowItem::Heading(s) => view! {
                         <tr class="sectionhdr" attr:data-section=s.clone()>
-                            <td></td><td colspan="7">{s.clone()}</td>
+                            <td></td><td></td><td colspan="7">{s.clone()}</td>
                         </tr>
                     }.into_any(),
                     RowItem::Tag(d) => view! {
@@ -4713,16 +4713,16 @@ fn TagsPage() -> impl IntoView {
                 Ok(_) => view! {
                     <table class="tagtable">
                         <thead><tr>
-                            <th></th><th>"tag"</th><th>"comment / what it's for"</th>
+                            <th></th><th></th><th>"tag"</th><th>"comment / what it's for"</th>
                             <th>"section"</th><th>"scope"</th><th>"interest"</th><th>"scale"</th><th></th>
                         </tr></thead>
                         <tbody>
-                            <tr class="grouphdr"><td colspan="8">"book tags — a word in one book "{move || sort_btns(false)}</td></tr>
+                            <tr class="grouphdr"><td colspan="9">"book tags — a word in one book "{move || sort_btns(false)}</td></tr>
                             {move || scope_rows(false)}
-                            <tr class="dropend"><td colspan="8">"— end of book tags (drop here to move to the end) —"</td></tr>
-                            <tr class="grouphdr"><td colspan="8">"word tags — a word across all books "{move || sort_btns(true)}</td></tr>
+                            <tr class="dropend"><td colspan="9">"— end of book tags (drop here to move to the end) —"</td></tr>
+                            <tr class="grouphdr"><td colspan="9">"word tags — a word across all books "{move || sort_btns(true)}</td></tr>
                             {move || scope_rows(true)}
-                            <tr class="dropend"><td colspan="8">"— end of word tags (drop here to move to the end) —"</td></tr>
+                            <tr class="dropend"><td colspan="9">"— end of word tags (drop here to move to the end) —"</td></tr>
                         </tbody>
                     </table>
                 }.into_any(),
