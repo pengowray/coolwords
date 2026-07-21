@@ -3537,6 +3537,10 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
     // "rate" mode: expand every tag to a tri-state / scale strip (⌫ untag, ✗ = 0
     // considered, 1..max = level) so the 0/considered state + scale levels are reachable.
     let rating = RwSignal::new(false);
+    // Anchored per-chip level picker: holds the name of the scale tag whose popover
+    // is open (None = closed). Lets you pick a precise level on one tag without the
+    // global "rate" mode exploding every tag into a strip.
+    let pop = RwSignal::new(Option::<String>::None);
     // Progressive disclosure: the scope/interest/comment form for creating a NEW tag
     // stays hidden until the user opts in ("create …"), so the common case (search +
     // apply, or a quick default-scoped add) isn't cluttered by two selects.
@@ -3632,6 +3636,9 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                     // consume on_name / click_name / name, so the strip can't reuse them).
                     let (r_clr_s, r_clr_c, r_no_s, r_no_c, r_lv) =
                         (name.clone(), name.clone(), name.clone(), name.clone(), name.clone());
+                    // clones for the anchored level picker (chip click opens it; the two
+                    // reactive `open` gates read it — one for the popover, one for the backdrop).
+                    let (pop_name, pop_show, pop_back) = (name.clone(), name.clone(), name.clone());
                     let title = d.comment.clone().unwrap_or_default();
                     let is_scale = d.is_scale();
                     let maxlv = d.max_level();
@@ -3656,16 +3663,18 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                             on:pointerdown=down on:pointermove=mv on:pointerup=up
                             on:pointercancel=move |_| ds.reset()
                             on:click=move |_| if !editing.get_untracked() {
-                                // bool: toggle applied/untagged. scale: quick on at 1,
-                                // or off — the rate strip sets a precise level.
+                                // bool: toggle applied/untagged. scale: open an anchored
+                                // level picker (⌫ / ✗ / 1..max) for just this tag — unless
+                                // the global "rate" strip is already showing one.
                                 if is_scale {
-                                    let cur = tag_value(t, key, &click_name);
-                                    set_tag_val(t, book_id, word_id, &click_name,
-                                        if cur.is_some_and(|v| v >= 1) { None } else { Some(1) });
+                                    if !rating.get_untracked() {
+                                        let n = pop_name.clone();
+                                        pop.update(|p| *p = (p.as_deref() != Some(n.as_str())).then_some(n));
+                                    }
                                 } else {
                                     toggle_tag(t, book_id, word_id, &click_name);
+                                    toast_tag(toast, t.tags, &click_name);
                                 }
-                                toast_tag(toast, t.tags, &click_name);
                             }>
                             <span class="chiptext">{name.clone()}</span>
                             // scale value badge (reactive), shown when applied.
@@ -3714,6 +3723,45 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                                     }).collect_view()}
                                 </div>
                             </div>
+                        }.into_any()
+                    } else if is_scale {
+                        // Normal mode: click the chip to reveal an anchored level picker
+                        // (⌫ untag / ✗ considered=0 / 1..max). A fixed backdrop closes it
+                        // on click-away; picking a level closes it too.
+                        view! {
+                            <span class="chipwrap">
+                                {chip}
+                                // Rendered once; visibility toggled by the reactive `open`
+                                // gates (CSS hides it when this tag's popover isn't the open one).
+                                <div class="scalepop-backdrop"
+                                    class:open=move || pop.get().as_deref() == Some(pop_back.as_str())
+                                    on:click=move |_| pop.set(None)></div>
+                                <div class="scalepop"
+                                    class:open=move || pop.get().as_deref() == Some(pop_show.as_str())>
+                                    <button type="button" class="ratebtn clr" title="untag"
+                                        class:sel=move || tag_value(t, key, &r_clr_s).is_none()
+                                        on:click=move |_| {
+                                            set_tag_val(t, book_id, word_id, &r_clr_c, None);
+                                            toast_tag(toast, t.tags, &r_clr_c); pop.set(None);
+                                        }>"⌫"</button>
+                                    <button type="button" class="ratebtn no" title="considered — not tagged"
+                                        class:sel=move || tag_value(t, key, &r_no_s) == Some(0)
+                                        on:click=move |_| {
+                                            set_tag_val(t, book_id, word_id, &r_no_c, Some(0));
+                                            toast_tag(toast, t.tags, &r_no_c); pop.set(None);
+                                        }>"✗"</button>
+                                    {(1..=maxlv).map(|lv| {
+                                        let nml = r_lv.clone();
+                                        let ncl = r_lv.clone();
+                                        view! { <button type="button" class="ratebtn"
+                                            class:sel=move || tag_value(t, key, &nml) == Some(lv)
+                                            on:click=move |_| {
+                                                set_tag_val(t, book_id, word_id, &ncl, Some(lv));
+                                                toast_tag(toast, t.tags, &ncl); pop.set(None);
+                                            }>{lv.to_string()}</button> }
+                                    }).collect_view()}
+                                </div>
+                            </span>
                         }.into_any()
                     } else {
                         chip.into_any()

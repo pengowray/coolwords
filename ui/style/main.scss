@@ -197,6 +197,17 @@ h1 { margin-bottom: 0; }
 .ratebtn.sel { background: #3498db; color: #fff; border-color: #3498db; }
 .ratebtn.no.sel { background: #c0392b; border-color: #c0392b; } /* 0 = considered & declined */
 .ratebtn.clr.sel { background: #7f8c8d; border-color: #7f8c8d; }
+/* per-scale-chip anchored level picker: click a scale chip to reveal ⌫/✗/1..max */
+.chipwrap { position: relative; display: inline-flex; }
+.scalepop-backdrop { display: none; position: fixed; inset: 0; z-index: 19; }
+.scalepop-backdrop.open { display: block; }
+.scalepop {
+  display: none; position: absolute; top: calc(100% + 4px); left: 0; z-index: 20;
+  gap: 3px; flex-wrap: wrap; align-items: center;
+  padding: 0.35rem 0.4rem; border: 1px solid #8886; border-radius: 10px;
+  background: Canvas; box-shadow: 0 4px 14px #0003;
+}
+.scalepop.open { display: inline-flex; }
 /* scale ceiling input on the new-tag form + tags manager */
 .newtag-max, .maxin { width: 3.2rem; }
 /* live search over the collection under the new-tag box */
