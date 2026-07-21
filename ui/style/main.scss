@@ -1,9 +1,48 @@
-:root { color-scheme: light dark; }
+:root {
+  color-scheme: light dark;
+  /* Palette tokens — one source of truth for the accent family so widgets stay
+     consistent (and future theming is a one-line change). */
+  --accent: #16a085;        /* teal: brand / "interesting" */
+  --accent-strong: #12876f;
+  --blue: #3498db;          /* active / selected */
+  --blue-ink: #2980b9;      /* blue text on light surfaces */
+  --danger: #c0392b;        /* "uninteresting" / destructive */
+  --star: #e0a000;          /* pin / favourite */
+  --border: #8884;          /* hairline borders + inputs */
+  --border-strong: #8886;   /* toolbar controls */
+  --focus: #3498dbcc;       /* keyboard focus ring */
+}
 
 /* Always reserve the scrollbar gutter so toggling tall/short content (e.g. the
    plain-list view) never adds/removes the scrollbar and shifts the whole page
    sideways — which used to move toolbar buttons out from under the cursor. */
 html { scrollbar-gutter: stable; overflow-y: scroll; }
+
+/* One consistent keyboard-focus ring across every interactive control. `:where`
+   keeps specificity at 0 so each widget's own styles still win for everything
+   but the outline. Mouse clicks don't trigger it (`:focus-visible`). */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+/* Subtle, uniform hover/press feedback on the button-like controls. */
+.bar > button, .descbtn, .chip, .tagbtn, .sortbtn, .scopebtn, .catx,
+.favchip, .ratebtn, .listcopy, .plmain, .plmore, .navlink {
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+@media (prefers-color-scheme: dark) {
+  /* These secondary-text greys were picked for a light page and read as nearly
+     black on a dark one — lift them to legible light greys. Body text already
+     adapts via `color-scheme`; only these hard-coded dark greys needed help. */
+  .dz-big { color: #c4c4c4; }
+  .seg-text { color: #b0b0b0; }
+  .seg.kept .seg-text { color: #dcdcdc; }
+  .detail .meta { color: #a8a8a8; }
+  .reltgt { color: #a0a0a0; }
+  .seg-note, .ocr-cur, .tagsectionin { color: #9a9a9a; }
+}
 
 body {
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -283,7 +322,10 @@ h1 { margin-bottom: 0; }
   color: #fff; background: #16a085; border-radius: 9px; padding: 0.05rem 0.45rem;
   vertical-align: 0.05rem;
 }
-.catsel, .lvlsel { padding: 0.2rem 0.3rem; border-radius: 6px; }
+.catsel, .lvlsel {
+  padding: 0.25rem 0.4rem; border-radius: 6px;
+  border: 1px solid var(--border-strong); background: Canvas; color: inherit;
+}
 .forms { color: #16a085; font-size: 0.72rem; font-weight: 600; }
 .catx {
   border: 1px solid #8884; background: transparent; border-radius: 50%;
