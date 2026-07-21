@@ -341,6 +341,36 @@ fn group_tags(t: Tagger, book_id: i64, members: &[i64]) -> Vec<(String, Interest
     out
 }
 
+/// A family's applied collection tags as `(name, value)`, value = the max applied
+/// level across members (so a scale tag shows its rating). Excludes `pick:` buckets
+/// and the ★ star. Sorted interesting → neutral → uninteresting, then by name, to
+/// match `group_tags`. Drives the plain-list `#hashtag[:value]` export.
+fn group_tag_values(t: Tagger, book_id: i64, members: &[i64]) -> Vec<(String, i32)> {
+    let mut vals: HashMap<String, i32> = HashMap::new();
+    t.store.with(|m| {
+        for &w in members {
+            if let Some(set) = m.get(&(book_id, w)) {
+                for (tag, &val) in set {
+                    if val >= 1 && tag != "star" && !tag.starts_with("pick:") {
+                        let e = vals.entry(tag.clone()).or_insert(0);
+                        *e = (*e).max(val);
+                    }
+                }
+            }
+        }
+    });
+    let rank = |i: &Interest| match i {
+        Interest::Interesting => 0,
+        Interest::Neutral => 1,
+        Interest::Uninteresting => 2,
+    };
+    let mut out: Vec<(String, i32)> = vals.into_iter().collect();
+    out.sort_by(|a, b| {
+        rank(&tag_interest(t, &a.0)).cmp(&rank(&tag_interest(t, &b.0))).then_with(|| a.0.cmp(&b.0))
+    });
+    out
+}
+
 /// Per-interest counts of a family's applied collection tags: (interesting,
 /// neutral, uninteresting). Used for the compact count pills when a word carries
 /// too many tags to list as chips.
@@ -445,6 +475,9 @@ pub struct Candidate {
     /// In-book member word_ids of this group (incl. the representative), so tag
     /// state can be unioned across the family for cross-level visibility.
     pub members: Vec<i64>,
+    /// Distinct surface forms in this group for display (representative first, then
+    /// the merged in-book forms alphabetically) — e.g. `["dog", "dogs"]`.
+    pub forms: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1388,6 +1421,7 @@ pub async fn get_candidates(
             buckets: Vec::new(),
             n_forms: row.get(11)?,
             members: Vec::new(),
+            forms: Vec::new(),
         })
     };
     let mut out: Vec<Candidate> = match &bind_cat {
@@ -1420,20 +1454,25 @@ pub async fn get_candidates(
     // in-book member word_ids per group representative at this level (level 0:
     // each word maps to itself, so members = [self]).
     let mut members_map: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut forms_map: HashMap<i64, Vec<String>> = HashMap::new();
     let mut ms = conn
         .prepare(
-            "SELECT COALESCE(wl.lemma_id, bo.word_id) AS rep, bo.word_id
+            "SELECT COALESCE(wl.lemma_id, bo.word_id) AS rep, bo.word_id, w.word
              FROM book_occurrences bo
              LEFT JOIN word_lemma wl ON wl.word_id = bo.word_id AND wl.level = ?2
+             JOIN words w ON w.id = bo.word_id
              WHERE bo.book_id = ?1 AND bo.word_id IS NOT NULL",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    for (rep, wid) in ms
-        .query_map([book_id, level], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+    for (rep, wid, word) in ms
+        .query_map([book_id, level], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+        })
         .map_err(|e| ServerFnError::new(e.to_string()))?
         .filter_map(Result::ok)
     {
         members_map.entry(rep).or_default().push(wid);
+        forms_map.entry(rep).or_default().push(word);
     }
 
     for c in &mut out {
@@ -1446,6 +1485,18 @@ pub async fn get_candidates(
             c.buckets = b.clone();
         }
         c.members = members_map.remove(&c.word_id).unwrap_or_else(|| vec![c.word_id]);
+        // Representative headword first (it may not itself occur in the book), then
+        // the merged in-book forms alphabetically, deduped — for the "dog/dogs" list.
+        let mut forms = vec![c.word.clone()];
+        if let Some(mut extra) = forms_map.remove(&c.word_id) {
+            extra.sort();
+            for w in extra {
+                if !forms.contains(&w) {
+                    forms.push(w);
+                }
+            }
+        }
+        c.forms = forms;
     }
     Ok(out)
 }
@@ -3870,6 +3921,11 @@ fn HomePage() -> impl IntoView {
     let hide_rejected = RwSignal::new(false);
     // Plain-text mode: swap the word cards for a copy-pasteable list of words (as on the verbarium).
     let show_list = RwSignal::new(false);
+    // Plain-list options (behind the ▾ menu). Forms & hashtags are off by default.
+    let list_menu = RwSignal::new(false);
+    let show_forms = RwSignal::new(false);
+    let show_tags = RwSignal::new(false);
+    let list_sep = RwSignal::new("nl".to_string()); // "nl" | "sp" | "comma"
     let open_picker = RwSignal::new(None::<i64>);
 
     let tagger = Tagger {
@@ -4022,9 +4078,31 @@ fn HomePage() -> impl IntoView {
                     on:change=move |_| hide_rejected.update(|v| *v = !*v)/>
                 " hide rejected"
             </label>
-            <button class="descbtn" class:on=move || show_list.get()
-                title="show a plain-text list of the words shown, for copy/paste"
-                on:click=move |_| show_list.update(|v| *v = !*v)>"▤ plain list"</button>
+            <div class="plwrap">
+                <button class="descbtn" class:on=move || show_list.get()
+                    title="show a plain-text list of the words shown, for copy/paste"
+                    on:click=move |_| show_list.update(|v| *v = !*v)>"▤ plain list"</button>
+                <button class="descbtn plmore" class:on=move || list_menu.get()
+                    title="plain-list options" on:click=move |_| list_menu.update(|v| *v = !*v)>"▾"</button>
+                <Show when=move || list_menu.get() fallback=|| ()>
+                    <div class="plmenu">
+                        <label><input type="checkbox" prop:checked=move || show_forms.get()
+                            on:change=move |_| { show_forms.update(|v| *v = !*v); show_list.set(true); }/>
+                            " word forms (dog/dogs)"</label>
+                        <label><input type="checkbox" prop:checked=move || show_tags.get()
+                            on:change=move |_| { show_tags.update(|v| *v = !*v); show_list.set(true); }/>
+                            " tags as #hashtags"</label>
+                        <div class="plmenu-seps">"separate with:"
+                            <label><input type="radio" name="plsep" prop:checked=move || list_sep.get() == "nl"
+                                on:change=move |_| { list_sep.set("nl".into()); show_list.set(true); }/>" newlines"</label>
+                            <label><input type="radio" name="plsep" prop:checked=move || list_sep.get() == "sp"
+                                on:change=move |_| { list_sep.set("sp".into()); show_list.set(true); }/>" spaces"</label>
+                            <label><input type="radio" name="plsep" prop:checked=move || list_sep.get() == "comma"
+                                on:change=move |_| { list_sep.set("comma".into()); show_list.set(true); }/>" commas"</label>
+                        </div>
+                    </div>
+                </Show>
+            </div>
         </div>
 
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
@@ -4035,9 +4113,24 @@ fn HomePage() -> impl IntoView {
                     let top = only_top.get();
                     let list: Vec<Candidate> = all.into_iter().filter(|c| !top || c.selected).collect();
                     let total = list.len();
-                    // Plain-text mode: one word per line (in the shown order), with a copy button.
+                    // Plain-text mode: each word on its own line (in the shown order),
+                    // optionally with its merged forms (`dog/dogs`) and/or its tags as
+                    // `#hashtag[:value]`, joined by the chosen separator, with a copy button.
                     if show_list.get() {
-                        let text = list.iter().map(|c| c.word.clone()).collect::<Vec<_>>().join("\n");
+                        let forms_on = show_forms.get();
+                        let tags_on = show_tags.get();
+                        let scale_names: HashSet<String> = tagger.tags
+                            .with(|defs| defs.iter().filter(|d| d.is_scale()).map(|d| d.name.clone()).collect());
+                        let line = |c: &Candidate| -> String {
+                            let head = if forms_on && c.forms.len() > 1 { c.forms.join("/") } else { c.word.clone() };
+                            if !tags_on { return head; }
+                            let hs = group_tag_values(tagger, b, &c.members).into_iter()
+                                .map(|(n, v)| if scale_names.contains(&n) { format!("#{n}:{v}") } else { format!("#{n}") })
+                                .collect::<Vec<_>>().join(" ");
+                            if hs.is_empty() { head } else { format!("{head} // {hs}") }
+                        };
+                        let joiner = match list_sep.get().as_str() { "sp" => " ", "comma" => ", ", _ => "\n" };
+                        let text = list.iter().map(line).collect::<Vec<_>>().join(joiner);
                         let text_copy = text.clone();
                         let rows = total.clamp(3, 24) as i32;
                         return view! {

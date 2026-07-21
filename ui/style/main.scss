@@ -178,6 +178,20 @@ h1 { margin-bottom: 0; }
 }
 .descbtn:hover { border-color: #888; }
 .descbtn.on { background: #3498db; color: #fff; border-color: #3498db; }
+/* plain-list button + its ▾ options menu */
+.plwrap { position: relative; display: inline-flex; gap: 4px; }
+.plmore { padding-left: 0.4rem; padding-right: 0.4rem; }
+.plmenu {
+  position: absolute; top: calc(100% + 4px); right: 0; z-index: 20;
+  display: flex; flex-direction: column; gap: 0.3rem; white-space: nowrap;
+  padding: 0.5rem 0.6rem; border: 1px solid #8886; border-radius: 10px;
+  background: Canvas; box-shadow: 0 4px 14px #0003; font-size: 0.8rem; color: inherit;
+}
+.plmenu label { display: flex; align-items: center; gap: 0.3rem; cursor: pointer; }
+.plmenu-seps {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem 0.6rem;
+  border-top: 1px solid #8883; padding-top: 0.35rem; color: #888;
+}
 .chipcell { display: flex; align-items: center; gap: 0.4rem; flex-basis: 100%; margin: 2px 0; }
 .chipcell .chip { flex: none; }
 .chipdesc {
