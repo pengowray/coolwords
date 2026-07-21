@@ -18,14 +18,22 @@ USER_SCHEMA = SCHEMA_PATH.parent / "user.sql"
 
 
 def migrate_tag_columns(user: sqlite3.Connection) -> None:
-    """Additively add columns that postdate the original `tags` table (CREATE TABLE
-    IF NOT EXISTS won't add them to an existing DB). Mirrors the Rust open_user()."""
+    """Additively add columns that postdate the original `tags`/`word_tags` tables
+    (CREATE TABLE IF NOT EXISTS won't add them to an existing DB). Mirrors the Rust
+    migrate_user()."""
     have = {r[1] for r in user.execute("PRAGMA table_info(tags)")}
     for name, decl in (("scope", "TEXT NOT NULL DEFAULT 'book'"),
                        ("interest", "TEXT NOT NULL DEFAULT 'interesting'"),
-                       ("section", "TEXT NOT NULL DEFAULT ''")):
+                       ("section", "TEXT NOT NULL DEFAULT ''"),
+                       ("kind", "TEXT NOT NULL DEFAULT 'bool'"),
+                       ("scale_max", "INTEGER NOT NULL DEFAULT 1"),
+                       ("scale_labels", "TEXT")):
         if name not in have:
             user.execute(f"ALTER TABLE tags ADD COLUMN {name} {decl}")
+    # word_tags.value: the tri-state rating (NULL==1==applied; 0==considered-declined).
+    have_apps = {r[1] for r in user.execute("PRAGMA table_info(word_tags)")}
+    if "value" not in have_apps:
+        user.execute("ALTER TABLE word_tags ADD COLUMN value INTEGER")
     user.commit()
 
 

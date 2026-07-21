@@ -26,6 +26,8 @@ web-sys = { version = "0.3", features = [
     "HtmlInputElement", "Window", "Storage",
     # Ingress base recovery on the client: read <html data-base> and the page origin.
     "Document", "Element", "Location",
+    # Touch-capable tag drag-and-drop (Pointer Events, hit-testing, edge autoscroll).
+    "PointerEvent", "MouseEvent", "EventTarget", "HtmlElement",
 ] }
 
 [features]
@@ -38,6 +40,9 @@ ssr = [
     "leptos_meta/ssr",
     "leptos_router/ssr",
     "dep:rusqlite",
+    # web-sys is compiled for SSR too (event handlers in shared view code reference
+    # it); wasm-bindgen's JsCast is needed there for pointer-capture casting.
+    "dep:wasm-bindgen",
 ]
 
 [package.metadata.leptos]

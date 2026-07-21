@@ -131,9 +131,34 @@ h1 { margin-bottom: 0; }
 .chip:hover { border-color: #888; }
 .chip.on { background: #3498db; color: #fff; border-color: #3498db; }
 .chip.pick.on { background: #16a085; border-color: #16a085; }
-/* chips are draggable to reorder / refile */
-.chip[draggable="true"] { cursor: grab; }
-.chip[draggable="true"]:active { cursor: grabbing; }
+/* in "edit" mode a chip becomes a touch-draggable reorder handle (Pointer Events);
+   touch-action:none lets a drag scroll the list without the browser hijacking it */
+.chip.editing { cursor: grab; touch-action: none; }
+.chip.editing:active { cursor: grabbing; }
+.chip.dragging { opacity: 0.5; }
+.chip.dropover { outline: 2px dashed #3498db; outline-offset: 1px; }
+/* scale tags: a subtle dashed outline + the current-value badge */
+.chip.scale { border-style: dashed; }
+/* a parent tag lit only because an applied child implies it (child-implies-parent) */
+.chip.implied { border-color: #16a085; color: #16a085; border-style: dotted; }
+.chip .chipval { font-weight: 700; font-variant-numeric: tabular-nums; }
+/* rate strip (⌫ untag / ✗ considered=0 / 1..max level) shown in the picker's rate mode */
+.ratebar { display: inline-flex; gap: 3px; flex-wrap: wrap; align-items: center; }
+.ratebtn {
+  min-width: 1.7rem; border: 1px solid #8884; background: transparent; border-radius: 8px;
+  padding: 0.15rem 0.35rem; font-size: 0.8rem; line-height: 1.1; cursor: pointer;
+  color: #888; font-variant-numeric: tabular-nums;
+}
+.ratebtn:hover { border-color: #888; }
+.ratebtn.sel { background: #3498db; color: #fff; border-color: #3498db; }
+.ratebtn.no.sel { background: #c0392b; border-color: #c0392b; } /* 0 = considered & declined */
+.ratebtn.clr.sel { background: #7f8c8d; border-color: #7f8c8d; }
+/* scale ceiling input on the new-tag form + tags manager */
+.newtag-max, .maxin { width: 3.2rem; }
+/* live search over the collection under the new-tag box */
+.tagsearch { display: flex; flex-wrap: wrap; gap: 4px; flex-basis: 100%; margin: 2px 0; }
+/* the create-a-new-tag form (scope + interest), revealed only on "create …" */
+.newtag-opts { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; flex-basis: 100%; }
 /* section subheadings inside a scope group */
 .tagsection {
   flex-basis: 100%; margin: 0.3rem 0 0.1rem; font-size: 0.7rem; font-weight: 700;
@@ -400,9 +425,19 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
 .tagrow.int-interesting { border-left-color: #16a085; }
 .tagrow.int-neutral { border-left-color: #7f8c8d; }
 .tagrow.int-uninteresting { border-left-color: #c0392b; }
-.tagrow[draggable="true"] { cursor: grab; }
-.tagrow[draggable="true"]:active { cursor: grabbing; }
-.tagtable .grip { color: #bbb; cursor: grab; user-select: none; text-align: center; width: 1.4rem; }
+.tagrow.editing { background: #3498db0a; }
+.tagtable .grip { color: #ccc; user-select: none; text-align: center; width: 1.4rem; }
+/* the grip only grabs the drag gesture in edit mode */
+.tagtable .grip.draghandle { color: #3498db; cursor: grab; touch-action: none; }
+.tagtable .grip.draghandle:active { cursor: grabbing; }
+/* per-scope sort controls in the group header */
+.sortbtns { margin-left: 0.5rem; font-weight: 400; text-transform: none; letter-spacing: 0; }
+.sortbtn {
+  border: 1px solid #8884; background: transparent; border-radius: 8px;
+  padding: 0.05rem 0.4rem; font-size: 0.72rem; cursor: pointer; color: #888; margin-left: 4px;
+}
+.sortbtn:hover { border-color: #888; }
+.pickhead.tagsedit { justify-content: flex-start; margin: 0.3rem 0; }
 /* section subheading row within a scope, and the end-of-scope drop target */
 .tagtable .sectionhdr td {
   font-size: 0.72rem; font-weight: 700; color: #16a085; letter-spacing: 0.03em;
@@ -427,6 +462,13 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
 .scopebtn.global { border-color: #16a085; color: #16a085; }
 .scopebtn:hover { border-color: #888; }
 .intsel { font-size: 0.8rem; padding: 1px 4px; border-radius: 6px; }
+/* child (dotted) tags: a connector glyph + lighter weight so hierarchy reads down the column */
+.tagname.child { font-weight: 500; }
+.tagname.child::placeholder { color: #aaa; }
+.scalecell { white-space: nowrap; }
+.kindsel { font-size: 0.78rem; padding: 1px 4px; border-radius: 6px; }
+.maxin { font-size: 0.8rem; padding: 1px 4px; border-radius: 6px; margin-left: 3px;
+  border: 1px solid #8884; background: Canvas; color: inherit; }
 .tagsadd { margin-top: 1rem; }
 
 /* ---- PDF OCR: source controls + embedded-vs-OCR compare ---- */
@@ -508,4 +550,18 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
   .newtag-name, .newtag-comment { width: 100%; }
   .pickgroup.newtag { flex-direction: column; align-items: stretch; }
   .managelink { margin-left: 0; }
+}
+
+/* transient toast: a tag's name + comment on touch, where title tooltips never show */
+.toast {
+  position: fixed; left: 50%; bottom: 1.2rem; transform: translateX(-50%);
+  max-width: min(92vw, 30rem); z-index: 100;
+  background: #222e; color: #fff; border-radius: 10px;
+  padding: 0.5rem 0.9rem; font-size: 0.85rem; line-height: 1.3;
+  box-shadow: 0 4px 16px #0006; text-align: center;
+  animation: toastin 0.15s ease-out;
+}
+@keyframes toastin {
+  from { opacity: 0; transform: translate(-50%, 6px); }
+  to   { opacity: 1; transform: translate(-50%, 0); }
 }
