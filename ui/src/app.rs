@@ -2868,9 +2868,22 @@ fn HomePage() -> impl IntoView {
         query_signal_with_options::<i64>("word", NavigateOptions { scroll: false, ..Default::default() });
     // stemming aggressiveness: 0 none / 1 inflectional / 2 derivational / 3 aggressive
     let (lvl_q, set_lvl) = query_signal::<i64>("lvl");
-    // No explicit ?book → resume the last-viewed book (localStorage), else the first.
-    let book = Memo::new(move |_| book_q.get().or_else(stored_book).unwrap_or(1));
     let level = Memo::new(move |_| lvl_q.get().unwrap_or(0));
+    // Load the book list up front so the current-book pick can fall back to a real
+    // book when the requested one is missing (e.g. it was just deleted).
+    let books = Resource::new(|| (), |_| list_books());
+    // No explicit ?book → resume the last-viewed book (localStorage), else the first.
+    // If that id isn't among the existing books (stale localStorage, or a deleted
+    // book still named in the URL or the nav "words" link), fall back to the first
+    // available book — otherwise every per-book query returns empty and the page
+    // strands on a wordless, tagless "0 shown" view of a book that no longer exists.
+    let book = Memo::new(move |_| {
+        let want = book_q.get().or_else(stored_book).unwrap_or(1);
+        match books.get() {
+            Some(Ok(list)) if !list.is_empty() && !list.iter().any(|b| b.id == want) => list[0].id,
+            _ => want,
+        }
+    });
     let only_top = RwSignal::new(false);
     let hide_rejected = RwSignal::new(false);
     let open_picker = RwSignal::new(None::<i64>);
@@ -2906,7 +2919,6 @@ fn HomePage() -> impl IntoView {
         }
     });
 
-    let books = Resource::new(|| (), |_| list_books());
     let categories = Resource::new(move || (book.get(), level.get()), |(b, l)| list_categories(b, l));
     let candidates = Resource::new(
         move || (book.get(), category.get(), level.get()),
@@ -3593,17 +3605,22 @@ fn CollectionPage() -> impl IntoView {
                                                 }).collect_view()}
                                             </span>
                                         </div>
-                                        <div class="cc-books">
-                                            <span class="cc-in">"in: "</span>
-                                            {e.books.into_iter().map(|(bid, title)| {
-                                                let href = (e.word_id > 0)
-                                                    .then(|| format!("{base}/?book={bid}&word={}", e.word_id));
-                                                match href {
-                                                    Some(h) => view! { <a class="cc-book" href=h>{title}</a> }.into_any(),
-                                                    None => view! { <span class="cc-book">{title}</span> }.into_any(),
-                                                }
-                                            }).collect_view()}
-                                        </div>
+                                        // Only when the word still lives in a book. A word whose
+                                        // sole book was deleted keeps its tags but has nowhere to
+                                        // link, so drop the empty "in:" line rather than show it bare.
+                                        {(!e.books.is_empty()).then(|| view! {
+                                            <div class="cc-books">
+                                                <span class="cc-in">"in: "</span>
+                                                {e.books.into_iter().map(|(bid, title)| {
+                                                    let href = (e.word_id > 0)
+                                                        .then(|| format!("{base}/?book={bid}&word={}", e.word_id));
+                                                    match href {
+                                                        Some(h) => view! { <a class="cc-book" href=h>{title}</a> }.into_any(),
+                                                        None => view! { <span class="cc-book">{title}</span> }.into_any(),
+                                                    }
+                                                }).collect_view()}
+                                            </div>
+                                        })}
                                     </article>
                                 }
                             }).collect_view()}
