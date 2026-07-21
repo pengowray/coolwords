@@ -27,7 +27,8 @@ def migrate_tag_columns(user: sqlite3.Connection) -> None:
                        ("section", "TEXT NOT NULL DEFAULT ''"),
                        ("kind", "TEXT NOT NULL DEFAULT 'bool'"),
                        ("scale_max", "INTEGER NOT NULL DEFAULT 1"),
-                       ("scale_labels", "TEXT")):
+                       ("scale_labels", "TEXT"),
+                       ("fav", "INTEGER NOT NULL DEFAULT 0")):
         if name not in have:
             user.execute(f"ALTER TABLE tags ADD COLUMN {name} {decl}")
     # word_tags.value: the tri-state rating (NULL==1==applied; 0==considered-declined).

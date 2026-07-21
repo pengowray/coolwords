@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS tags (
     section  TEXT NOT NULL DEFAULT '',        -- user subheading within a scope ('' = ungrouped)
     kind        TEXT NOT NULL DEFAULT 'bool', -- 'bool' (on/off) | 'scale' (1..scale_max)
     scale_max   INTEGER NOT NULL DEFAULT 1,   -- bool == 1; a scale is 2..10
-    scale_labels TEXT                         -- nullable JSON array of level names (optional)
+    scale_labels TEXT,                        -- nullable JSON array of level names (optional)
+    fav         INTEGER NOT NULL DEFAULT 0    -- 1 = pinned for quick access in the verbarium
 );
 
 -- Tag applications. No foreign keys into the dictionary — fully self-contained.

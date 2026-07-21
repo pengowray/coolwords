@@ -28,6 +28,8 @@ web-sys = { version = "0.3", features = [
     "Document", "Element", "Location",
     # Touch-capable tag drag-and-drop (Pointer Events, hit-testing, edge autoscroll).
     "PointerEvent", "MouseEvent", "EventTarget", "HtmlElement",
+    # Copy the verbarium's plain-text word list to the clipboard.
+    "Navigator", "Clipboard", "HtmlTextAreaElement",
 ] }
 
 [features]

@@ -288,6 +288,36 @@ h1 { margin-bottom: 0; }
 .catsel optgroup { font-style: normal; font-weight: 600; }
 .catsel option { font-weight: 400; }
 
+/* verbarium: pinned-tag quick-filter chips */
+.favchips { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; margin: 0.6rem 0 0.2rem; }
+.favchips-lbl { color: #888; font-size: 0.85rem; }
+.favchip {
+  border: 1px solid #e0a00088; background: #e0a00014; color: inherit;
+  border-radius: 999px; padding: 0.2rem 0.7rem; cursor: pointer; font-size: 0.9rem;
+}
+.favchip:hover { border-color: #e0a000; }
+.favchip.on { background: #e0a000; border-color: #e0a000; color: #fff; }
+
+/* verbarium: plain-text list export */
+.plainlist {
+  width: 100%; box-sizing: border-box; margin: 0.4rem 0; padding: 0.5rem 0.6rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9rem;
+  line-height: 1.5; border: 1px solid #8884; border-radius: 8px; resize: vertical;
+}
+.listcopy {
+  margin-left: 0.6rem; border: 1px solid #8884; background: transparent; color: #888;
+  border-radius: 6px; padding: 0.05rem 0.5rem; cursor: pointer; font-size: 0.8rem; font-weight: 400;
+}
+.listcopy:hover { border-color: #16a085; color: #16a085; }
+
+/* tags page: pin-for-verbarium ★ toggle */
+.favpin {
+  border: none; background: transparent; cursor: pointer; padding: 0 0.3rem 0 0;
+  color: #bbb; font-size: 1rem; line-height: 1;
+}
+.favpin:hover { color: #e0a000; }
+.favpin.on { color: #e0a000; }
+
 /* grouped relations */
 .rels { list-style: none; padding-left: 0; font-size: 0.9rem; }
 .rels li { margin: 0.15rem 0; }

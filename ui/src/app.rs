@@ -72,6 +72,8 @@ pub struct TagDef {
     pub scale_max: i64,
     /// Optional per-level names as a JSON array (index 1..=scale_max), or None.
     pub scale_labels: Option<String>,
+    /// Pinned for quick access in the verbarium (surfaced as a filter chip there).
+    pub fav: bool,
 }
 
 impl TagDef {
@@ -400,6 +402,15 @@ pub struct CollectionEntry {
     /// Ranking number for a "smart" collection (e.g. net favourite − negative
     /// all-books tags), shown as a badge. `None` for an ordinary tag/all view.
     pub metric: Option<i64>,
+}
+
+/// A collection tag in the verbarium's filter list: its name, how many distinct
+/// words carry it (descendants included), and whether it's pinned (fav) for quick access.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CollectionTag {
+    pub name: String,
+    pub count: i64,
+    pub fav: bool,
 }
 
 /// One entry in the filter dropdown. `value` is what goes in the `cat` query
@@ -746,7 +757,8 @@ fn migrate_user(u: &rusqlite::Connection) -> Result<(), ServerFnError> {
                          ("section", "TEXT NOT NULL DEFAULT ''"),
                          ("kind", "TEXT NOT NULL DEFAULT 'bool'"),
                          ("scale_max", "INTEGER NOT NULL DEFAULT 1"),
-                         ("scale_labels", "TEXT")] {
+                         ("scale_labels", "TEXT"),
+                         ("fav", "INTEGER NOT NULL DEFAULT 0")] {
         if !have.contains(name) {
             u.execute(&format!("ALTER TABLE tags ADD COLUMN {name} {decl}"), [])
                 .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -1844,23 +1856,14 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
     let mut word_books: HashMap<String, Vec<(i64, String)>> = HashMap::new();
 
     // Every APPLIED collection-tag application (the JOIN drops `pick:` buckets, which
-    // aren't registered in u.tags; COALESCE(value,1)>=1 drops 0/considered rows).
-    // Filter to one tag when requested — a parent name also matches its descendants
-    // (`t.tag LIKE ?1 || '.%'`), so filtering by `thing` surfaces `thing.material`.
+    // aren't registered in u.tags; COALESCE(value,1)>=1 drops 0/considered rows). We
+    // always fetch ALL applications (never a per-tag WHERE) so that a word matched by
+    // the `tag` filter still carries its OTHER tags in the row — the tag filter is
+    // applied to the assembled per-word rows below, not to this scan.
     let base_sql = "SELECT t.word, t.tag, g.interest, t.book_slug \
                     FROM u.word_tags t JOIN u.tags g ON g.name = t.tag \
                     WHERE t.rater = 'me' AND COALESCE(t.value, 1) >= 1";
-    let rows: Vec<(String, String, String, String)> = if let Some(tg) = tag.as_deref() {
-        let mut s = conn
-            .prepare(&format!("{base_sql} AND (t.tag = ?1 OR t.tag LIKE ?1 || '.%')"))
-            .map_err(|e| ServerFnError::new(e.to_string()))?;
-        let v = s
-            .query_map([tg], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-            .map_err(|e| ServerFnError::new(e.to_string()))?
-            .filter_map(Result::ok)
-            .collect();
-        v
-    } else {
+    let rows: Vec<(String, String, String, String)> = {
         let mut s = conn.prepare(base_sql).map_err(|e| ServerFnError::new(e.to_string()))?;
         let v = s
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
@@ -1978,6 +1981,12 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
         out.retain(|e| e.metric.unwrap_or(0) > 0);
         out.sort_by(|x, y| y.metric.cmp(&x.metric).then_with(|| x.word.cmp(&y.word)));
     } else {
+        // A tag filter narrows to words CARRYING that tag (or a descendant of it —
+        // `thing` surfaces `thing.material`), but each kept word keeps its full tag
+        // set so the verbarium can still show — and sort by — a word's other tags.
+        if let Some(tg) = tag.as_deref() {
+            out.retain(|e| e.tags.iter().any(|(n, _)| n == tg || is_ancestor(tg, n)));
+        }
         out.sort_by(|x, y| int_rank(&x.interest).cmp(&int_rank(&y.interest)).then_with(|| x.word.cmp(&y.word)));
     }
     Ok(out)
@@ -1987,20 +1996,24 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
 /// the counts shown in the Collection page's filter dropdown. Ordered like the
 /// tag collection (sort, name). Includes tags with a zero count.
 #[server]
-pub async fn collection_tags() -> Result<Vec<(String, i64)>, ServerFnError> {
+pub async fn collection_tags() -> Result<Vec<CollectionTag>, ServerFnError> {
     let conn = open_user()?;
     let mut s = conn
         .prepare(
             // A tag's count includes its descendants' applications (child implies
             // parent), matching the filtered collection view; 0/considered excluded.
-            "SELECT g.name, count(DISTINCT t.word) FROM tags g \
+            "SELECT g.name, count(DISTINCT t.word), g.fav FROM tags g \
              LEFT JOIN word_tags t ON (t.tag = g.name OR t.tag LIKE g.name || '.%') \
                  AND t.rater = 'me' AND COALESCE(t.value, 1) >= 1 \
              GROUP BY g.name ORDER BY g.sort, g.name",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     let out = s
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .query_map([], |r| Ok(CollectionTag {
+            name: r.get::<_, String>(0)?,
+            count: r.get::<_, i64>(1)?,
+            fav: r.get::<_, i64>(2)? != 0,
+        }))
         .map_err(|e| ServerFnError::new(e.to_string()))?
         .filter_map(Result::ok)
         .collect();
@@ -2012,7 +2025,7 @@ pub async fn collection_tags() -> Result<Vec<(String, i64)>, ServerFnError> {
 pub async fn list_tags() -> Result<Vec<TagDef>, ServerFnError> {
     let conn = open_user()?;
     let mut stmt = conn
-        .prepare("SELECT name, comment, builtin, scope, interest, sort, section, kind, scale_max, scale_labels FROM tags ORDER BY sort, name")
+        .prepare("SELECT name, comment, builtin, scope, interest, sort, section, kind, scale_max, scale_labels, fav FROM tags ORDER BY sort, name")
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     let out = stmt
         .query_map([], |r| {
@@ -2027,6 +2040,7 @@ pub async fn list_tags() -> Result<Vec<TagDef>, ServerFnError> {
                 kind: r.get(7)?,
                 scale_max: r.get(8)?,
                 scale_labels: r.get(9)?,
+                fav: r.get::<_, i64>(10)? != 0,
             })
         })
         .map_err(|e| ServerFnError::new(e.to_string()))?
@@ -2287,6 +2301,15 @@ pub async fn delete_tag(name: String) -> Result<i64, ServerFnError> {
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     tx.commit().map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(n)
+}
+
+/// Pin / unpin a tag for quick access in the verbarium (surfaced there as a filter chip).
+#[server]
+pub async fn set_tag_fav(name: String, fav: bool) -> Result<(), ServerFnError> {
+    let conn = open_user()?;
+    conn.execute("UPDATE tags SET fav = ?1 WHERE name = ?2", rusqlite::params![fav as i64, name])
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(())
 }
 
 /// Set a tag's interest level (interesting / neutral / uninteresting). `star` stays interesting.
@@ -2817,6 +2840,17 @@ fn remember_book(id: i64) {
 #[cfg(not(feature = "hydrate"))]
 fn remember_book(_id: i64) {}
 
+/// Copy plain text to the clipboard (the verbarium's "copy list" button). Client-only
+/// for the same reason as the localStorage helpers above; a no-op on the SSR target.
+#[cfg(feature = "hydrate")]
+fn copy_to_clipboard(text: &str) {
+    if let Some(w) = web_sys::window() {
+        let _ = w.navigator().clipboard().write_text(text);
+    }
+}
+#[cfg(not(feature = "hydrate"))]
+fn copy_to_clipboard(_text: &str) {}
+
 /// Persistent top menu shown on every page: brand + the three sections + a single
 /// consistent "import" action. The active page is highlighted, and "words" carries
 /// the current book so you land back where you left off.
@@ -2848,7 +2882,7 @@ fn NavBar() -> impl IntoView {
         <nav class="navbar">
             <span class="brand">"coolwords"</span>
             <A href=words_href attr:class=cls("/", "navlink")>"words"</A>
-            <A href=format!("{base}/collection") attr:class=cls("/collection", "navlink")>"collection"</A>
+            <A href=format!("{base}/collection") attr:class=cls("/collection", "navlink")>"verbarium"</A>
             <A href=format!("{base}/books") attr:class=cls("/books", "navlink")>"books"</A>
             <A href=format!("{base}/tags") attr:class=cls("/tags", "navlink")>"tags"</A>
             <A href=format!("{base}/import") attr:class=cls("/import", "navimport")>"+ import book"</A>
@@ -3443,6 +3477,7 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                         kind: new_kind.get_untracked(),
                         scale_max: if new_kind.get_untracked() == "scale" { new_max.get_untracked() } else { 1 },
                         scale_labels: None,
+                        fav: false,
                     });
                 }
             });
@@ -4173,10 +4208,15 @@ fn TagRow(
     scope: ServerAction<SetTagScope>,
     set_scale: ServerAction<SetTagScale>,
     comment_act: ServerAction<AddTag>,
+    fav_act: ServerAction<SetTagFav>,
 ) -> impl IntoView {
     let toast = expect_context::<Toast>();
     let name = d.name.clone();
     let locked = name == "star";
+    // Pinned-for-verbarium toggle. Seeded from the row's snapshot; the click updates
+    // this signal (immediate ★/☆), dispatches, and mirrors into `all` optimistically.
+    let fav_sig = RwSignal::new(d.fav);
+    let n_fav = name.clone();
     let is_word = d.scope == SCOPE_WORD;
     let cur_interest = d.interest.clone();
     let int_cls = d.interest.clone();
@@ -4237,6 +4277,16 @@ fn TagRow(
                 on:pointerdown=down on:pointermove=mv on:pointerup=up
                 on:pointercancel=move |_| ds.reset()>"⠿"</td>
             <td>
+                <button class="favpin" class:on=move || fav_sig.get()
+                    title=move || if fav_sig.get() { "pinned in the verbarium — click to unpin" } else { "pin this tag for quick access in the verbarium" }
+                    on:click=move |_| {
+                        let v = !fav_sig.get();
+                        fav_sig.set(v);
+                        fav_act.dispatch(SetTagFav { name: n_fav.clone(), fav: v });
+                        all.update(|list| { if let Some(dd) = list.iter_mut().find(|dd| dd.name == n_fav) { dd.fav = v; } });
+                    }>
+                    {move || if fav_sig.get() { "★" } else { "☆" }}
+                </button>
                 {if locked {
                     view! { <span class="tagname locked" title="the quick ★ tag can't be renamed or deleted">{name.clone()}" ★"</span> }.into_any()
                 } else {
@@ -4354,6 +4404,7 @@ fn TagsPage() -> impl IntoView {
     let interest = ServerAction::<SetTagInterest>::new();
     let scope = ServerAction::<SetTagScope>::new();
     let set_scale = ServerAction::<SetTagScale>::new();
+    let fav = ServerAction::<SetTagFav>::new();
     let layout = ServerAction::<SetScopeLayout>::new();
     // Only *structural* edits (add a row, delete a row, move a row between the
     // book/word groups) refetch the list. Rename / comment / interest / reorder /
@@ -4378,6 +4429,7 @@ fn TagsPage() -> impl IntoView {
             || matches!(interest.value().get(), Some(Err(_)))
             || matches!(layout.value().get(), Some(Err(_)))
             || matches!(set_scale.value().get(), Some(Err(_)))
+            || matches!(fav.value().get(), Some(Err(_)))
             || matches!(add.value().get(), Some(Err(_)));
         if failed {
             tags.refetch();
@@ -4419,6 +4471,7 @@ fn TagsPage() -> impl IntoView {
                     kind: kind_s,
                     scale_max: max_v,
                     scale_labels: None,
+                    fav: false,
                 });
             }
         });
@@ -4453,7 +4506,7 @@ fn TagsPage() -> impl IntoView {
                     }.into_any(),
                     RowItem::Tag(d) => view! {
                         <TagRow d=d all=all layout=layout ds=ds editing=editing rename=rename del=del
-                            interest=interest scope=scope set_scale=set_scale comment_act=add/>
+                            interest=interest scope=scope set_scale=set_scale comment_act=add fav_act=fav/>
                     }.into_any(),
                 }}
             </For>
@@ -4549,10 +4602,42 @@ fn CollectionPage() -> impl IntoView {
     let base = base_path();
     let tags = Resource::new(|| (), |_| collection_tags());
     let words = Resource::new(move || tag_q.get(), collection_words);
+    // Plain-text mode: swap the word cards for a copy-pasteable list of headwords.
+    let show_list = RwSignal::new(false);
 
     view! {
-        <h1>"collection"</h1>
+        <h1>"verbarium"</h1>
         <p class="sub">"every word you've tagged, across all books. Filter by a tag; click a word to open it in a book."</p>
+
+        // Pinned (★) tags, for one-tap filtering — pin a tag on the tags page.
+        <Suspense fallback=|| ()>
+            {move || tags.get().map(|res| match res {
+                Err(_) => ().into_any(),
+                Ok(list) => {
+                    let favs: Vec<CollectionTag> = list.into_iter().filter(|t| t.fav).collect();
+                    if favs.is_empty() { return ().into_any(); }
+                    view! {
+                        <div class="favchips">
+                            <span class="favchips-lbl">"pinned:"</span>
+                            {favs.into_iter().map(|t| {
+                                let name = t.name.clone();
+                                let n_act = name.clone();
+                                view! {
+                                    <button class="favchip"
+                                        class:on=move || tag_q.get().as_deref() == Some(name.as_str())
+                                        on:click=move |_| {
+                                            if tag_q.get().as_deref() == Some(n_act.as_str()) { set_tag.set(None); }
+                                            else { set_tag.set(Some(n_act.clone())); }
+                                        }>
+                                        {format!("★ {} ({})", t.name, t.count)}
+                                    </button>
+                                }
+                            }).collect_view()}
+                        </div>
+                    }.into_any()
+                }
+            })}
+        </Suspense>
 
         <div class="bar">
             <Suspense fallback=|| ()>
@@ -4568,9 +4653,11 @@ fn CollectionPage() -> impl IntoView {
                             <option value="">"all tags"</option>
                             <option value="special:top-global">"★ most all-books favourites"</option>
                             <optgroup label="tags">
-                                {list.into_iter().map(|(name, n)| { let v = name.clone(); view! {
-                                    <option value=v>{format!("{name} ({n})")}</option>
-                                } }).collect_view()}
+                                {list.into_iter().map(|t| { let v = t.name.clone();
+                                    let star = if t.fav { "★ " } else { "" };
+                                    view! {
+                                        <option value=v>{format!("{star}{} ({})", t.name, t.count)}</option>
+                                    } }).collect_view()}
                             </optgroup>
                         </select>
                     }.into_any(),
@@ -4588,6 +4675,9 @@ fn CollectionPage() -> impl IntoView {
                 <option value="tags">"sort: most tags"</option>
                 <option value="books">"sort: most books"</option>
             </select>
+            <button class="descbtn" class:on=move || show_list.get()
+                title="show a plain-text list of the words, for copy/paste"
+                on:click=move |_| show_list.update(|v| *v = !*v)>"▤ plain list"</button>
             <Show when=move || tag_q.get().is_some() fallback=|| ()>
                 <button class="catx" title="clear filter" on:click=move |_| set_tag.set(None)>"×"</button>
             </Show>
@@ -4610,8 +4700,22 @@ fn CollectionPage() -> impl IntoView {
                         _ => {} // keep server order
                     }
                     let base = base.clone();
+                    let count = list.len();
+                    // Plain-text mode: one headword per line, with a copy button.
+                    if show_list.get() {
+                        let text = list.iter().map(|e| e.word.clone()).collect::<Vec<_>>().join("\n");
+                        let text_copy = text.clone();
+                        let rows = count.clamp(3, 24) as i32;
+                        return view! {
+                            <p class="counts">{format!("{count} words")}
+                                <button class="listcopy" title="copy the list to the clipboard"
+                                    on:click=move |_| copy_to_clipboard(&text_copy)>"copy"</button>
+                            </p>
+                            <textarea class="plainlist" readonly=true rows=rows prop:value=text></textarea>
+                        }.into_any();
+                    }
                     view! {
-                        <p class="counts">{format!("{} words", list.len())}</p>
+                        <p class="counts">{format!("{count} words")}</p>
                         <div class="wlist">
                             {list.into_iter().map(|e| {
                                 let word_href = (e.word_id > 0).then(|| {
