@@ -738,8 +738,10 @@ pub struct OcrEngineStatus {
     pub complete: bool,
 }
 
+// The DB/path/importer helpers below are pub(crate) so sibling modules (catalog,
+// booktags) reuse them instead of duplicating the path probing and schema setup.
 #[cfg(feature = "ssr")]
-fn db_path() -> String {
+pub(crate) fn db_path() -> String {
     if let Ok(p) = std::env::var("COOLWORDS_DB") {
         return p;
     }
@@ -753,7 +755,7 @@ fn db_path() -> String {
 
 /// Path to the per-user database (tags + collection). Self-contained; overridable.
 #[cfg(feature = "ssr")]
-fn user_db_path() -> String {
+pub(crate) fn user_db_path() -> String {
     if let Ok(p) = std::env::var("COOLWORDS_USER_DB") {
         return p;
     }
@@ -766,12 +768,12 @@ fn user_db_path() -> String {
 }
 
 #[cfg(feature = "ssr")]
-const USER_SCHEMA: &str = include_str!("../../schema/user.sql");
+pub(crate) const USER_SCHEMA: &str = include_str!("../../schema/user.sql");
 
 /// Additively add columns that postdate the original `tags` table (CREATE TABLE
 /// IF NOT EXISTS won't add them to an existing DB). Mirrors ingest/userdb.py.
 #[cfg(feature = "ssr")]
-fn migrate_user(u: &rusqlite::Connection) -> Result<(), ServerFnError> {
+pub(crate) fn migrate_user(u: &rusqlite::Connection) -> Result<(), ServerFnError> {
     // Columns of `tags` and `word_tags` that postdate their original CREATE TABLE.
     let cols = |table: &str| -> Result<HashSet<String>, ServerFnError> {
         let mut have = HashSet::new();
@@ -810,7 +812,7 @@ fn migrate_user(u: &rusqlite::Connection) -> Result<(), ServerFnError> {
 /// Open the user DB standalone (creating it + its schema/builtin tags if needed).
 /// Used by the tag-collection server fns that don't touch the dictionary.
 #[cfg(feature = "ssr")]
-fn open_user() -> Result<rusqlite::Connection, ServerFnError> {
+pub(crate) fn open_user() -> Result<rusqlite::Connection, ServerFnError> {
     let u = rusqlite::Connection::open(user_db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
     u.execute_batch(USER_SCHEMA).map_err(|e| ServerFnError::new(e.to_string()))?;
     migrate_user(&u)?;
@@ -820,7 +822,7 @@ fn open_user() -> Result<rusqlite::Connection, ServerFnError> {
 /// Open the dictionary DB with the user DB ATTACHed as `u`, so a single
 /// connection can join words/candidates against the user's tags.
 #[cfg(feature = "ssr")]
-fn open_conn() -> Result<rusqlite::Connection, ServerFnError> {
+pub(crate) fn open_conn() -> Result<rusqlite::Connection, ServerFnError> {
     open_user()?; // ensure the user DB + schema exist before attaching
     let conn = rusqlite::Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
     conn.execute("ATTACH DATABASE ?1 AS u", rusqlite::params![user_db_path()])
@@ -875,7 +877,7 @@ pub(crate) fn books_dir() -> std::path::PathBuf {
 
 /// Staging area for uploaded-but-not-committed files.
 #[cfg(feature = "ssr")]
-fn staging_dir() -> std::path::PathBuf {
+pub(crate) fn staging_dir() -> std::path::PathBuf {
     let d = books_dir().join(".staging");
     let _ = std::fs::create_dir_all(&d);
     d
@@ -889,7 +891,7 @@ pub(crate) fn python_exe() -> String {
 /// Run `python -m ingest.import_book <args>` and return its parsed JSON, turning a
 /// non-zero exit or an `{"ok": false, ...}` payload into a user-facing error.
 #[cfg(feature = "ssr")]
-fn run_importer(args: &[&str]) -> Result<serde_json::Value, ServerFnError> {
+pub(crate) fn run_importer(args: &[&str]) -> Result<serde_json::Value, ServerFnError> {
     let out = std::process::Command::new(python_exe())
         .current_dir(repo_root())
         .arg("-m")
@@ -918,7 +920,7 @@ fn run_importer(args: &[&str]) -> Result<serde_json::Value, ServerFnError> {
 
 /// Canonical book slug: lowercase, ascii-alnum + single dashes, <= 60 chars.
 #[cfg(feature = "ssr")]
-fn sanitize_slug(s: &str) -> String {
+pub(crate) fn sanitize_slug(s: &str) -> String {
     let mut out = String::new();
     let mut dash = false;
     for c in s.trim().to_lowercase().chars() {

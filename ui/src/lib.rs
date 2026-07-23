@@ -4,6 +4,8 @@
 #![recursion_limit = "1024"]
 
 pub mod app;
+pub mod booktags;
+pub mod catalog;
 #[cfg(feature = "ssr")]
 pub mod jobs;
 

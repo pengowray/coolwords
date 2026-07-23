@@ -1,7 +1,12 @@
 //! Background-job registry: long-running Python subprocesses (OCR, reingest,
-//! trajectory) run ONE AT A TIME with live progress + cancel, for the book manage
-//! page. Server fns can't see leptos context, so the registry is a global static
-//! (server fns are plain async fns in the axum/tokio process and can touch it).
+//! trajectory, catalog sync, bulk grab) run ONE AT A TIME with live progress +
+//! cancel, for the book manage page. Server fns can't see leptos context, so the
+//! registry is a global static (server fns are plain async fns in the axum/tokio
+//! process and can touch it).
+//!
+//! Any `ingest.*` module can be driven — see `start_module`. Every one of them
+//! keeps the same contract: human progress lines on stderr, exactly one JSON object
+//! on stdout.
 //!
 //! Cancel = set a flag + TREE-kill the OS process (on Windows, killing python alone
 //! leaves its tesseract child orphaned — taskkill /T takes the whole tree).
@@ -56,14 +61,42 @@ fn find_live(book_id: i64, kind: &str, tag: &str) -> Option<String> {
         .map(|j| j.prog.id.clone())
 }
 
-/// Snapshot for the client; also reaps jobs that finished > 10 min ago.
-pub fn status(id: &str) -> Option<JobProgress> {
-    let mut jobs = JOBS.lock().ok()?;
+/// Drop jobs that finished > 10 min ago. Callers already hold the lock.
+fn reap(jobs: &mut HashMap<String, Job>) {
     let cutoff = now().saturating_sub(600);
     jobs.retain(|_, j| {
         matches!(j.prog.status.as_str(), "queued" | "running") || j.prog.updated >= cutoff
     });
+}
+
+/// Snapshot for the client; also reaps jobs that finished > 10 min ago.
+pub fn status(id: &str) -> Option<JobProgress> {
+    let mut jobs = JOBS.lock().ok()?;
+    reap(&mut jobs);
     jobs.get(id).map(|j| j.prog.clone())
+}
+
+/// Every live/recent job, for the queue panel on /get and /books. Same reaping rule
+/// as `status`; running first, then most-recently-updated, so the panel's top row
+/// is always the thing actually happening right now.
+pub fn list() -> Vec<JobProgress> {
+    let mut jobs = match JOBS.lock() {
+        Ok(j) => j,
+        Err(_) => return Vec::new(),
+    };
+    reap(&mut jobs);
+    let mut out: Vec<JobProgress> = jobs.values().map(|j| j.prog.clone()).collect();
+    out.sort_by(|a, b| {
+        let rank = |s: &str| match s {
+            "running" => 0,
+            "queued" => 1,
+            _ => 2,
+        };
+        rank(&a.status)
+            .cmp(&rank(&b.status))
+            .then(b.updated.cmp(&a.updated))
+    });
+    out
 }
 
 pub fn cancel(id: &str) {
@@ -87,6 +120,24 @@ pub fn cancel(id: &str) {
     }
 }
 
+/// Stop everything of one kind — the bulk grab's panic button. Collect the ids
+/// first so we're not holding the registry lock while `cancel` re-takes it.
+pub fn cancel_all(kind: &str) {
+    let ids: Vec<String> = match JOBS.lock() {
+        Ok(jobs) => jobs
+            .values()
+            .filter(|j| {
+                j.prog.kind == kind && matches!(j.prog.status.as_str(), "queued" | "running")
+            })
+            .map(|j| j.prog.id.clone())
+            .collect(),
+        Err(_) => return,
+    };
+    for id in ids {
+        cancel(&id);
+    }
+}
+
 /// Kill an OS process and ALL its descendants (the python parent + its tesseract
 /// child). On Windows `taskkill /T`; elsewhere best-effort SIGKILL.
 fn tree_kill(pid: u32) {
@@ -107,6 +158,21 @@ fn tree_kill(pid: u32) {
 /// Start a background job running `python -m ingest.import_book <args>`. Returns the
 /// (existing, if duplicate) job id immediately; the work proceeds on a tokio task.
 pub fn start(kind: &str, book_id: i64, tag: &str, label: &str, args: Vec<String>) -> String {
+    start_module(kind, "ingest.import_book", book_id, tag, label, args)
+}
+
+/// The general form: run ANY `python -m <module> <args>` under the same one-at-a-time
+/// gate, progress parsing and cancel semantics. `kind` still selects the
+/// `parse_progress` arm and (with book_id + tag) the duplicate-request key, so a
+/// module can be driven under several kinds if its progress lines differ.
+pub fn start_module(
+    kind: &str,
+    module: &str,
+    book_id: i64,
+    tag: &str,
+    label: &str,
+    args: Vec<String>,
+) -> String {
     if let Some(existing) = find_live(book_id, kind, tag) {
         return existing;
     }
@@ -132,11 +198,18 @@ pub fn start(kind: &str, book_id: i64, tag: &str, label: &str, args: Vec<String>
         );
     }
     let kind = kind.to_string();
-    tokio::spawn(run(id.clone(), kind, args, cancel));
+    let module = module.to_string();
+    tokio::spawn(run(id.clone(), kind, module, args, cancel));
     id
 }
 
-async fn run(id: String, kind: String, args: Vec<String>, cancel: Arc<AtomicBool>) {
+async fn run(
+    id: String,
+    kind: String,
+    module: String,
+    args: Vec<String>,
+    cancel: Arc<AtomicBool>,
+) {
     // wait our turn (one job at a time)
     let _permit = GATE.acquire().await;
     if cancel.load(Ordering::Relaxed) {
@@ -151,7 +224,7 @@ async fn run(id: String, kind: String, args: Vec<String>, cancel: Arc<AtomicBool
     let mut child = match tokio::process::Command::new(python_exe())
         .current_dir(repo_root())
         .arg("-m")
-        .arg("ingest.import_book")
+        .arg(&module)
         .args(&args)
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
@@ -201,11 +274,13 @@ async fn run(id: String, kind: String, args: Vec<String>, cancel: Arc<AtomicBool
 
     let exit = child.wait().await;
     let out = out_task.await.unwrap_or_default();
-    let ok_json = serde_json::from_str::<serde_json::Value>(out.trim().lines().last().unwrap_or(""))
-        .ok()
-        .and_then(|v| v.get("ok").and_then(|b| b.as_bool()));
-    let err_msg = serde_json::from_str::<serde_json::Value>(out.trim().lines().last().unwrap_or(""))
-        .ok()
+    // Every ingest module's contract: the LAST stdout line is its single JSON object.
+    // Parse it once and read both fields off it.
+    let payload =
+        serde_json::from_str::<serde_json::Value>(out.trim().lines().last().unwrap_or("")).ok();
+    let ok_json = payload.as_ref().and_then(|v| v.get("ok").and_then(|b| b.as_bool()));
+    let err_msg = payload
+        .as_ref()
         .and_then(|v| v.get("error").and_then(|s| s.as_str()).map(str::to_string));
 
     if cancel.load(Ordering::Relaxed) {
@@ -254,6 +329,60 @@ fn parse_progress(kind: &str, line: &str) -> Option<(f32, String)> {
         "trajectory" => line
             .strip_prefix("trajectory: ")
             .map(|m| (-1.0, format!("usage charts: {}", m.trim()))),
+        // "catalog: standardebooks page 7/31" (determinate — SE is paged HTML) and
+        // "catalog: gutenberg 42000 rows" (indeterminate — one streamed CSV).
+        "catalog" => {
+            let (src, tail) = line.strip_prefix("catalog: ")?.trim().split_once(' ')?;
+            if let Some(frac) = tail.strip_prefix("page ") {
+                let (i, n) = frac.trim().split_once('/')?;
+                let (i, n): (f32, f32) = (i.trim().parse().ok()?, n.trim().parse().ok()?);
+                let pct = if n > 0.0 { i / n * 100.0 } else { -1.0 };
+                Some((pct, format!("{src}: page {} / {}", i as i64, n as i64)))
+            } else {
+                let n: i64 = tail.strip_suffix("rows")?.trim().parse().ok()?;
+                Some((-1.0, format!("{src}: {} rows", thousands(n))))
+            }
+        }
+        // "grab: 3/25 The Mystery of Edwin Drood" (determinate) and, per finished
+        // book, "grab: imported <slug>" — a note only, so it leaves percent alone.
+        "grab" => {
+            let rest = line.strip_prefix("grab: ")?.trim();
+            if let Some(slug) = rest.strip_prefix("imported ") {
+                return Some((-1.0, format!("imported {}", slug.trim())));
+            }
+            let (frac, title) = rest.split_once(' ').unwrap_or((rest, ""));
+            let (i, n) = frac.split_once('/')?;
+            let (i, n): (f32, f32) = (i.trim().parse().ok()?, n.trim().parse().ok()?);
+            let pct = if n > 0.0 { i / n * 100.0 } else { -1.0 };
+            Some((pct, format!("{} / {} {}", i as i64, n as i64, title).trim_end().to_string()))
+        }
+        // "rescore: score" — the two heavy steps of a library-wide re-score.
+        "rescore" => {
+            let step = line.strip_prefix("rescore: ")?.trim();
+            let pct = match step {
+                s if s.starts_with("score") => 40.0,
+                s if s.starts_with("cluster") => 80.0,
+                _ => -1.0,
+            };
+            Some((pct, format!("re-scoring: {step}")))
+        }
         _ => None,
     }
+}
+
+/// 42000 -> "42,000". Row counts stream past fast enough that unseparated digits
+/// are unreadable.
+fn thousands(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if n < 0 {
+        out.push('-');
+    }
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
