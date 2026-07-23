@@ -12,7 +12,15 @@ Data (`coolwords.db`, `coolwords_emb.npy`, `user.db`, `books/`) lives in
 > **Heads-up on the build:** this compiles Rust + `cargo-leptos` + wasm on the HAOS
 > box. Budget **20–60+ min** on first build and make sure the machine has a few GB of
 > free disk and enough RAM (a low-RAM box can OOM mid-compile). Rebuilds after code
-> changes are faster (cargo cache), but HA may discard build layers between reboots.
+> changes are much faster: the dependency graph is compiled in its own layer keyed
+> only on `ui/Cargo.toml` + `ui/Cargo.lock`, so editing app code recompiles one crate
+> instead of ~400. Only a dependency change (or HA discarding build layers, which it
+> may do between reboots) brings back the full cost.
+>
+> Note the Dockerfile deliberately uses **plain layer caching, not** BuildKit's
+> `RUN --mount=type=cache` — HAOS ships Docker with BuildKit disabled on purpose
+> ([operating-system#3935](https://github.com/home-assistant/operating-system/issues/3935),
+> closed wontfix), and under the classic builder `RUN --mount=` fails to parse.
 
 ---
 
