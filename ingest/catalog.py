@@ -127,13 +127,17 @@ def _get(url: str, *, binary: bool = False):
 
 # ------------------------------------------------------ gutenberg sync ---- #
 
-# PG's Authors field is "Surname, Given, 1812-1870 [Role]", '; '-separated. The
-# three suffixes come off in this order because a role bracket sits OUTSIDE the
+# PG's Authors field is "Surname, Given[, Title], 1812-1870 [Role]", '; '-separated.
+# The three suffixes come off in this order because a role bracket sits OUTSIDE the
 # life dates ("Dickens, Charles, 1812-1870 [Author of introduction, etc.]") and
 # would otherwise anchor the date pattern away from the end of the string.
 _ROLE = re.compile(r"\s*\[[^\]]*\]\s*$")
+# One end of a life-date range. Years are 1-4 digits, not 3-4: the classical
+# authors are exactly the ones with short years ("Tacitus, Cornelius, 56-117"),
+# and either end may carry a "?" and/or an era marker ("107 BCE-44 BCE").
+_YEAR = r"\d{1,4}\s*\??\s*(?:BCE|BC|CE|AD)?"
 _LIFE_DATES = re.compile(
-    r",\s*(?:\d{3,4}\??\s*-\s*(?:\d{3,4}\??)?|-\s*\d{3,4}\??)\s*$")
+    rf",\s*(?:{_YEAR}\s*-\s*(?:{_YEAR})?|-\s*{_YEAR})\s*$", re.I)
 # "Marie, de France, active 12th century" / "Homer, approximately 750 BCE"
 _FLOURISHED = re.compile(r",\s*(?:active|fl\.?|approximately|ca\.?)\s+[^,]*$", re.I)
 
@@ -154,12 +158,26 @@ def normalize_author(raw: str) -> str:
         name = _FLOURISHED.sub("", name).strip().strip(",").strip()
         if not name:
             continue
-        # A single comma means "Surname, Given"; anything else (or none) is
-        # already display order or something odd like "Various" / an org name.
-        if name.count(",") == 1:
-            surname, _, given = name.partition(",")
-            given, surname = given.strip(), surname.strip()
-            name = f"{given} {surname}".strip() if given else surname
+        pieces = [p.strip() for p in name.split(",")]
+        pieces = [p for p in pieces if p]
+        if len(pieces) >= 2:
+            # "Surname, Given" plus any number of trailing honorific/territorial
+            # components ("Alger, Horatio, Jr."; "Disraeli, Benjamin, Earl of
+            # Beaconsfield"). Only the first comma is the inversion point; the
+            # rest ride along after the name. Keeping them (rather than dropping
+            # them like the dates) means we never have to decide which words are
+            # titles, and never silently lose part of someone's name — but it is
+            # the swap that matters, because a search for "horatio alger" cannot
+            # match "Alger, Horatio, Jr.". ~5% of the catalog has such a tail.
+            surname, given, rest = pieces[0], pieces[1], pieces[2:]
+            # A lower-case second component is a nobiliary particle or epithet,
+            # not a given name ("Marie, de France"; "Pliny, the Elder") — those
+            # are already in reading order and only need the comma removed.
+            joined = (f"{surname} {given}" if given[:1].islower()
+                      else f"{given} {surname}")
+            name = ", ".join([joined, *rest])
+        # A single piece is already display order, or something odd like
+        # "Various" / an organisation name — either way, leave it alone.
         out.append(name)
     return "; ".join(out)
 
