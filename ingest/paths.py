@@ -89,14 +89,18 @@ BOOKS_DIR = Path(env("COOLWORDS_BOOKS_DIR", r"D:\datasets\coolwords\books"))
 STAGING_DIR = BOOKS_DIR / ".staging"
 
 # Project Gutenberg's robot policy forbids automated crawling of www.gutenberg.org
-# pages but explicitly sanctions downloading from a mirror. nabasny serves the
-# generated cache/epub files over working HTTPS (verified), so it is the default.
-# The two alternates ingest/catalog.py falls back to are both compromised in their
-# own way — https://gutenberg.pglaf.org has an EXPIRED certificate, and PG's own
-# master mirror http://aleph.gutenberg.org answers only over plain HTTP — which is
-# exactly why neither leads. What a plaintext hop costs here is not confidentiality
-# (the books are public domain) but INTEGRITY: nothing downstream authenticates the
-# bytes, so on that hop anyone on the path can substitute a different book.
-# Override per-machine to pick a closer mirror — see
-# https://www.gutenberg.org/MIRRORS.ALL for the full list.
-GUTENBERG_MIRROR = env("COOLWORDS_GUTENBERG_MIRROR", "https://gutenberg.nabasny.com").rstrip("/")
+# pages but explicitly sanctions downloading from a mirror. Old Dominion University
+# is on PG's OWN mirror list (https://www.gutenberg.org/MIRRORS.ALL, where its
+# `gutenberg-epub/` tree is listed as the generated epub/mobi tree), answers over
+# working HTTPS, and is flagged there as a high-speed connection — verified serving
+# pg2701.epub byte-identically. Staying on that list is the point: it is the only
+# thing that makes "this host may hand us a book" a decision PG made rather than
+# one we made. The fallbacks in ingest/catalog.py are listed too but each gives
+# something up — pglaf's certificate has expired, and PG's master mirror
+# aleph.gutenberg.org answers only over plain HTTP. What a plaintext hop costs
+# here is not confidentiality (the books are public domain) but INTEGRITY: nothing
+# downstream authenticates the bytes, so on that hop anyone on the path can
+# substitute a different book. Override per-machine to pick a closer mirror, but
+# prefer one from MIRRORS.ALL — and note the file layout differs between mirrors
+# (see _MIRROR_FALLBACKS / _DEFAULT_MIRROR_PATH in ingest/catalog.py).
+GUTENBERG_MIRROR = env("COOLWORDS_GUTENBERG_MIRROR", "https://mirror.cs.odu.edu/gutenberg-epub").rstrip("/")

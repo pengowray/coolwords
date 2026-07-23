@@ -232,19 +232,32 @@ def _record_sync(con, source: str, n_rows: int) -> None:
     con.commit()
 
 
-# Mirrors tried, in order, after the configured one. Mirrors rot — pglaf's TLS
-# certificate is expired, and aleph (Project Gutenberg's own master mirror, the one
-# every other mirror pulls from) only answers over plain HTTP, because its
-# certificate is issued for a different hostname. HTTPS ones go FIRST: what a
-# plaintext hop costs here isn't confidentiality (these are public-domain books)
-# but INTEGRITY — nothing downstream authenticates the bytes, so anyone on the path
-# can swap in a different book. aleph stays as a last resort, because a substituted
-# book still beats no download. Set COOLWORDS_GUTENBERG_MIRROR to pin one.
+# Mirrors tried, in order, after the configured one. Every entry is on PG's own
+# https://www.gutenberg.org/MIRRORS.ALL list — that list IS the trust anchor for
+# "which host may hand us a book", so a well-behaved unlisted third party still
+# never leads. Mirrors rot, so order them by what they give up: ODU serves HTTPS
+# and is flagged high-speed; pglaf's TLS certificate has expired; aleph (PG's
+# master mirror, the one the others pull from) answers only over plain HTTP,
+# because its certificate is issued for a different hostname. HTTPS goes FIRST.
+# What a plaintext hop costs here isn't confidentiality (these are public-domain
+# books) but INTEGRITY — nothing downstream authenticates the bytes, so on that
+# hop anyone on the path can swap in a different book. aleph is last rather than
+# absent because a wrong book is a visible, recoverable failure for a personal
+# word-research tool: you'd see it in the import preview. Set
+# COOLWORDS_GUTENBERG_MIRROR to pin one (ideally a closer one off that list).
+# Layouts differ: the ODU `gutenberg-epub/` tree IS the generated-file tree (ids
+# sit at its root), while pglaf/aleph expose the same files under a `cache/epub/`
+# prefix — hence a path template per mirror rather than one fixed shape.
 _MIRROR_FALLBACKS = (
-    "https://gutenberg.nabasny.com",
-    "https://gutenberg.pglaf.org",
-    "http://aleph.gutenberg.org",
+    ("https://mirror.cs.odu.edu/gutenberg-epub", "{id}/pg{id}.{fmt}"),
+    ("https://gutenberg.pglaf.org", "cache/epub/{id}/pg{id}.{fmt}"),
+    ("http://aleph.gutenberg.org", "cache/epub/{id}/pg{id}.{fmt}"),
 )
+
+# Layout for a base we weren't shipped a template for (i.e. one the user pinned
+# via COOLWORDS_GUTENBERG_MIRROR). `cache/epub/` is the layout of PG's master
+# mirror, so it is the right guess for an arbitrary mirror of that tree.
+_DEFAULT_MIRROR_PATH = "cache/epub/{id}/pg{id}.{fmt}"
 
 
 # Hosts benched after a connection-level failure this run: host -> [when, why, skips].
@@ -282,17 +295,30 @@ def _dead_reason(host: str) -> str:
 
 
 def _mirror_bases() -> list[str]:
-    """The configured mirror first, then the fallbacks, deduped."""
-    out = [GUTENBERG_MIRROR]
-    out += [m for m in _MIRROR_FALLBACKS if m not in out]
+    """The configured mirror first, then the shipped fallbacks, deduped."""
+    out = [GUTENBERG_MIRROR.rstrip("/")]
+    out += [b for b, _ in _MIRROR_FALLBACKS if b.rstrip("/") not in out]
     return out
 
 
+def _mirror_path(base: str) -> str:
+    """The file-path template for a mirror base (see _MIRROR_FALLBACKS)."""
+    base = base.rstrip("/")
+    for b, path in _MIRROR_FALLBACKS:
+        if b.rstrip("/") == base:
+            return path
+    return _DEFAULT_MIRROR_PATH
+
+
 def gutenberg_url(pg_id: str, fmt: str = "epub", base: str = "") -> str:
-    """The mirror path for a PG id. VERIFIED: <mirror>/cache/epub/2701/pg2701.epub
-    (727,431 bytes) and .../pg2701.txt. Never www.gutenberg.org — see the module
-    docstring: crawling their pages is against their robot policy."""
-    return f"{(base or GUTENBERG_MIRROR).rstrip('/')}/cache/epub/{pg_id}/pg{pg_id}.{fmt}"
+    """The download URL for a PG id on `base` (default: the configured mirror).
+
+    VERIFIED against ODU, the default: <base>/2701/pg2701.epub is 727,431 bytes
+    and .../pg2701.txt is 1,276,263 — byte-identical to what pglaf served. Never
+    www.gutenberg.org: crawling their pages is against their robot policy (see
+    the module docstring); mirrors are the sanctioned path."""
+    base = (base or GUTENBERG_MIRROR).rstrip("/")
+    return f"{base}/{_mirror_path(base).format(id=pg_id, fmt=fmt)}"
 
 
 def sync_gutenberg(con, limit_rows: int | None = None) -> int:
