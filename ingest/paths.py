@@ -3,8 +3,9 @@
 Edit DATASETS if the downloaded datasets move. Everything else is derived.
 
 A repo-root `.env` (gitignored) can override a few user-specific paths without
-touching code; see `load_dotenv` / `env` below. The only knob today is
-`COOLWORDS_BOOKS_DIR` (where the import UI copies dropped books).
+touching code; see `load_dotenv` / `env` below. Today's knobs are
+`COOLWORDS_BOOKS_DIR` (where the import UI copies dropped books) and
+`COOLWORDS_GUTENBERG_MIRROR` (which mirror ingest/catalog.py downloads from).
 """
 import os
 from pathlib import Path
@@ -80,3 +81,21 @@ def env(name: str, default: str = "") -> str:
 # (real env var or repo `.env`); defaults to a location outside the repo so the
 # (potentially large) imported corpus isn't mixed into version control.
 BOOKS_DIR = Path(env("COOLWORDS_BOOKS_DIR", r"D:\datasets\coolwords\books"))
+
+# Scratch space for files on their way in: browser uploads land here before
+# --inspect / --commit, and ingest/catalog.py downloads here before importing.
+# Must stay in lockstep with the Rust staging_dir() in ui/src/app.rs, which is
+# likewise books_dir().join(".staging").
+STAGING_DIR = BOOKS_DIR / ".staging"
+
+# Project Gutenberg's robot policy forbids automated crawling of www.gutenberg.org
+# pages but explicitly sanctions downloading from a mirror. aleph is PG's own
+# master mirror — the server every other mirror pulls from — and serves the
+# generated cache/epub files over plain HTTP (its certificate is issued for a
+# different hostname, and these are public-domain books, so there is nothing to
+# protect in transit). The obvious alternative, https://gutenberg.pglaf.org, had
+# an EXPIRED TLS certificate when this was last checked; ingest/catalog.py keeps
+# it and https://gutenberg.nabasny.com as automatic fallbacks either way.
+# Override per-machine to pick a closer mirror — see
+# https://www.gutenberg.org/MIRRORS.ALL for the full list.
+GUTENBERG_MIRROR = env("COOLWORDS_GUTENBERG_MIRROR", "http://aleph.gutenberg.org").rstrip("/")

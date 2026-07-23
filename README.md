@@ -62,6 +62,37 @@ python -m ingest.cluster --slug gutenberg-2701 --k 16 --top 20   # clusters + sh
 - **cluster** groups candidates by embedding (themes) and greedily picks a
   varied top-20, skipping words too similar to an already-picked one (shadowing).
 
+### Finding books: the catalog
+
+Rather than hunting for files by hand, mirror the public catalogs locally once
+and search them offline:
+
+```pwsh
+python -m ingest.catalog --sync all              # ~75k Gutenberg + ~1.5k Standard Ebooks
+python -m ingest.catalog --search "melville" --limit 10
+python -m ingest.catalog --grab '[{"source":"gutenberg","source_id":"2701"}]'
+```
+
+`--grab` downloads and imports without scoring; run `python -m ingest.import_book
+--rescore <slug>` per book afterwards (the UI queues this for you). Add
+`--max-pages N` / `--limit-rows N` to cap a sync when smoke-testing the parsers.
+
+Politeness is baked in, and the rules are not optional:
+
+- **Gutenberg downloads go through a mirror** (`COOLWORDS_GUTENBERG_MIRROR`,
+  default `https://gutenberg.pglaf.org`). Their robot policy forbids automated
+  crawling of `www.gutenberg.org` pages but explicitly sanctions the offline
+  catalog file and mirror downloads — so we fetch the one gzipped
+  `pg_catalog.csv.gz` from the main site and everything else from the mirror,
+  with a 2s gap between requests (their own `wget -w 2` guidance).
+- **Standard Ebooks is parsed from the public HTML catalog**, not the OPDS feed:
+  `/feeds/opds` and the bulk archives are gated behind Patrons Circle membership
+  and return 401. The `?view=list` pages are RDFa-annotated and public; 1s
+  between requests.
+- Every request carries a descriptive User-Agent and goes through one per-host
+  throttle. Syncing is an explicit action — searching never touches the network,
+  and a book already in the DB is never re-downloaded.
+
 ## 3. Rating UI (Rust / Leptos)
 
 ```pwsh

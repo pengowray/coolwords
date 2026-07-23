@@ -234,7 +234,14 @@ def _run_step(args: list[str]) -> dict:
 
 
 def do_commit(path: Path, slug: str, title: str, author: str, year, orig_filename: str,
-              run_pipeline: bool) -> dict:
+              run_pipeline: bool, source: str = "", source_id: str = "") -> dict:
+    """Copy a file into BOOKS_DIR, ingest its histogram, optionally run the pipeline.
+
+    `source` / `source_id` override whatever the extractor sniffed out of the file.
+    That matters for catalogue downloads (ingest/catalog.py): a Standard Ebooks
+    epub only announces itself as a generic 'epub', but we know it came from
+    standardebooks.org with a canonical id, and recording that is what lets the
+    catalogue search grey out books we already have."""
     path = Path(path)
     # Import is always fast: PDFs use their embedded text layer (a scan imports as a
     # near-empty placeholder). Re-OCR + source switching happen later on the manage
@@ -260,8 +267,8 @@ def do_commit(path: Path, slug: str, title: str, author: str, year, orig_filenam
     meta = {
         "title": title or ex.title,
         "author": author or ex.author,
-        "source": ex.source or "import",
-        "source_id": ex.source_id,
+        "source": source or ex.source or "import",
+        "source_id": source_id or ex.source_id,
         "year": year,
         "content_hash": chash,
         "format": ex.fmt,
@@ -393,6 +400,37 @@ def do_reingest(slug: str, text_source: str, run_pipeline: bool = True) -> dict:
             "n_tokens": n_tokens, "n_types": n_types, "candidates": n_cand, "pipeline": steps}
 
 
+def do_rescore(slug: str) -> dict:
+    """Re-run score + cluster for an already-imported book (no re-extraction).
+
+    The bulk catalogue grab (ingest/catalog.py --grab) imports with
+    run_pipeline=False so the download batch stays fast; the Rust job queue then
+    runs this once per new book, one at a time under the job semaphore. Also the
+    right thing to run after a scoring-parameter change. Deliberately does NOT
+    touch ingest.trajectory — that pass is global and slow, so it's a separate
+    --refresh-trajectory job run once at the end rather than per book."""
+    con = connect()
+    row = con.execute("SELECT id FROM books WHERE slug = ?", (slug,)).fetchone()
+    con.close()
+    if not row:
+        return {"ok": False, "code": "NO_BOOK", "error": f"no book '{slug}'"}
+    book_id = row[0]
+
+    steps = []
+    print("rescore: score", file=sys.stderr, flush=True)
+    steps.append(_run_step(["ingest.score", "--slug", slug]))
+    print("rescore: cluster", file=sys.stderr, flush=True)
+    steps.append(_run_step(["ingest.cluster", "--slug", slug]))
+
+    con = connect()
+    n_cand = con.execute(
+        "SELECT count(*) FROM candidates WHERE book_id = ? AND level = 0", (book_id,)
+    ).fetchone()[0]
+    con.close()
+    return {"ok": all(s["ok"] for s in steps), "slug": slug, "book_id": book_id,
+            "candidates": n_cand, "pipeline": steps}
+
+
 def do_refresh_trajectory() -> dict:
     """Re-run the global per-decade usage pass (covers any new words after a source
     switch). Slow — streams the ngram shards; run as a background job."""
@@ -414,6 +452,8 @@ def main() -> None:
                    help="re-tokenize a committed book from a chosen --text-source")
     g.add_argument("--ocr-status", metavar="SLUG", dest="ocr_status",
                    help="report OCR cache + text-source state for a committed book")
+    g.add_argument("--rescore", metavar="SLUG",
+                   help="re-run score + cluster for an already-imported book (background job)")
     g.add_argument("--refresh-trajectory", action="store_true", dest="refresh_trajectory",
                    help="re-run the global usage-over-time pass (background job)")
     ap.add_argument("--slug", default="")
@@ -421,6 +461,10 @@ def main() -> None:
     ap.add_argument("--author", default="")
     ap.add_argument("--year", default="")
     ap.add_argument("--orig-filename", default="")
+    ap.add_argument("--source", default="",
+                    help="--commit: override the sniffed source ('gutenberg', 'standardebooks')")
+    ap.add_argument("--source-id", default="", dest="source_id",
+                    help="--commit: override the sniffed source id")
     ap.add_argument("--no-pipeline", action="store_true")
     ap.add_argument("--engine", default="", help="OCR engine: tesseract | rapidocr (default: auto)")
     ap.add_argument("--pages", default="", help="pages for --ocr-compare, 1-based: '1,5,9-12'")
@@ -441,6 +485,8 @@ def main() -> None:
             if not args.text_source:
                 raise SystemExit("--reingest requires --text-source embedded|ocr:<engine>")
             result = do_reingest(args.reingest, args.text_source, run_pipeline=not args.no_pipeline)
+        elif args.rescore:
+            result = do_rescore(args.rescore)
         elif args.refresh_trajectory:
             result = do_refresh_trajectory()
         else:
@@ -448,7 +494,8 @@ def main() -> None:
                 raise SystemExit("--commit requires --slug")
             year = int(args.year) if re.fullmatch(r"\d{3,4}", args.year.strip()) else None
             result = do_commit(Path(args.commit), args.slug, args.title, args.author,
-                               year, args.orig_filename, run_pipeline=not args.no_pipeline)
+                               year, args.orig_filename, run_pipeline=not args.no_pipeline,
+                               source=args.source, source_id=args.source_id)
     except (ExtractError, OcrError) as e:
         result = {"ok": False, "code": e.code, "error": str(e)}
     except Exception as e:  # surface any failure as JSON the UI can show
