@@ -31,6 +31,7 @@ background-job progress bar (ui/src/jobs.rs).
 import argparse
 import csv
 import gzip
+import http.client
 import json
 import re
 import sys
@@ -48,6 +49,11 @@ SOURCES = ("gutenberg", "standardebooks")
 
 USER_AGENT = "coolwords/0.1 (personal word-research tool; +local)"
 TIMEOUT = 60.0
+# Ceiling on any single response we'll hold in memory. The largest thing we fetch
+# is the PG catalog (~14 MB compressed) and the odd fat illustrated epub; anything
+# past this is a mirror misbehaving (or a hostile response on the plain-HTTP hop),
+# and a per-item failure is a far better outcome than an OOM mid-batch.
+MAX_DOWNLOAD = 128 * 1024 * 1024
 
 GUTENBERG_CATALOG = "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"
 SE_BASE = "https://standardebooks.org"
@@ -118,7 +124,22 @@ def _get(url: str, *, binary: bool = False):
     Handles a server that gzips anyway (some mirrors ignore identity) and .gz
     URLs, so callers never think about content encoding."""
     with _open(url) as resp:
-        data = resp.read()
+        # Bound what we're willing to hold in memory: the body is unauthenticated
+        # (and attacker-substitutable on a plain-HTTP mirror hop), so an unbounded
+        # read turns "a mirror served us nonsense" into "the importer OOMs".
+        declared = (resp.headers.get("Content-Length") or "").strip()
+        n = int(declared) if declared.isdigit() else None
+        if n is not None and n > MAX_DOWNLOAD:
+            raise CatalogError(f"{url}: declares {n} bytes, over the {MAX_DOWNLOAD} "
+                               f"byte ceiling", code="TOO_LARGE")
+        # A NO-ARGUMENT read() is what makes http.client verify the declared length
+        # and raise IncompleteRead on a truncated body; read(amt) just returns short,
+        # which would hand a half-downloaded epub to the importer. So only use the
+        # capped form when the server declared nothing to bound us (chunked/close).
+        data = resp.read() if n is not None else resp.read(MAX_DOWNLOAD + 1)
+        if len(data) > MAX_DOWNLOAD:
+            raise CatalogError(f"{url}: response exceeds {MAX_DOWNLOAD} bytes",
+                               code="TOO_LARGE")
         enc = (resp.headers.get("Content-Encoding") or "").lower()
     if enc == "gzip" or (url.endswith(".gz") and data[:2] == b"\x1f\x8b"):
         data = gzip.decompress(data)
@@ -212,21 +233,52 @@ def _record_sync(con, source: str, n_rows: int) -> None:
 
 
 # Mirrors tried, in order, after the configured one. Mirrors rot — pglaf's TLS
-# certificate expired at some point, and aleph (Project Gutenberg's own master
-# mirror, the one every other mirror pulls from) serves the cache over plain HTTP
-# because its certificate is issued for a different hostname. Plain HTTP is fine
-# here: these are public-domain books, there's nothing to keep confidential, and
-# the alternative is a dead download. Set COOLWORDS_GUTENBERG_MIRROR to pin one.
+# certificate is expired, and aleph (Project Gutenberg's own master mirror, the one
+# every other mirror pulls from) only answers over plain HTTP, because its
+# certificate is issued for a different hostname. HTTPS ones go FIRST: what a
+# plaintext hop costs here isn't confidentiality (these are public-domain books)
+# but INTEGRITY — nothing downstream authenticates the bytes, so anyone on the path
+# can swap in a different book. aleph stays as a last resort, because a substituted
+# book still beats no download. Set COOLWORDS_GUTENBERG_MIRROR to pin one.
 _MIRROR_FALLBACKS = (
-    "http://aleph.gutenberg.org",
     "https://gutenberg.nabasny.com",
     "https://gutenberg.pglaf.org",
+    "http://aleph.gutenberg.org",
 )
 
 
-# Mirror hosts that failed at the connection level this run — skipped for the rest
-# of the process so a bulk grab doesn't re-handshake with a dead server per book.
-_dead_hosts: set[str] = set()
+# Hosts benched after a connection-level failure this run: host -> [when, why, skips].
+# Benching stops a bulk grab re-handshaking with a dead server once per book, but it
+# is bounded in BOTH time and skipped attempts, because the failure is just as likely
+# to be at our end (DNS, a dropped link, a VPN reconnect) — and a permanent bench
+# there would fail books 2..200 of a grab without making a single request, forever.
+# `why` is kept so those later books report the real network error rather than a bare
+# "no candidate URLs".
+_DEAD_TTL = 300.0
+_DEAD_SKIPS = 25
+_dead_hosts: dict[str, list] = {}
+# Consecutive connection-level failures per host, reset by a good download. Gutenberg
+# is benched on the first strike (it has other mirrors); a single-source host like
+# Standard Ebooks gets a few chances before we write it off — but it MUST eventually
+# be written off, or an outage costs TIMEOUT seconds on every remaining book.
+_conn_fails: dict[str, int] = {}
+
+
+def _bench(host: str, reason: str) -> None:
+    _dead_hosts[host] = [time.monotonic(), reason, 0]
+
+
+def _dead_reason(host: str) -> str:
+    """Why `host` is benched right now, or "" if it isn't (any more)."""
+    hit = _dead_hosts.get(host)
+    if hit is None:
+        return ""
+    when, why, skips = hit
+    if time.monotonic() - when >= _DEAD_TTL or skips >= _DEAD_SKIPS:
+        del _dead_hosts[host]       # re-probe: the outage may well have been ours
+        return ""
+    hit[2] = skips + 1
+    return why
 
 
 def _mirror_bases() -> list[str]:
@@ -285,6 +337,14 @@ def sync_gutenberg(con, limit_rows: int | None = None) -> int:
     if batch:
         con.executemany(_UPSERT, batch)
     con.commit()
+    # 0 kept rows is a broken scraper, not an empty upstream — the filtered catalog
+    # is ~75k rows. Raising (rather than stamping catalog_sync) is the only way the
+    # user finds out: a recorded 0-row sync leaves the previous sync's rows in place
+    # and makes the Get-books page read "synced just now" over stale data.
+    if n == 0 and not limit_rows:
+        raise CatalogError("gutenberg sync kept 0 rows — the catalog CSV's columns "
+                           "probably changed (expected Text#, Type, Language)",
+                           code="SYNC_EMPTY")
     _record_sync(con, "gutenberg", n)
     _progress(f"catalog: gutenberg {n} rows (done)")
     return n
@@ -324,7 +384,12 @@ class _SEListParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.entries: list[dict] = []
         self._cur: dict | None = None
-        self._li_depth = 0          # nested <li> count inside the current entry
+        # Where the current entry's own <li> sits on the stack, -1 when idle. The
+        # entry closes when that frame leaves the stack — derived from the stack
+        # rather than counted separately, because </li> is OPTIONAL in HTML5: a
+        # counter left too high by an omitted </li> would silently swallow every
+        # entry on the page (and the unwind loop below repairs only the stack).
+        self._li_index = -1
         self._stack: list[tuple[str, dict]] = []
         self._tag_buf = ""          # text of the <a> currently inside <ul class="tags">
 
@@ -352,13 +417,10 @@ class _SEListParser(HTMLParser):
     # -- HTMLParser hooks ------------------------------------------------- #
     def handle_starttag(self, tag: str, attrs) -> None:
         a = {k: (v or "") for k, v in attrs}
-        if tag == "li":
-            if self._cur is None and a.get("typeof") == "schema:Book":
-                self._cur = {"about": a.get("about", ""), "title": "",
-                             "author": "", "details": "", "tags": []}
-                self._li_depth = 0
-            if self._cur is not None:
-                self._li_depth += 1
+        if tag == "li" and self._cur is None and a.get("typeof") == "schema:Book":
+            self._cur = {"about": a.get("about", ""), "title": "",
+                         "author": "", "details": "", "tags": []}
+            self._li_index = len(self._stack)   # where the push below will land
         if tag == "a" and self._sink() == "tag":
             self._tag_buf = ""
         if tag not in _VOID:
@@ -378,11 +440,22 @@ class _SEListParser(HTMLParser):
             if self._stack[i][0] == tag:
                 del self._stack[i:]
                 break
-        if tag == "li" and self._cur is not None:
-            self._li_depth -= 1
-            if self._li_depth <= 0:
-                self.entries.append(self._cur)
-                self._cur = None
+        # The entry ends when its own <li> frame leaves the stack — by its own
+        # </li>, or by an enclosing </ul> unwinding past it. Checked for ANY end
+        # tag, so an omitted or stray </li> inside the entry is harmless.
+        if self._cur is not None and len(self._stack) <= self._li_index:
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._cur is not None:
+            self.entries.append(self._cur)
+        self._cur = None
+        self._li_index = -1
+
+    def close(self) -> None:
+        """Flush a still-open entry: an unclosed final <li> must not lose a book."""
+        super().close()
+        self._flush()
 
     def handle_data(self, data: str) -> None:
         sink = self._sink()
@@ -479,6 +552,13 @@ def sync_standardebooks(con, max_pages: int | None = None) -> int:
         con.commit()
         n += len(batch)
         page += 1
+    # Same reasoning as sync_gutenberg: the terminator above ("no entries" / "no new
+    # ids") is deliberately indistinguishable from a parse failure, so a markup change
+    # would otherwise break on page 1 and be recorded as a clean, complete sync.
+    if n == 0 and not max_pages:
+        raise CatalogError("standardebooks sync parsed 0 entries on page 1 — the "
+                           "catalog markup probably changed (expected "
+                           '<li typeof="schema:Book" about=…>)', code="SYNC_EMPTY")
     _record_sync(con, "standardebooks", n)
     _progress(f"catalog: standardebooks {n} rows (done)")
     return n
@@ -487,13 +567,26 @@ def sync_standardebooks(con, max_pages: int | None = None) -> int:
 def do_sync(which: str, max_pages: int | None, limit_rows: int | None) -> dict:
     con = connect()
     counts: dict[str, int] = {}
+    errors: list[str] = []
     try:
-        if which in ("gutenberg", "all"):
-            counts["gutenberg"] = sync_gutenberg(con, limit_rows=limit_rows)
-        if which in ("standardebooks", "all"):
-            counts["standardebooks"] = sync_standardebooks(con, max_pages=max_pages)
+        for src, run in (
+            ("gutenberg", lambda: sync_gutenberg(con, limit_rows=limit_rows)),
+            ("standardebooks", lambda: sync_standardebooks(con, max_pages=max_pages)),
+        ):
+            if which not in (src, "all"):
+                continue
+            try:
+                counts[src] = run()
+            except CatalogError as e:   # one dead scraper must not hide the other
+                counts[src] = 0
+                errors.append(str(e))
     finally:
         con.close()
+    if errors:
+        # ok:false + error is the contract ui/src/jobs.rs already understands, so the
+        # job goes red with the real reason instead of green with nothing to show.
+        return {"ok": False, "code": "SYNC_EMPTY", "counts": counts,
+                "error": "; ".join(errors)}
     return {"ok": True, "counts": counts}
 
 
@@ -555,11 +648,16 @@ def do_search(query: str, source: str, subject: str, sort: str,
 
     cols = ", ".join(f"c.{c}" for c in _COLS)
     rows = con.execute(
-        # The LEFT JOIN is the whole point of keeping the catalog in coolwords.db:
-        # one query tells the UI both "here are the matches" and "these are already
-        # imported" (so it can grey them out instead of offering a no-op download).
-        f"SELECT {cols}, b.slug FROM catalog_books c "
-        f"LEFT JOIN books b ON b.source = c.source AND b.source_id = c.source_id"
+        # Keeping the catalog in coolwords.db is what lets one query say both "here
+        # are the matches" and "these are already imported" (so the UI can grey them
+        # out instead of offering a no-op download). A correlated subquery, NOT a
+        # LEFT JOIN: `books` has no UNIQUE(source, source_id) — the same PG book
+        # dropped in as .txt and as .epub lands twice with different content_hash —
+        # and a join would fan one catalog row out into several, duplicating rows and
+        # desyncing the page window from `total`, which is counted without the join.
+        f"SELECT {cols}, (SELECT b.slug FROM books b "
+        f"                 WHERE b.source = c.source AND b.source_id = c.source_id "
+        f"                 ORDER BY b.id LIMIT 1) FROM catalog_books c"
         f"{where} ORDER BY {order} LIMIT ? OFFSET ?",
         [*params, *order_params, limit, offset],
     ).fetchall()
@@ -652,26 +750,42 @@ def download(row: dict, dest_dir: Path) -> tuple[Path, str]:
     last = "no candidate URLs"
     for fmt, url in _attempts(row):
         host = urllib.parse.urlsplit(url).netloc
-        if host in _dead_hosts:
+        dead = _dead_reason(host)
+        if dead:
+            # Record WHY we're skipping: otherwise a batch poisoned by an earlier
+            # outage reports "no candidate URLs", which reads as a catalog problem.
+            last = f"{url}: {dead} (host benched earlier this run)"
             continue
         try:
             data = _get(url, binary=True)
         except urllib.error.HTTPError as e:
             last = f"{url}: {e}"    # 404 — this file is missing, the mirror is fine
             continue
+        except http.client.HTTPException as e:
+            # A truncated or malformed body (IncompleteRead, BadStatusLine). These
+            # subclass Exception, NOT OSError, and urllib only wraps what getresponse()
+            # raises — not what resp.read() does — so without this clause one clean
+            # mid-body disconnect escapes the loop and the other mirrors are never
+            # tried. The host answered, so don't bench it: just take the next candidate.
+            last = f"{url}: {type(e).__name__}: {e}"
+            continue
         except (urllib.error.URLError, OSError) as e:
-            # Connection-level (expired cert, DNS, refused): the MIRROR is out, so
-            # stop paying for it on every remaining book of a bulk grab. Only for
-            # Gutenberg, where alternatives exist — one blip must not blacklist
-            # Standard Ebooks, which has no second source.
-            if row["source"] == "gutenberg":
-                _dead_hosts.add(host)
+            # Connection-level (expired cert, DNS, refused, timeout): the MIRROR is
+            # out, so stop paying TIMEOUT seconds for it on every remaining book of a
+            # bulk grab. Gutenberg is benched immediately (alternatives exist); a
+            # single-source host only after a few strikes, so one blip can't retire
+            # Standard Ebooks — but a real outage still stops costing a minute a book.
+            n = _conn_fails.get(host, 0) + 1
+            _conn_fails[host] = n
+            if row["source"] == "gutenberg" or n >= 3:
+                _bench(host, str(e))
             last = f"{url}: {e}"
             continue
         bad = _looks_wrong(data, fmt)
         if bad:
             last = f"{url}: {bad}"
             continue
+        _conn_fails.pop(host, None)
         out = dest_dir / _safe_name(row["source"], row["source_id"], fmt)
         out.write_bytes(data)
         return out, fmt
@@ -753,16 +867,46 @@ def do_grab(items: list[dict], dest: str) -> dict:
                 continue
 
             path, fmt = download(row, dest_dir)
-            res = do_commit(path, slug, row["title"] or "", row["author"] or "",
-                            row["year"], path.name, run_pipeline=False,
-                            source=source, source_id=source_id)
+            try:
+                res = do_commit(path, slug, row["title"] or "", row["author"] or "",
+                                row["year"], path.name, run_pipeline=False,
+                                source=source, source_id=source_id)
+            finally:
+                # do_commit COPIES into BOOKS_DIR, so the download is dead weight the
+                # moment it returns — and nothing else ever sweeps it, so a 200-book
+                # grab would leave a second copy of every epub inside BOOKS_DIR/.staging
+                # forever, inflating every backup of the corpus. Only ever delete our
+                # own scratch file: with an explicit --dest the file is the caller's,
+                # and --dest could even be BOOKS_DIR, where it IS the committed book.
+                try:
+                    if dest_dir.resolve() == STAGING_DIR.resolve():
+                        path.unlink(missing_ok=True)
+                except OSError:
+                    pass        # a stray file is not worth failing the item over
             if not res.get("ok"):
                 # A content-hash collision means we already have this text under
                 # another slug — that's a skip, not an error.
                 if res.get("code") == "DUPLICATE":
+                    dup = res.get("slug")
+                    # ...but the row we collided with may be a hand-import, whose
+                    # identity ('epub'/'pdf', no id) the /get "already imported"
+                    # lookup can never match — so the catalog row stays un-greyed and we
+                    # re-download the same megabytes on every future bulk grab. Only
+                    # claim the identity when the row hasn't got one of its own, so a
+                    # genuine cross-catalog text collision is left alone.
+                    if dup:
+                        con = connect()
+                        try:
+                            con.execute(
+                                "UPDATE books SET source = ?, source_id = ? WHERE slug = ? "
+                                "AND (source_id IS NULL OR source_id = '')",
+                                (source, source_id, dup))
+                            con.commit()
+                        finally:
+                            con.close()
                     skipped.append({"source": source, "source_id": source_id,
-                                    "slug": None, "reason": res.get("error", "duplicate")})
-                    _progress("grab: skipped (duplicate content)")
+                                    "slug": dup, "reason": res.get("error", "duplicate")})
+                    _progress(f"grab: skipped {dup or ''} (duplicate content)")
                 else:
                     failed.append({"source": source, "source_id": source_id,
                                    "error": res.get("error", "import failed")})
@@ -777,8 +921,19 @@ def do_grab(items: list[dict], dest: str) -> dict:
             failed.append({"source": source, "source_id": source_id, "error": msg})
             _progress(f"grab: failed {source}:{source_id} — {msg}")
 
-    return {"ok": True, "n": n, "imported": imported,
-            "skipped": skipped, "failed": failed}
+    out = {"ok": not failed, "n": n, "imported": imported,
+           "skipped": skipped, "failed": failed}
+    if failed:
+        # jobs.rs surfaces only `ok` and `error` off this payload, so fold the count
+        # and the first reason into a sentence. Without it a batch in which every
+        # mirror was down shows up in the queue panel as a green "done" at 100% and
+        # the user's only clue is that nothing ever appears in the library.
+        out["code"] = "PARTIAL" if imported else "ALL_FAILED"
+        out["error"] = (f"{len(failed)} of {n} failed ({len(imported)} imported) — "
+                        f"{failed[0]['error']}")
+    _progress(f"grab: done {len(imported)} imported, {len(skipped)} skipped, "
+              f"{len(failed)} failed")
+    return out
 
 
 def _parse_items(raw: str) -> list[dict]:

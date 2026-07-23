@@ -256,7 +256,10 @@ def do_commit(path: Path, slug: str, title: str, author: str, year, orig_filenam
     dup_slug, dup_title = _dup_lookup(con, chash, exclude_slug=slug)
     if dup_slug:
         con.close()
-        return {"ok": False, "code": "DUPLICATE",
+        # slug/title as fields, not just prose: ingest/catalog.py's bulk grab needs
+        # to know WHICH book we collided with, so it can stamp the catalog identity
+        # onto a hand-imported row and stop re-downloading it on every future grab.
+        return {"ok": False, "code": "DUPLICATE", "slug": dup_slug, "title": dup_title,
                 "error": f"Identical content already imported as '{dup_title}' ({dup_slug})."}
 
     BOOKS_DIR.mkdir(parents=True, exist_ok=True)

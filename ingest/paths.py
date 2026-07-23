@@ -89,13 +89,14 @@ BOOKS_DIR = Path(env("COOLWORDS_BOOKS_DIR", r"D:\datasets\coolwords\books"))
 STAGING_DIR = BOOKS_DIR / ".staging"
 
 # Project Gutenberg's robot policy forbids automated crawling of www.gutenberg.org
-# pages but explicitly sanctions downloading from a mirror. aleph is PG's own
-# master mirror — the server every other mirror pulls from — and serves the
-# generated cache/epub files over plain HTTP (its certificate is issued for a
-# different hostname, and these are public-domain books, so there is nothing to
-# protect in transit). The obvious alternative, https://gutenberg.pglaf.org, had
-# an EXPIRED TLS certificate when this was last checked; ingest/catalog.py keeps
-# it and https://gutenberg.nabasny.com as automatic fallbacks either way.
+# pages but explicitly sanctions downloading from a mirror. nabasny serves the
+# generated cache/epub files over working HTTPS (verified), so it is the default.
+# The two alternates ingest/catalog.py falls back to are both compromised in their
+# own way — https://gutenberg.pglaf.org has an EXPIRED certificate, and PG's own
+# master mirror http://aleph.gutenberg.org answers only over plain HTTP — which is
+# exactly why neither leads. What a plaintext hop costs here is not confidentiality
+# (the books are public domain) but INTEGRITY: nothing downstream authenticates the
+# bytes, so on that hop anyone on the path can substitute a different book.
 # Override per-machine to pick a closer mirror — see
 # https://www.gutenberg.org/MIRRORS.ALL for the full list.
-GUTENBERG_MIRROR = env("COOLWORDS_GUTENBERG_MIRROR", "http://aleph.gutenberg.org").rstrip("/")
+GUTENBERG_MIRROR = env("COOLWORDS_GUTENBERG_MIRROR", "https://gutenberg.nabasny.com").rstrip("/")

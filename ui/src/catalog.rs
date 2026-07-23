@@ -310,8 +310,14 @@ pub async fn search_catalog(
         params.push(V::Text(format!("%{query}%")));
     }
     if !subject.is_empty() {
-        clauses.push("lower(c.subjects) LIKE ?");
-        params.push(V::Text(format!("%{}%", subject.to_lowercase())));
+        // Whole-entry match, not a bare substring: `catalog_subjects` counts whole
+        // "; "-delimited entries, so the number beside the option has to be the number
+        // this filter returns. LIKE '%fiction%' would additionally swallow every
+        // "Whaling -- Fiction" heading and report ~30,000 results for an option
+        // labelled "Fiction (4,102)". Normalising "; " to ";" and wrapping the column
+        // in sentinel semicolons is what anchors the first and last entries.
+        clauses.push("';' || replace(lower(c.subjects), '; ', ';') || ';' LIKE ?");
+        params.push(V::Text(format!("%;{};%", subject.to_lowercase())));
     }
     let where_sql = if clauses.is_empty() {
         String::new()
@@ -348,13 +354,24 @@ pub async fn search_catalog(
     };
 
     let sql = format!(
-        // The LEFT JOIN is the whole point of keeping the catalog in coolwords.db:
-        // one query says both "here are the matches" and "these are already in", so
-        // the UI can grey them out instead of offering a no-op download.
+        // Keeping the catalog in coolwords.db is what lets one query say both "here
+        // are the matches" and "these are already in", so the UI can grey them out
+        // instead of offering a no-op download. Correlated subqueries, NOT a LEFT
+        // JOIN: `books` has no UNIQUE(source, source_id) — the same PG book dropped
+        // in as .txt and as .epub lands twice with different content_hash — and a
+        // join would fan one catalog row out into several, rendering the title twice
+        // and desyncing this page window from `total`, which is counted without the
+        // join (so the tail of the result set becomes unreachable in the pager).
+        // min-by-id picks the first import, which is the one the user would expect.
         "SELECT c.source, c.source_id, c.title, c.author, c.year, c.language, c.subjects, \
-                c.n_words, c.reading_ease, c.fmt, c.url, b.slug, b.id \
-         FROM catalog_books c \
-         LEFT JOIN books b ON b.source = c.source AND b.source_id = c.source_id\
+                c.n_words, c.reading_ease, c.fmt, c.url, \
+                (SELECT b.slug FROM books b \
+                  WHERE b.source = c.source AND b.source_id = c.source_id \
+                  ORDER BY b.id LIMIT 1), \
+                (SELECT b.id FROM books b \
+                  WHERE b.source = c.source AND b.source_id = c.source_id \
+                  ORDER BY b.id LIMIT 1) \
+         FROM catalog_books c\
          {where_sql} ORDER BY {order} LIMIT ? OFFSET ?"
     );
     let mut all: Vec<V> = params;
@@ -518,15 +535,24 @@ pub async fn grab_books(items: Vec<(String, String)>) -> Result<String, ServerFn
     let watch_id = id.clone();
     tokio::task::spawn_blocking(move || {
         let _guard = handle.enter();
-        loop {
+        let ended = loop {
             std::thread::sleep(std::time::Duration::from_millis(1000));
             match crate::jobs::status(&watch_id) {
                 Some(p) if matches!(p.status.as_str(), "queued" | "running") => continue,
-                _ => break, // done, failed, cancelled, or reaped
+                Some(p) => break p.status, // done, failed, or cancelled
+                None => break "reaped".to_string(),
             }
-        }
+        };
         let _ = std::fs::remove_file(&path);
-        // Even a cancelled/failed grab usually imported SOMETHING; score whatever landed.
+        // A cancelled grab is the user asking us to STOP — and `stop_queue` cancels
+        // the grab a full poll tick before we get here, so fanning out now would
+        // refill the queue it just emptied with an hour of scoring, one job per book
+        // that had landed. Books that did land are still in the library and can be
+        // scored on demand from the books page (`start_rescore` exists for this).
+        if ended == "cancelled" {
+            return;
+        }
+        // Even a FAILED grab usually imported SOMETHING; score whatever landed.
         let Ok(after) = imported_map(&clean) else { return };
         let mut fresh: Vec<(i64, String)> = after
             .into_iter()

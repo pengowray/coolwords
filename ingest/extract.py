@@ -283,6 +283,15 @@ _EPUB_SKIP = re.compile(
     r"|table[\s_-]?of[\s_-]?contents", re.I)
 _MIN_EPUB_WORDS = 20
 
+# Ceilings on what one EPUB is allowed to expand to in memory. A zip's central
+# directory declares each entry's uncompressed size, so a high-ratio entry (a zip
+# bomb, or just a corrupt file) can be refused BEFORE z.read() allocates it. Real
+# books are far under these: a fat illustrated epub's biggest XHTML file is a few
+# MB. Matters because catalogue downloads are unauthenticated (see paths.py) and
+# get imported unattended.
+_MAX_ZIP_ENTRY = 32 * 1024 * 1024
+_MAX_ZIP_TOTAL = 256 * 1024 * 1024
+
 # cp1252 "smart" punctuation that arrives as C1 control codepoints when an OPF /
 # metadata blob is mislabelled latin-1; map the common ones back for clean titles.
 _C1_FIX = {0x91: "‘", 0x92: "’", 0x93: "“", 0x94: "”",
@@ -298,13 +307,28 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+def _zread(z: zipfile.ZipFile, name: str, budget: list[int]) -> bytes:
+    """z.read(name), refusing an entry that expands past the ceilings above.
+
+    `budget` is a one-element list holding the bytes still allowed for this file, so
+    the running total survives across the spine loop."""
+    size = z.getinfo(name).file_size
+    if size > _MAX_ZIP_ENTRY or size > budget[0]:
+        raise ExtractError("This EPUB expands to an implausible size — refusing to "
+                           "read it (it is corrupt, or a zip bomb).",
+                           code="EPUB_TOO_LARGE")
+    budget[0] -= size
+    return z.read(name)
+
+
 def _extract_epub(path: Path) -> Extraction:
     with zipfile.ZipFile(path) as z:
         names = set(z.namelist())
+        budget = [_MAX_ZIP_TOTAL]
 
         # DRM: only flag when actual CONTENT is encrypted (font obfuscation is fine).
         if "META-INF/encryption.xml" in names:
-            enc = z.read("META-INF/encryption.xml").decode("utf-8", "replace")
+            enc = _zread(z, "META-INF/encryption.xml", budget).decode("utf-8", "replace")
             if _CONTENT_EXT.search(enc):
                 flavour = "Adobe Adept DRM" if "ns.adobe.com/adept" in enc else "DRM"
                 raise ExtractError(
@@ -312,13 +336,13 @@ def _extract_epub(path: Path) -> Extraction:
                     f"can't be imported. Remove the DRM from your purchased copy first.",
                     code="EPUB_DRM")
 
-        opf_path = _opf_path(z)
-        opf_root = ET.fromstring(z.read(opf_path))
+        opf_path = _opf_path(z, budget)
+        opf_root = ET.fromstring(_zread(z, opf_path, budget))
         opf_dir = opf_path.rsplit("/", 1)[0] if "/" in opf_path else ""
 
         title, author, year, source, source_id = _epub_metadata(opf_root)
         manifest, spine, toc_id = _parse_opf(opf_root)
-        toc_titles, toc_paths = _parse_epub_toc(z, manifest, toc_id, opf_dir)
+        toc_titles, toc_paths = _parse_epub_toc(z, manifest, toc_id, opf_dir, budget)
 
         segs: list[Segment] = []
         for idref in spine:
@@ -329,7 +353,7 @@ def _extract_epub(path: Path) -> Extraction:
             item_path = _resolve(opf_dir, href.split("#")[0])
             if item_path not in names:
                 continue
-            html = z.read(item_path).decode("utf-8", "replace")
+            html = _zread(z, item_path, budget).decode("utf-8", "replace")
             text = _html_text(html)
             norm = _norm_path(item_path)
             title_for = toc_titles.get(norm) or _title_from_name(href)
@@ -355,8 +379,8 @@ def _extract_epub(path: Path) -> Extraction:
     return ex
 
 
-def _opf_path(z: zipfile.ZipFile) -> str:
-    root = ET.fromstring(z.read("META-INF/container.xml"))
+def _opf_path(z: zipfile.ZipFile, budget: list[int]) -> str:
+    root = ET.fromstring(_zread(z, "META-INF/container.xml", budget))
     for el in root.iter():
         if _local(el.tag) == "rootfile" and el.get("full-path"):
             return el.get("full-path")
@@ -413,7 +437,7 @@ def _parse_opf(opf_root):
     return manifest, spine, toc_id
 
 
-def _parse_epub_toc(z, manifest, toc_id, opf_dir):
+def _parse_epub_toc(z, manifest, toc_id, opf_dir, budget):
     """Return ({normalized content path -> title}, ordered set of TOC paths)."""
     titles: dict[str, str] = {}
     order: list[str] = []
@@ -423,7 +447,7 @@ def _parse_epub_toc(z, manifest, toc_id, opf_dir):
     toc_path = _resolve(opf_dir, toc_href)
     toc_dir = toc_path.rsplit("/", 1)[0] if "/" in toc_path else ""
     try:
-        data = z.read(toc_path)
+        data = _zread(z, toc_path, budget)
     except KeyError:
         return titles, order
     try:

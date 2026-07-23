@@ -106,13 +106,19 @@ pub fn cancel(id: &str) {
             Err(_) => return,
         };
         match jobs.get_mut(id) {
-            Some(j) => {
+            // Only a LIVE job can be cancelled. A finished one sits in the map for
+            // another 10 minutes (see `reap`) and the client's view is up to a poll
+            // interval stale, so without this guard a just-completed job would be
+            // relabelled "cancelled" — and, worse, `taskkill /T /F` would fire at a
+            // pid the OS may already have handed to somebody else's process tree.
+            // `.take()` so the pid can never be killed twice.
+            Some(j) if matches!(j.prog.status.as_str(), "queued" | "running") => {
                 j.cancel.store(true, Ordering::Relaxed);
                 j.prog.status = "cancelled".into();
                 j.prog.updated = now();
-                j.pid
+                j.pid.take()
             }
-            None => return,
+            _ => return,
         }
     };
     if let Some(pid) = pid {
@@ -273,6 +279,13 @@ async fn run(
     }
 
     let exit = child.wait().await;
+    // The child is reaped, so the pid is dead and the OS is free to reissue it —
+    // drop it before anything can cancel this job on its way to a terminal status.
+    if let Ok(mut jobs) = JOBS.lock() {
+        if let Some(j) = jobs.get_mut(&id) {
+            j.pid = None;
+        }
+    }
     let out = out_task.await.unwrap_or_default();
     // Every ingest module's contract: the LAST stdout line is its single JSON object.
     // Parse it once and read both fields off it.
@@ -344,11 +357,18 @@ fn parse_progress(kind: &str, line: &str) -> Option<(f32, String)> {
             }
         }
         // "grab: 3/25 The Mystery of Edwin Drood" (determinate) and, per finished
-        // book, "grab: imported <slug>" — a note only, so it leaves percent alone.
+        // book, "grab: imported|failed|skipped …" plus a closing "grab: done …" —
+        // notes only, so they leave percent alone.
         "grab" => {
             let rest = line.strip_prefix("grab: ")?.trim();
-            if let Some(slug) = rest.strip_prefix("imported ") {
-                return Some((-1.0, format!("imported {}", slug.trim())));
+            // Notes rather than counters — they carry no i/n, so they only set the
+            // message. "failed"/"skipped" have to be recognised explicitly: falling
+            // through would leave `frac` = "failed", the split on '/' would fail, and
+            // a whole batch of failures would scroll past without one visible word.
+            for p in ["imported ", "failed ", "skipped ", "done "] {
+                if let Some(tail) = rest.strip_prefix(p) {
+                    return Some((-1.0, format!("{p}{}", tail.trim())));
+                }
             }
             let (frac, title) = rest.split_once(' ').unwrap_or((rest, ""));
             let (i, n) = frac.split_once('/')?;

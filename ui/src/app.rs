@@ -5791,9 +5791,21 @@ fn JobQueuePanel() -> impl IntoView {
             on_cleanup(move || h.clear());
         }
     });
+    // This panel lists EVERY kind, and on the books page the OCR / reingest /
+    // trajectory jobs are the page's own — so "stop all" has to mean all of them.
+    // catalog::stop_queue deliberately spares those kinds (it is the /get page's
+    // panic button), so cancel what we're actually showing instead.
     let stop_all = move |_| {
+        let ids: Vec<String> = jobs
+            .get_untracked()
+            .into_iter()
+            .filter(|j| matches!(j.status.as_str(), "queued" | "running"))
+            .map(|j| j.id)
+            .collect();
         leptos::task::spawn_local(async move {
-            let _ = crate::catalog::stop_queue().await;
+            for id in ids {
+                let _ = cancel_job(id).await;
+            }
             poll();
         });
     };
