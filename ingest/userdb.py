@@ -2,9 +2,10 @@
 
     python -m ingest.userdb
 
-User data (the tag collection + tag applications) lives in its own self-contained
-SQLite file, keyed by stable text (book slug + lowercased headword) so it is
-untouched by — and survives — dictionary/book rebuilds. This script:
+User data (the tag collection, word-tag applications, and book tags) lives in its
+own self-contained SQLite file, keyed by stable text (book slug + lowercased
+headword) so it is untouched by — and survives — dictionary/book rebuilds. This
+script:
   1. creates user.db and applies schema/user.sql (tables + builtin tag seed),
   2. one-time migrates any legacy coolwords.db.word_tags (id-keyed) into it by
      resolving book_id -> slug and word_id -> word, then drops the legacy table.
@@ -76,8 +77,13 @@ def main() -> None:
 
     n_tags = user.execute("SELECT count(*) FROM tags").fetchone()[0]
     n_apps = user.execute("SELECT count(*) FROM word_tags").fetchone()[0]
+    # book_tags is created by the schema script above, so it always exists by now
+    # (older user.db files get it on the first re-run — that's the idempotency).
+    n_books = user.execute("SELECT count(*) FROM book_tags").fetchone()[0]
+    n_auto = user.execute("SELECT count(*) FROM book_tags WHERE auto = 1").fetchone()[0]
     user.close()
-    print(f"userdb: {USER_DB_PATH} — {n_tags} tags in collection, {n_apps} applications "
+    print(f"userdb: {USER_DB_PATH} — {n_tags} tags in collection, {n_apps} word-tag "
+          f"applications, {n_books} book tags ({n_auto} auto) "
           f"({migrated} migrated from coolwords.db)")
 
 

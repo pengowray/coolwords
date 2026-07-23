@@ -432,6 +432,10 @@ pub struct CollectionEntry {
     /// Ranking number for a "smart" collection (e.g. net favourite − negative
     /// all-books tags), shown as a badge. `None` for an ordinary tag/all view.
     pub metric: Option<i64>,
+    /// Primary part of speech ("noun"/"verb"/"adj"/…), for the by-part-of-speech
+    /// view. `None` when the dictionary has no POS for the word (or it's unresolved).
+    #[serde(default)]
+    pub pos: Option<String>,
 }
 
 /// A collection tag in the verbarium's filter list: its name, how many distinct
@@ -478,6 +482,10 @@ pub struct Candidate {
     /// Distinct surface forms in this group for display (representative first, then
     /// the merged in-book forms alphabetically) — e.g. `["dog", "dogs"]`.
     pub forms: Vec<String>,
+    /// Primary part of speech ("noun"/"verb"/"adj"/…) for the by-part-of-speech
+    /// view. `None` when the dictionary records no POS for this word.
+    #[serde(default)]
+    pub pos: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1225,6 +1233,94 @@ fn pos_label(pos: &str) -> String {
     .to_string()
 }
 
+/// Fold `(word_id, pos, source)` rows into ONE primary part of speech per word.
+///
+/// A word routinely carries several rows: WordNet and the wiktextract fallback both
+/// have opinions, and each can list more than one class. The tie-breaks, in order:
+/// WordNet wins over anything else (it's the curated source, and its classes are the
+/// ones the rest of the UI is built around), then the earliest class in [`FILTER_POS`]
+/// wins — which puts the four content classes (noun, verb, adj, adv) ahead of the
+/// function words, so "round" reads as a noun rather than a preposition.
+#[cfg(feature = "ssr")]
+fn fold_pos(rows: impl Iterator<Item = (i64, String, String)>) -> HashMap<i64, String> {
+    let class_rank =
+        |pos: &str| FILTER_POS.iter().position(|p| *p == pos).unwrap_or(FILTER_POS.len());
+    // word_id -> (source rank, class rank, pos)
+    let mut best: HashMap<i64, (u8, usize, String)> = HashMap::new();
+    for (wid, pos, source) in rows {
+        let key = (u8::from(source != "wordnet"), class_rank(&pos));
+        match best.get(&wid) {
+            Some(&(s, c, _)) if (s, c) <= key => {}
+            _ => {
+                best.insert(wid, (key.0, key.1, pos));
+            }
+        }
+    }
+    best.into_iter().map(|(wid, (_, _, pos))| (wid, pos)).collect()
+}
+
+/// The content classes the "by part of speech" view cycles through, in display
+/// order, paired with the heading each gets. Everything else (function words, and
+/// words the dictionary has no POS for at all) lands in a trailing "other" section
+/// — never dropped. Not `cfg(ssr)`: the arrangement happens on the client.
+pub const POS_CYCLE: [(&str, &str); 4] =
+    [("noun", "nouns"), ("verb", "verbs"), ("adj", "adjectives"), ("adv", "adverbs")];
+
+/// Default chunk size for the POS view: 20 of each class before moving on.
+pub const POS_CHUNK: usize = 20;
+
+/// Arrange an already-FILTERED list into POS sections: up to `chunk` nouns, then
+/// `chunk` verbs, adjectives, adverbs — repeating until every bucket is empty —
+/// then one final "other" section. Relative order within a class is preserved, so
+/// the underlying ranking (or the collection's sort) still shows through.
+///
+/// Generic over the item so the words page (`Candidate`) and the verbarium
+/// (`CollectionEntry`) share one implementation and can't drift apart.
+pub fn pos_sections<T>(
+    items: Vec<T>,
+    pos_of: impl Fn(&T) -> Option<String>,
+    chunk: usize,
+) -> Vec<(String, Vec<T>)> {
+    let chunk = chunk.max(1);
+    let mut buckets: Vec<Vec<T>> = (0..POS_CYCLE.len()).map(|_| Vec::new()).collect();
+    let mut other: Vec<T> = Vec::new();
+    for it in items {
+        match pos_of(&it)
+            .as_deref()
+            .and_then(|p| POS_CYCLE.iter().position(|(c, _)| *c == p))
+        {
+            Some(i) => buckets[i].push(it),
+            None => other.push(it),
+        }
+    }
+    // Reversed once so each chunk is a cheap run of pops off the end instead of a
+    // repeated drain from the front.
+    for b in &mut buckets {
+        b.reverse();
+    }
+    let mut out: Vec<(String, Vec<T>)> = Vec::new();
+    while buckets.iter().any(|b| !b.is_empty()) {
+        for (i, b) in buckets.iter_mut().enumerate() {
+            if b.is_empty() {
+                continue;
+            }
+            let take = chunk.min(b.len());
+            let mut sec = Vec::with_capacity(take);
+            for _ in 0..take {
+                sec.push(b.pop().expect("non-empty"));
+            }
+            // The heading repeats verbatim each time round the cycle — that sameness
+            // IS the signal that you've wrapped back to the top of the rotation.
+            out.push((POS_CYCLE[i].1.to_string(), sec));
+        }
+    }
+    if !other.is_empty() {
+        // Say how many, so a big "other" pile is visible rather than mysterious.
+        out.push((format!("other ({})", other.len()), other));
+    }
+    out
+}
+
 #[server]
 pub async fn list_books() -> Result<Vec<Book>, ServerFnError> {
     let conn = open_conn()?;
@@ -1424,6 +1520,7 @@ pub async fn get_candidates(
             n_forms: row.get(11)?,
             members: Vec::new(),
             forms: Vec::new(),
+            pos: None,
         })
     };
     let mut out: Vec<Candidate> = match &bind_cat {
@@ -1477,7 +1574,30 @@ pub async fn get_candidates(
         forms_map.entry(rep).or_default().push(word);
     }
 
+    // Primary POS for the by-part-of-speech view. ONE query for the whole book at
+    // this level (joined through candidates so it's bounded by the candidate set,
+    // not by word_pos as a whole) — `out` can be 400 rows, and a query per word
+    // would be 400 round trips through SQLite for a purely cosmetic grouping.
+    let pos_map: HashMap<i64, String> = {
+        let mut ps = conn
+            .prepare(
+                "SELECT wp.word_id, wp.pos, wp.source FROM word_pos wp
+                   JOIN candidates c ON c.word_id = wp.word_id
+                  WHERE c.book_id = ?1 AND c.level = ?2",
+            )
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        let rows = ps
+            .query_map([book_id, level], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })
+            .map_err(|e| ServerFnError::new(e.to_string()))?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        fold_pos(rows.into_iter())
+    };
+
     for c in &mut out {
+        c.pos = pos_map.get(&c.word_id).cloned();
         if let Some(t) = tags.get(&c.word_id) {
             // applied names only (value >= 1); the client store separately carries
             // the tri-state values via book_tags.
@@ -2020,13 +2140,35 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
         gt.iter().filter(|(_, i)| i == "interesting").count() as i64
             - gt.iter().filter(|(_, i)| i == "uninteresting").count() as i64
     };
+    // Primary POS for every tagged word, in ONE scan. The collection can run to
+    // thousands of entries, so this is deliberately a single join over the tagged
+    // set rather than a lookup per word.
+    let pos_map: HashMap<i64, String> = {
+        let mut ps = conn
+            .prepare(
+                "SELECT DISTINCT wp.word_id, wp.pos, wp.source FROM word_pos wp
+                   JOIN words w ON w.id = wp.word_id
+                   JOIN u.word_tags t ON t.word = w.word",
+            )
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        let rows = ps
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })
+            .map_err(|e| ServerFnError::new(e.to_string()))?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        fold_pos(rows.into_iter())
+    };
+
     let mut out: Vec<CollectionEntry> = by_word
         .into_iter()
         .map(|(word, a)| {
             let mut tags = a.tags;
             tags.sort_by(|x, y| int_rank(&x.1).cmp(&int_rank(&y.1)).then_with(|| x.0.cmp(&y.0)));
             let metric = special.then(|| net(&a.global_tags));
-            CollectionEntry { interest: eff(&tags), word, word_id: a.word_id, gloss: a.gloss, tags, books: a.books, metric }
+            let pos = pos_map.get(&a.word_id).cloned();
+            CollectionEntry { interest: eff(&tags), word, word_id: a.word_id, gloss: a.gloss, tags, books: a.books, metric, pos }
         })
         .collect();
     if special {
@@ -2938,6 +3080,10 @@ fn NavBar() -> impl IntoView {
             <A href=format!("{base}/collection") attr:class=cls("/collection", "navlink")>"verbarium"</A>
             <A href=format!("{base}/books") attr:class=cls("/books", "navlink")>"books"</A>
             <A href=format!("{base}/tags") attr:class=cls("/tags", "navlink")>"tags"</A>
+            // The two "add a book" actions sit together at the right-hand end:
+            // `.navimport`'s margin-left:auto on the FIRST of them pushes the pair
+            // over, and the second follows it. Same treatment, same visual weight.
+            <A href=format!("{base}/get") attr:class=cls("/get", "navimport")>"+ get books"</A>
             <A href=format!("{base}/import") attr:class=cls("/import", "navimport")>"+ import book"</A>
         </nav>
     }
@@ -2972,6 +3118,7 @@ pub fn App() -> impl IntoView {
                     <Route path=StaticSegment("tags") view=TagsPage/>
                     <Route path=StaticSegment("books") view=BooksAdminPage/>
                     <Route path=StaticSegment("import") view=ImportPage/>
+                    <Route path=StaticSegment("get") view=crate::catalog::GetBooksPage/>
                     <Route path=StaticSegment("source") view=BookSourcePage/>
                 </Routes>
                 <ToastView/>
@@ -3941,6 +4088,232 @@ fn Trajectory(data: Vec<(i32, f64)>, book_year: Option<i64>) -> impl IntoView {
     }.into_any()
 }
 
+/// One word card on the words page. Lifted out of `HomePage`'s view! so the POS
+/// view can render the same card under several headings — and so the words page's
+/// view tree stops growing: the nesting there is already at the trait solver's
+/// limit (see the crate-root `recursion_limit`), and a component boundary is a
+/// type-length boundary too.
+#[component]
+fn WordCard(
+    c: Candidate,
+    book_id: i64,
+    set_word: SignalSetter<Option<i64>>,
+    set_cat: SignalSetter<Option<String>>,
+    hide_rejected: RwSignal<bool>,
+    open_picker: RwSignal<Option<i64>>,
+) -> impl IntoView {
+    let tagger = expect_context::<Tagger>();
+    let b = book_id;
+    let wid = c.word_id;
+    let bk = c.buckets.clone();
+    let selected_dot = c.selected;
+    let nforms = c.n_forms;
+    // Each reactive closure below needs its own copy of the member list.
+    let members = c.members.clone();
+    let members_rej = c.members.clone();
+    let members_hid = c.members.clone();
+    let members_has = c.members.clone();
+    let members_strip = c.members.clone();
+    let word = c.word.clone();
+    let gloss = c.gloss.clone().unwrap_or_default();
+    let has_gloss = !gloss.is_empty();
+    let in_book = c.in_book;
+    let score = c.score;
+    let origin_disp = c.origin_name.clone().or_else(|| c.origin_code.clone()).unwrap_or_default();
+    let has_origin = !origin_disp.is_empty();
+    let origin_title = c.origin_code.clone().unwrap_or_default();
+    let cat = c.category.clone();
+    view! {
+        <article class="wcard"
+            class:interesting=move || group_interest(tagger, b, &members) == Some(Interest::Interesting)
+            class:rejected=move || group_interest(tagger, b, &members_rej) == Some(Interest::Uninteresting)
+            class:hidden=move || hide_rejected.get() && group_interest(tagger, b, &members_hid) == Some(Interest::Uninteresting)>
+            <div class="wc-main">
+                <Star book_id=b word_id=wid/>
+                <div class="wc-body" on:click=move |_| set_word.set(Some(wid))>
+                    <div class="wc-head">
+                        <span class="word">
+                            {word}
+                            {(nforms > 1).then(|| view! {
+                                <small class="forms" title="surface forms merged into this group at the current level">{format!(" +{}", nforms - 1)}</small>
+                            })}
+                        </span>
+                        {selected_dot.then(|| view! { <span class="seldot" title="in the varied top-20">"•"</span> })}
+                    </div>
+                    {has_gloss.then(|| view! { <p class="gloss">{gloss}</p> })}
+                    <div class="wc-meta">
+                        <span title="times in this book">{format!("{in_book}×")}</span>
+                        <span title="interestingness score">{format!("score {:.1}", score)}</span>
+                        {has_origin.then(|| view! { <span class="wc-origin" title=origin_title>{origin_disp}</span> })}
+                    </div>
+                </div>
+                <div class="wc-side">
+                    {cat.map(|cc| { let cc2 = cc.clone(); view! {
+                        <button type="button" class="catchip" title="filter by this category"
+                            on:click=move |_| set_cat.set(Some(cc2.clone()))>{cc}</button>
+                    } })}
+                </div>
+            </div>
+            <div class="wc-tags">
+                <TagStrip book_id=b members=members_strip/>
+                <button type="button" class="tagbtn"
+                    class:has=move || group_has_other(tagger, b, &members_has)
+                    class:open=move || open_picker.get() == Some(wid)
+                    on:click=move |_| open_picker.update(|o| *o = if *o == Some(wid) { None } else { Some(wid) })>
+                    {move || if open_picker.get() == Some(wid) { "− tag" } else { "＋ tag" }}
+                </button>
+            </div>
+            <Show when=move || open_picker.get() == Some(wid) fallback=|| ()>
+                <TagPicker book_id=b word_id=wid buckets=bk.clone()/>
+            </Show>
+        </article>
+    }
+}
+
+/// The current-book picker: a book-tag FILTER select plus the book select itself,
+/// whose options are grouped into `<optgroup>`s by book tag. Replaces the old
+/// one-button-per-book row, which stopped being usable somewhere around the
+/// twentieth book.
+///
+/// PRIMARY-GROUP RULE (a book can carry several tags, so the group must be a
+/// deterministic function of them, or a book would jump around between renders):
+/// if the user has applied any MANUAL tag, the alphabetically-first one wins;
+/// otherwise the derived `src:` tag is used — every book has exactly one, since
+/// `booktags::reconcile_book_tags` regenerates it from `books.source` on every read.
+/// A book with no tags at all lands in a trailing "untagged" group. When there are
+/// no book tags in the whole library we render a FLAT list, because a single
+/// optgroup wrapping everything is just noise.
+///
+/// The tag filter lives in `?btag` so a filtered view is linkable. It narrows which
+/// books are offered — EXCEPT that the currently-open book is always listed, filter
+/// or not: a filter that hid it would leave the select showing a blank value while
+/// the page below it still showed that book's words.
+#[component]
+fn BookSelect(
+    books: Resource<Result<Vec<Book>, ServerFnError>>,
+    book: Memo<i64>,
+    set_book: SignalSetter<Option<i64>>,
+    set_word: SignalSetter<Option<i64>>,
+) -> impl IntoView {
+    let (btag, set_btag) = query_signal::<String>("btag");
+    // Tags are a separate call from `list_books` on purpose: `books_with_tags`
+    // deliberately doesn't carry the ★ count (it would need a third copy of that
+    // correlated subquery), so the two are merged here on book_id.
+    let tagged = Resource::new(|| (), |_| crate::booktags::books_with_tags());
+
+    view! {
+        <Suspense fallback=move || view! { <span class="loading">"…"</span> }>
+            {move || {
+                let list = match books.get() {
+                    Some(Ok(l)) => l,
+                    Some(Err(e)) => return view! { <span class="err">{format!("{e}")}</span> }.into_any(),
+                    None => return ().into_any(),
+                };
+                // Missing/failed tags just mean "no groups"; the picker still works.
+                let by_book: HashMap<i64, Vec<crate::booktags::BookTag>> = tagged
+                    .get()
+                    .and_then(|r| r.ok())
+                    .map(|v| v.into_iter().map(|b| (b.book_id, b.tags)).collect())
+                    .unwrap_or_default();
+                let any_tags = by_book.values().any(|t| !t.is_empty());
+
+                // Filter dropdown entries: every distinct tag with how many books
+                // carry it. Counted over a book's WHOLE tag set (not just its primary
+                // group), so "poetry (7)" means what it says.
+                let mut counts: Vec<(String, i64)> = {
+                    let mut m: HashMap<String, i64> = HashMap::new();
+                    for tags in by_book.values() {
+                        for t in tags {
+                            *m.entry(t.name.clone()).or_default() += 1;
+                        }
+                    }
+                    m.into_iter().collect()
+                };
+                counts.sort_by(|a, b| a.0.cmp(&b.0));
+
+                let want = btag.get().unwrap_or_default();
+                let cur = book.get();
+                let keep: Vec<Book> = if want.is_empty() {
+                    list
+                } else {
+                    list.into_iter()
+                        .filter(|b| {
+                            b.id == cur
+                                || by_book.get(&b.id).is_some_and(|t| t.iter().any(|x| x.name == want))
+                        })
+                        .collect()
+                };
+
+                // (group label, books) — groups alphabetical, "untagged" pinned last.
+                let mut groups: Vec<(String, Vec<Book>)> = Vec::new();
+                for b in keep {
+                    let g = by_book
+                        .get(&b.id)
+                        .and_then(|tags| {
+                            let mut manual: Vec<&str> =
+                                tags.iter().filter(|t| !t.auto).map(|t| t.name.as_str()).collect();
+                            manual.sort();
+                            manual.first().map(|s| s.to_string()).or_else(|| {
+                                tags.iter()
+                                    .find(|t| t.name.starts_with("src:"))
+                                    .or_else(|| tags.first())
+                                    .map(|t| t.name.clone())
+                            })
+                        })
+                        .unwrap_or_else(|| "untagged".to_string());
+                    match groups.iter_mut().find(|(name, _)| *name == g) {
+                        Some(slot) => slot.1.push(b),
+                        None => groups.push((g, vec![b])),
+                    }
+                }
+                groups.sort_by(|a, b| match (a.0 == "untagged", b.0 == "untagged") {
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    _ => a.0.cmp(&b.0),
+                });
+
+                let opt = |b: &Book| {
+                    let (v, label) = (b.id.to_string(), format!("{} ({}★)", b.title, b.n_selected));
+                    view! { <option value=v>{label}</option> }
+                };
+                let pick = move |ev: web_sys::Event| {
+                    if let Ok(id) = event_target_value(&ev).parse::<i64>() {
+                        set_book.set(Some(id));
+                        set_word.set(None); // a new book's word ids mean nothing here
+                    }
+                };
+                view! {
+                    {(!counts.is_empty()).then(|| view! {
+                        <select class="catsel btagsel" title="show only books with this tag"
+                            prop:value=move || btag.get().unwrap_or_default()
+                            on:change=move |ev| {
+                                let v = event_target_value(&ev);
+                                if v.is_empty() { set_btag.set(None); } else { set_btag.set(Some(v)); }
+                            }>
+                            <option value="">"all books"</option>
+                            {counts.into_iter().map(|(name, n)| {
+                                let v = name.clone();
+                                view! { <option value=v>{format!("{name} ({n})")}</option> }
+                            }).collect_view()}
+                        </select>
+                    })}
+                    <select class="booksel" title="which book's words to show"
+                        prop:value=move || book.get().to_string() on:change=pick>
+                        {if any_tags {
+                            groups.into_iter().map(|(g, items)| view! {
+                                <optgroup label=g>{items.iter().map(opt).collect_view()}</optgroup>
+                            }).collect_view().into_any()
+                        } else {
+                            groups.into_iter().flat_map(|(_, items)| items)
+                                .map(|b| opt(&b)).collect_view().into_any()
+                        }}
+                    </select>
+                }.into_any()
+            }}
+        </Suspense>
+    }
+}
+
 #[component]
 fn HomePage() -> impl IntoView {
     let (book_q, set_book) = query_signal::<i64>("book");
@@ -3967,6 +4340,13 @@ fn HomePage() -> impl IntoView {
             _ => want,
         }
     });
+    // Arrangement: unset (or anything unrecognised) = the ranked list; "pos" cycles
+    // chunks of nouns/verbs/adjectives/adverbs. In the URL so a view is linkable.
+    let (view_q, set_view) = query_signal::<String>("view");
+    let pos_view = Memo::new(move |_| view_q.get().as_deref() == Some("pos"));
+    // Chunk size is a display preference, not an identity — deliberately NOT in the
+    // URL, so a shared `?view=pos` link doesn't carry someone else's granularity.
+    let pos_chunk = RwSignal::new(POS_CHUNK);
     let only_top = RwSignal::new(false);
     let hide_rejected = RwSignal::new(false);
     // Plain-text mode: swap the word cards for a copy-pasteable list of words (as on the verbarium).
@@ -4052,22 +4432,7 @@ fn HomePage() -> impl IntoView {
         <p class="sub">"★ to favourite; click \"tags\" to label; click a word for detail, a category to filter."</p>
 
         <div class="bar">
-            <Suspense fallback=move || view! { <span>"…"</span> }>
-                {move || books.get().map(|res| match res {
-                    Err(e) => view! { <span class="err">{format!("{e}")}</span> }.into_any(),
-                    Ok(list) => view! {
-                        {list.into_iter().map(|b| {
-                            let id = b.id;
-                            view! {
-                                <button class:active=move || book.get() == id
-                                    on:click=move |_| { set_book.set(Some(id)); set_word.set(None); }>
-                                    {format!("{} ({}★)", b.title, b.n_selected)}
-                                </button>
-                            }
-                        }).collect_view()}
-                    }.into_any(),
-                })}
-            </Suspense>
+            <BookSelect books=books book=book set_book=set_book set_word=set_word/>
             <a class="srclink" href={let b = base_path(); move || format!("{b}/source?book={}", book.get())}
                 title="see which parts of this book were kept vs stripped">"view stripping"</a>
             <select class="lvlsel" title="merge related word forms: none keeps every form separate; higher levels group inflections, then derivations, then aggressively (untrembling→tremble) — frequency is combined across the family"
@@ -4118,6 +4483,26 @@ fn HomePage() -> impl IntoView {
             <Show when=move || category.get().is_some() fallback=|| ()>
                 <button class="catx" title="clear category filter" on:click=move |_| set_cat.set(None)>"×"</button>
             </Show>
+            <select class="catsel viewsel" title="ranked = straight down the interestingness ranking; by part of speech = 20 nouns, then 20 verbs, adjectives, adverbs, and round again"
+                prop:value=move || view_q.get().unwrap_or_default()
+                on:change=move |ev| {
+                    let v = event_target_value(&ev);
+                    if v.is_empty() { set_view.set(None); } else { set_view.set(Some(v)); }
+                }>
+                <option value="">"view: ranked"</option>
+                <option value="pos">"view: by part of speech"</option>
+            </select>
+            <Show when=move || pos_view.get() fallback=|| ()>
+                <select class="catsel chunksel" title="how many of each part of speech before switching"
+                    prop:value=move || pos_chunk.get().to_string()
+                    on:change=move |ev| {
+                        if let Ok(n) = event_target_value(&ev).parse::<usize>() { pos_chunk.set(n); }
+                    }>
+                    <option value="10">"10 at a time"</option>
+                    <option value="20">"20 at a time"</option>
+                    <option value="50">"50 at a time"</option>
+                </select>
+            </Show>
             <label class="toggle">
                 <input type="checkbox" prop:checked=move || only_top.get()
                     on:change=move |_| only_top.update(|v| *v = !*v)/>
@@ -4162,8 +4547,16 @@ fn HomePage() -> impl IntoView {
                 Ok(all) => {
                     let b = book.get();
                     let top = only_top.get();
+                    // FILTER FIRST, arrange after — the category filter already ran
+                    // server-side, varied-top-20 runs here, and only what survives
+                    // both is fed to the POS arrangement. ("hide rejected" stays a
+                    // CSS-level hide on the card, exactly as before: doing it here
+                    // would rebuild the whole list every time you tag a word, and
+                    // the page would reshuffle under the cursor mid-tagging.)
                     let list: Vec<Candidate> = all.into_iter().filter(|c| !top || c.selected).collect();
                     let total = list.len();
+                    let chunk = pos_chunk.get();
+                    let by_pos = pos_view.get();
                     // Plain-text mode: each word on its own line (in the shown order),
                     // optionally with its merged forms (`dog/dogs`) and/or its tags as
                     // `#hashtag[:value]`, joined by the chosen separator, with a copy button.
@@ -4180,8 +4573,24 @@ fn HomePage() -> impl IntoView {
                                 .collect::<Vec<_>>().join(" ");
                             if hs.is_empty() { head } else { format!("{head} // {hs}") }
                         };
-                        let joiner = match list_sep.get().as_str() { "sp" => " ", "comma" => ", ", _ => "\n" };
-                        let text = list.iter().map(line).collect::<Vec<_>>().join(joiner);
+                        let sep = list_sep.get();
+                        let joiner = match sep.as_str() { "sp" => " ", "comma" => ", ", _ => "\n" };
+                        let text = if !by_pos {
+                            list.iter().map(line).collect::<Vec<_>>().join(joiner)
+                        } else {
+                            // Headings only survive in the newline flavour, as `# nouns`
+                            // comment lines — a heading dropped into a space- or
+                            // comma-separated run would read as just another word, which
+                            // is worse than losing the labels. The ORDER is the same
+                            // either way, so the grouping still comes through.
+                            let secs = pos_sections(list, |c| c.pos.clone(), chunk);
+                            let mut parts: Vec<String> = Vec::new();
+                            for (h, items) in secs {
+                                if joiner == "\n" { parts.push(format!("# {h}")); }
+                                parts.extend(items.iter().map(line));
+                            }
+                            parts.join(joiner)
+                        };
                         let text_copy = text.clone();
                         let rows = total.clamp(3, 24) as i32;
                         return view! {
@@ -4192,74 +4601,23 @@ fn HomePage() -> impl IntoView {
                             <textarea class="plainlist" readonly=true rows=rows prop:value=text></textarea>
                         }.into_any();
                     }
+                    let card = move |c: Candidate| view! {
+                        <WordCard c=c book_id=b set_word=set_word set_cat=set_cat
+                            hide_rejected=hide_rejected open_picker=open_picker/>
+                    };
+                    if by_pos {
+                        return view! {
+                            <p class="counts">{format!("{total} shown")}</p>
+                            {pos_sections(list, |c| c.pos.clone(), chunk).into_iter().map(|(h, items)| view! {
+                                <h3 class="possec">{h}</h3>
+                                <div class="wlist">{items.into_iter().map(card).collect_view()}</div>
+                            }).collect_view()}
+                        }.into_any();
+                    }
                     view! {
                         <p class="counts">{format!("{total} shown")}</p>
                         <div class="wlist">
-                            {list.into_iter().map(|c| {
-                                let wid = c.word_id;
-                                let bk = c.buckets.clone();
-                                let selected_dot = c.selected;
-                                let nforms = c.n_forms;
-                                let members = c.members.clone();
-                                let members_rej = c.members.clone();
-                                let members_hid = c.members.clone();
-                                let members_has = c.members.clone();
-                                let members_strip = c.members.clone();
-                                let word = c.word.clone();
-                                let gloss = c.gloss.clone().unwrap_or_default();
-                                let has_gloss = !gloss.is_empty();
-                                let in_book = c.in_book;
-                                let score = c.score;
-                                let origin_disp = c.origin_name.clone().or_else(|| c.origin_code.clone()).unwrap_or_default();
-                                let has_origin = !origin_disp.is_empty();
-                                let origin_title = c.origin_code.clone().unwrap_or_default();
-                                let cat = c.category.clone();
-                                view! {
-                                    <article class="wcard"
-                                        class:interesting=move || group_interest(tagger, b, &members) == Some(Interest::Interesting)
-                                        class:rejected=move || group_interest(tagger, b, &members_rej) == Some(Interest::Uninteresting)
-                                        class:hidden=move || hide_rejected.get() && group_interest(tagger, b, &members_hid) == Some(Interest::Uninteresting)>
-                                        <div class="wc-main">
-                                            <Star book_id=b word_id=wid/>
-                                            <div class="wc-body" on:click=move |_| set_word.set(Some(wid))>
-                                                <div class="wc-head">
-                                                    <span class="word">
-                                                        {word}
-                                                        {(nforms > 1).then(|| view! {
-                                                            <small class="forms" title="surface forms merged into this group at the current level">{format!(" +{}", nforms - 1)}</small>
-                                                        })}
-                                                    </span>
-                                                    {selected_dot.then(|| view! { <span class="seldot" title="in the varied top-20">"•"</span> })}
-                                                </div>
-                                                {has_gloss.then(|| view! { <p class="gloss">{gloss}</p> })}
-                                                <div class="wc-meta">
-                                                    <span title="times in this book">{format!("{in_book}×")}</span>
-                                                    <span title="interestingness score">{format!("score {:.1}", score)}</span>
-                                                    {has_origin.then(|| view! { <span class="wc-origin" title=origin_title>{origin_disp}</span> })}
-                                                </div>
-                                            </div>
-                                            <div class="wc-side">
-                                                {cat.map(|cc| { let cc2 = cc.clone(); view! {
-                                                    <button type="button" class="catchip" title="filter by this category"
-                                                        on:click=move |_| set_cat.set(Some(cc2.clone()))>{cc}</button>
-                                                } })}
-                                            </div>
-                                        </div>
-                                        <div class="wc-tags">
-                                            <TagStrip book_id=b members=members_strip/>
-                                            <button type="button" class="tagbtn"
-                                                class:has=move || group_has_other(tagger, b, &members_has)
-                                                class:open=move || open_picker.get() == Some(wid)
-                                                on:click=move |_| open_picker.update(|o| *o = if *o == Some(wid) { None } else { Some(wid) })>
-                                                {move || if open_picker.get() == Some(wid) { "− tag" } else { "＋ tag" }}
-                                            </button>
-                                        </div>
-                                        <Show when=move || open_picker.get() == Some(wid) fallback=|| ()>
-                                            <TagPicker book_id=b word_id=wid buckets=bk.clone()/>
-                                        </Show>
-                                    </article>
-                                }
-                            }).collect_view()}
+                            {list.into_iter().map(card).collect_view()}
                         </div>
                     }.into_any()
                 }
@@ -4816,10 +5174,67 @@ fn TagsPage() -> impl IntoView {
 
 /// A cross-book view of every word you've tagged, filterable to one tag. Each word
 /// links back into a book's detail; word-scoped tags list all the books they reach.
+/// One word card in the verbarium. Its own component for the same two reasons as
+/// [`WordCard`]: the POS view renders it under several headings, and pulling it out
+/// of `CollectionPage`'s view! keeps that tree well inside the trait-solver limit.
+/// `base` is the ingress prefix — every href here is absolute and must carry it.
+#[component]
+fn CollectionCard(e: CollectionEntry, base: String) -> impl IntoView {
+    let word_href = (e.word_id > 0)
+        .then(|| e.books.first().map(|(bid, _)| format!("{base}/?book={bid}&word={}", e.word_id)))
+        .flatten();
+    let gloss = short(&e.gloss, 140);
+    let has_gloss = !gloss.is_empty();
+    let cls = format!("wcard ccard int-{}", e.interest);
+    let word = e.word.clone();
+    let metric = e.metric;
+    let word_id = e.word_id;
+    view! {
+        <article class=cls>
+            <div class="wc-body">
+                {metric.map(|m| view! { <span class="cc-metric" title="net all-books favourites (favourite − negative)">{format!("+{m}")}</span> })}
+                {match word_href {
+                    Some(h) => view! { <a class="word" href=h>{word}</a> }.into_any(),
+                    None => view! { <span class="word">{word}</span> }.into_any(),
+                }}
+                {has_gloss.then(|| view! { <p class="gloss">{gloss}</p> })}
+            </div>
+            <div class="wc-tags">
+                <span class="tagstrip">
+                    {e.tags.into_iter().map(|(n, i)| {
+                        let cls = format!("taglabel int-{i}");
+                        view! { <span class=cls>{n}</span> }
+                    }).collect_view()}
+                </span>
+            </div>
+            // Only when the word still lives in a book. A word whose sole book was
+            // deleted keeps its tags but has nowhere to link, so drop the empty
+            // "in:" line rather than show it bare.
+            {(!e.books.is_empty()).then(|| view! {
+                <div class="cc-books">
+                    <span class="cc-in">"in: "</span>
+                    {e.books.into_iter().map(|(bid, title)| {
+                        let href = (word_id > 0).then(|| format!("{base}/?book={bid}&word={word_id}"));
+                        match href {
+                            Some(h) => view! { <a class="cc-book" href=h>{title}</a> }.into_any(),
+                            None => view! { <span class="cc-book">{title}</span> }.into_any(),
+                        }
+                    }).collect_view()}
+                </div>
+            })}
+        </article>
+    }
+}
+
 #[component]
 fn CollectionPage() -> impl IntoView {
     let (tag_q, set_tag) = query_signal::<String>("tag");
     let (sort_q, set_sort) = query_signal::<String>("sort");
+    // Same arrangement switch as the words page, same query param, so a `?view=pos`
+    // link means the same thing on both.
+    let (view_q, set_view) = query_signal::<String>("view");
+    let pos_view = Memo::new(move |_| view_q.get().as_deref() == Some("pos"));
+    let pos_chunk = RwSignal::new(POS_CHUNK);
     let base = base_path();
     let tags = Resource::new(|| (), |_| collection_tags());
     let words = Resource::new(move || tag_q.get(), collection_words);
@@ -4896,6 +5311,26 @@ fn CollectionPage() -> impl IntoView {
                 <option value="tags">"sort: most tags"</option>
                 <option value="books">"sort: most books"</option>
             </select>
+            <select class="catsel viewsel" title="ranked = the sort above, straight down; by part of speech = 20 nouns, then 20 verbs, adjectives, adverbs, and round again"
+                prop:value=move || view_q.get().unwrap_or_default()
+                on:change=move |ev| {
+                    let v = event_target_value(&ev);
+                    if v.is_empty() { set_view.set(None); } else { set_view.set(Some(v)); }
+                }>
+                <option value="">"view: ranked"</option>
+                <option value="pos">"view: by part of speech"</option>
+            </select>
+            <Show when=move || pos_view.get() fallback=|| ()>
+                <select class="catsel chunksel" title="how many of each part of speech before switching"
+                    prop:value=move || pos_chunk.get().to_string()
+                    on:change=move |ev| {
+                        if let Ok(n) = event_target_value(&ev).parse::<usize>() { pos_chunk.set(n); }
+                    }>
+                    <option value="10">"10 at a time"</option>
+                    <option value="20">"20 at a time"</option>
+                    <option value="50">"50 at a time"</option>
+                </select>
+            </Show>
             <button class="descbtn" class:on=move || show_list.get()
                 title="show a plain-text list of the words, for copy/paste"
                 on:click=move |_| show_list.update(|v| *v = !*v)>"▤ plain list"</button>
@@ -4922,9 +5357,23 @@ fn CollectionPage() -> impl IntoView {
                     }
                     let base = base.clone();
                     let count = list.len();
-                    // Plain-text mode: one headword per line, with a copy button.
+                    let chunk = pos_chunk.get();
+                    let by_pos = pos_view.get();
+                    // Plain-text mode: one headword per line, with a copy button. In
+                    // the POS view the sections become `# nouns` comment lines — this
+                    // list is always newline-separated, so a heading can't be mistaken
+                    // for a word the way it could in a comma-run.
                     if show_list.get() {
-                        let text = list.iter().map(|e| e.word.clone()).collect::<Vec<_>>().join("\n");
+                        let text = if by_pos {
+                            let mut parts: Vec<String> = Vec::new();
+                            for (h, items) in pos_sections(list, |e| e.pos.clone(), chunk) {
+                                parts.push(format!("# {h}"));
+                                parts.extend(items.into_iter().map(|e| e.word));
+                            }
+                            parts.join("\n")
+                        } else {
+                            list.iter().map(|e| e.word.clone()).collect::<Vec<_>>().join("\n")
+                        };
                         let text_copy = text.clone();
                         let rows = count.clamp(3, 24) as i32;
                         return view! {
@@ -4935,54 +5384,27 @@ fn CollectionPage() -> impl IntoView {
                             <textarea class="plainlist" readonly=true rows=rows prop:value=text></textarea>
                         }.into_any();
                     }
+                    if by_pos {
+                        return view! {
+                            <p class="counts">{format!("{count} words")}</p>
+                            {pos_sections(list, |e| e.pos.clone(), chunk).into_iter().map(|(h, items)| {
+                                let base = base.clone();
+                                view! {
+                                    <h3 class="possec">{h}</h3>
+                                    <div class="wlist">
+                                        {items.into_iter().map(|e| view! {
+                                            <CollectionCard e=e base=base.clone()/>
+                                        }).collect_view()}
+                                    </div>
+                                }
+                            }).collect_view()}
+                        }.into_any();
+                    }
                     view! {
                         <p class="counts">{format!("{count} words")}</p>
                         <div class="wlist">
-                            {list.into_iter().map(|e| {
-                                let word_href = (e.word_id > 0).then(|| {
-                                    e.books.first().map(|(bid, _)| format!("{base}/?book={bid}&word={}", e.word_id))
-                                }).flatten();
-                                let gloss = short(&e.gloss, 140);
-                                let has_gloss = !gloss.is_empty();
-                                let cls = format!("wcard ccard int-{}", e.interest);
-                                let word = e.word.clone();
-                                let metric = e.metric;
-                                view! {
-                                    <article class=cls>
-                                        <div class="wc-body">
-                                            {metric.map(|m| view! { <span class="cc-metric" title="net all-books favourites (favourite − negative)">{format!("+{m}")}</span> })}
-                                            {match word_href {
-                                                Some(h) => view! { <a class="word" href=h>{word}</a> }.into_any(),
-                                                None => view! { <span class="word">{word}</span> }.into_any(),
-                                            }}
-                                            {has_gloss.then(|| view! { <p class="gloss">{gloss}</p> })}
-                                        </div>
-                                        <div class="wc-tags">
-                                            <span class="tagstrip">
-                                                {e.tags.into_iter().map(|(n, i)| {
-                                                    let cls = format!("taglabel int-{i}");
-                                                    view! { <span class=cls>{n}</span> }
-                                                }).collect_view()}
-                                            </span>
-                                        </div>
-                                        // Only when the word still lives in a book. A word whose
-                                        // sole book was deleted keeps its tags but has nowhere to
-                                        // link, so drop the empty "in:" line rather than show it bare.
-                                        {(!e.books.is_empty()).then(|| view! {
-                                            <div class="cc-books">
-                                                <span class="cc-in">"in: "</span>
-                                                {e.books.into_iter().map(|(bid, title)| {
-                                                    let href = (e.word_id > 0)
-                                                        .then(|| format!("{base}/?book={bid}&word={}", e.word_id));
-                                                    match href {
-                                                        Some(h) => view! { <a class="cc-book" href=h>{title}</a> }.into_any(),
-                                                        None => view! { <span class="cc-book">{title}</span> }.into_any(),
-                                                    }
-                                                }).collect_view()}
-                                            </div>
-                                        })}
-                                    </article>
-                                }
+                            {list.into_iter().map(|e| view! {
+                                <CollectionCard e=e base=base.clone()/>
                             }).collect_view()}
                         </div>
                     }.into_any()
@@ -5332,6 +5754,90 @@ fn JobProgressBar(job: RwSignal<Option<String>>, #[prop(optional)] on_done: Opti
     }
 }
 
+/// The shared background-job queue, as a panel. `JobProgressBar` follows ONE job the
+/// page started; this shows everything the registry knows about — which is what the
+/// books page needs, because a bulk grab from `/get` queues one scoring job per book
+/// and you want to watch that from wherever you happen to be. Same `.q-*` markup as
+/// the catalog page's inline copy, so the two read identically.
+///
+/// Polling is fast while something is live and slow when idle; the idle tick matters
+/// because `grab_books` queues its per-book scoring jobs SERVER-side a moment after
+/// the grab exits, so a poller that stopped at "nothing live" would never see them.
+#[component]
+fn JobQueuePanel() -> impl IntoView {
+    let jobs = RwSignal::new(Vec::<JobProgress>::new());
+    let live = RwSignal::new(false);
+    let poll = move || {
+        leptos::task::spawn_local(async move {
+            if let Ok(list) = crate::catalog::queue_status().await {
+                live.set(list.iter().any(|j| matches!(j.status.as_str(), "queued" | "running")));
+                jobs.set(list);
+            }
+        });
+    };
+    Effect::new(move |_| {
+        poll(); // client-only; surface anything already running when the page opens
+        let tick = RwSignal::new(0u32);
+        let h = leptos::prelude::set_interval_with_handle(
+            move || {
+                tick.update(|n| *n += 1);
+                if live.get_untracked() || tick.get_untracked() % 5 == 0 {
+                    poll();
+                }
+            },
+            std::time::Duration::from_millis(1200),
+        );
+        if let Ok(h) = h {
+            on_cleanup(move || h.clear());
+        }
+    });
+    let stop_all = move |_| {
+        leptos::task::spawn_local(async move {
+            let _ = crate::catalog::stop_queue().await;
+            poll();
+        });
+    };
+    view! {
+        {move || {
+            let list = jobs.get();
+            (!list.is_empty()).then(|| view! {
+                <div class="q-panel">
+                    <div class="q-head">
+                        <span class="counts">
+                            {format!("queue · {} job{}", list.len(), if list.len() == 1 { "" } else { "s" })}
+                        </span>
+                        <button type="button" class="chip" on:click=stop_all>"stop all"</button>
+                    </div>
+                    <ul class="q-list">
+                        {list.into_iter().map(|j| {
+                            let id = j.id.clone();
+                            let pct = j.percent;
+                            let running = matches!(j.status.as_str(), "queued" | "running");
+                            let cancel = move |_| {
+                                let id = id.clone();
+                                leptos::task::spawn_local(async move { let _ = cancel_job(id).await; });
+                            };
+                            view! {
+                                <li class="q-job" class:done=!running>
+                                    <span class="q-kind">{j.kind.clone()}</span>
+                                    <span class="q-msg">{j.message.clone()}</span>
+                                    {(running && pct >= 0.0).then(|| view! {
+                                        <progress class="jobprog" max="100" value=pct></progress>
+                                    })}
+                                    <span class=format!("q-status s-{}", j.status)>{j.status.clone()}</span>
+                                    {running.then(|| view! {
+                                        <button type="button" class="chip" on:click=cancel>"cancel"</button>
+                                    })}
+                                </li>
+                            }
+                        }).collect_view()}
+                    </ul>
+                </div>
+            })
+        }}
+    }
+}
+
 /// PDF OCR + text-source controls for one book: per-engine cache state, Run OCR
 /// (background) / Compare / Delete cache, and a source selector that re-ingests.
 #[component]
@@ -5449,13 +5955,24 @@ fn OcrPanel(book_id: i64) -> impl IntoView {
     }
 }
 
-/// One editable book row on the manage page.
+/// One editable book row on the manage page. `tags` is the book's chip list, already
+/// fetched by the page (so the editor doesn't re-query per card); `on_change` bumps
+/// the page's refetch signal after an add/remove so the tag FILTER counts stay honest.
 #[component]
-fn BookCard(b: BookAdmin, edit: ServerAction<UpdateBook>, del: ServerAction<DeleteBook>) -> impl IntoView {
+fn BookCard(
+    b: BookAdmin,
+    tags: Vec<crate::booktags::BookTag>,
+    edit: ServerAction<UpdateBook>,
+    del: ServerAction<DeleteBook>,
+    on_change: Callback<()>,
+) -> impl IntoView {
     let BookAdmin {
         id, slug, title: t0, author: a0, year: y0, format, source, text_source,
         n_tokens, n_types, n_selected, ingested_at,
     } = b;
+    // `slug` is moved into the <a> below; the editor keys the DB by slug, so it
+    // needs its own copy.
+    let tag_slug = slug.clone();
     let title = RwSignal::new(t0);
     let author = RwSignal::new(a0);
     let year = RwSignal::new(y0.map(|y| y.to_string()).unwrap_or_default());
@@ -5486,6 +6003,7 @@ fn BookCard(b: BookAdmin, edit: ServerAction<UpdateBook>, del: ServerAction<Dele
                 <a class="reltgt" href=format!("{}/?book={id}", base_path())>{slug}</a>
                 {format!(" · {format} · {src} · {n_tokens} tokens · {n_types} types · {n_selected}★ · {ingested_at}")}
             </p>
+            <crate::booktags::BookTagEditor book_id=id slug=tag_slug tags=tags on_change=on_change/>
             {is_pdf.then(|| view! { <OcrPanel book_id=id/> })}
         </div>
     }
@@ -5497,7 +6015,13 @@ fn BookCard(b: BookAdmin, edit: ServerAction<UpdateBook>, del: ServerAction<Dele
 fn BooksAdminPage() -> impl IntoView {
     let edit = ServerAction::<UpdateBook>::new();
     let del = ServerAction::<DeleteBook>::new();
-    let books = Resource::new(move || del.version().get(), |_| list_books_admin());
+    // Bumped by BookTagEditor's on_change. Both resources key off it so adding a tag
+    // updates the filter's counts, not just the chip row that was edited.
+    let bump = RwSignal::new(0usize);
+    let books = Resource::new(move || (del.version().get(), bump.get()), |_| list_books_admin());
+    let tagged = Resource::new(move || (del.version().get(), bump.get()), |_| crate::booktags::books_with_tags());
+    let refetch = Callback::new(move |()| bump.update(|n| *n += 1));
+    let (btag, set_btag) = query_signal::<String>("btag");
     let traj_job = RwSignal::new(None::<String>);
     let do_traj = move |_| {
         leptos::task::spawn_local(async move {
@@ -5508,19 +6032,73 @@ fn BooksAdminPage() -> impl IntoView {
     };
     view! {
         <h1>"books"</h1>
-        <p class="sub">"Edit details, manage PDF OCR, switch text source."</p>
+        <p class="sub">"Edit details, tag books, manage PDF OCR, switch text source."</p>
         <div class="bar">
+            // The tag filter is driven by the same list the cards use, so it can't
+            // disagree with them about which tags exist.
+            <Suspense fallback=|| ()>
+                {move || tagged.get().and_then(|r| r.ok()).map(|list| {
+                    let mut counts: Vec<(String, i64)> = {
+                        let mut m: HashMap<String, i64> = HashMap::new();
+                        for b in &list {
+                            for t in &b.tags {
+                                *m.entry(t.name.clone()).or_default() += 1;
+                            }
+                        }
+                        m.into_iter().collect()
+                    };
+                    counts.sort_by(|a, b| a.0.cmp(&b.0));
+                    view! {
+                        <select class="catsel btagsel" title="show only books with this tag"
+                            prop:value=move || btag.get().unwrap_or_default()
+                            on:change=move |ev| {
+                                let v = event_target_value(&ev);
+                                if v.is_empty() { set_btag.set(None); } else { set_btag.set(Some(v)); }
+                            }>
+                            <option value="">"all books"</option>
+                            {counts.into_iter().map(|(name, n)| {
+                                let v = name.clone();
+                                view! { <option value=v>{format!("{name} ({n})")}</option> }
+                            }).collect_view()}
+                        </select>
+                    }
+                })}
+            </Suspense>
             <button type="button" class="chip" on:click=do_traj>"refresh usage charts (all books)"</button>
             <JobProgressBar job=traj_job/>
         </div>
+        // A bulk grab from /get queues one scoring job per book; without this the
+        // books would appear here with no sign that they're still being processed.
+        <JobQueuePanel/>
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
             {move || books.get().map(|res| match res {
                 Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
-                Ok(list) => view! {
-                    <div class="booklist">
-                        {list.into_iter().map(|b| view! { <BookCard b=b edit=edit del=del/> }).collect_view()}
-                    </div>
-                }.into_any(),
+                Ok(list) => {
+                    // book_id -> chips. A failed/absent tag fetch just means no chips;
+                    // the rest of the page must not depend on it.
+                    let by_book: HashMap<i64, Vec<crate::booktags::BookTag>> = tagged
+                        .get()
+                        .and_then(|r| r.ok())
+                        .map(|v| v.into_iter().map(|b| (b.book_id, b.tags)).collect())
+                        .unwrap_or_default();
+                    let want = btag.get().unwrap_or_default();
+                    let rows: Vec<(BookAdmin, Vec<crate::booktags::BookTag>)> = list
+                        .into_iter()
+                        .map(|b| { let t = by_book.get(&b.id).cloned().unwrap_or_default(); (b, t) })
+                        .filter(|(_, t)| want.is_empty() || t.iter().any(|x| x.name == want))
+                        .collect();
+                    let n = rows.len();
+                    view! {
+                        {(!want.is_empty()).then(|| view! {
+                            <p class="counts">{format!("{n} book{} tagged ‘{want}’", if n == 1 { "" } else { "s" })}</p>
+                        })}
+                        <div class="booklist">
+                            {rows.into_iter().map(|(b, t)| view! {
+                                <BookCard b=b tags=t edit=edit del=del on_change=refetch/>
+                            }).collect_view()}
+                        </div>
+                    }.into_any()
+                }
             })}
         </Suspense>
     }

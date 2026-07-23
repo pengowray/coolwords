@@ -919,7 +919,9 @@ pub fn GetBooksPage() -> impl IntoView {
                                     {(running && pct >= 0.0).then(|| view! {
                                         <progress class="jobprog" max="100" value=pct></progress>
                                     })}
-                                    <span class="q-status">{j.status.clone()}</span>
+                                    // The status word is also a class (`s-failed`, …)
+                                    // so CSS can colour it — text content isn't selectable.
+                                    <span class=format!("q-status s-{}", j.status)>{j.status.clone()}</span>
                                     {running.then(|| view! {
                                         <button type="button" class="chip" on:click=cancel>"cancel"</button>
                                     })}

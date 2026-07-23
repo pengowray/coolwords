@@ -28,7 +28,8 @@ html { scrollbar-gutter: stable; overflow-y: scroll; }
 
 /* Subtle, uniform hover/press feedback on the button-like controls. */
 .bar > button, .descbtn, .chip, .tagbtn, .sortbtn, .scopebtn, .catx,
-.favchip, .ratebtn, .listcopy, .plmain, .plmore, .navlink {
+.favchip, .ratebtn, .listcopy, .plmain, .plmore, .navlink,
+.bt-x, .cat-done, .cat-pick {
   transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
 }
 
@@ -636,6 +637,141 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
 .jobbar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 0.4rem 0; }
 .jobprog { width: 12rem; height: 0.7rem; }
 
+/* ---- book picker + arrangement selects (words page / verbarium) ---- */
+/* The book dropdown replaced a row of one-button-per-book. Titles run long, so it
+   gets a ceiling and ellipsizes rather than stretching the toolbar off-screen. */
+.booksel {
+  padding: 0.25rem 0.4rem; border-radius: 6px; max-width: min(22rem, 60vw);
+  border: 1px solid var(--border-strong); background: Canvas; color: inherit;
+  font-weight: 600; text-overflow: ellipsis;
+}
+.booksel optgroup { font-style: normal; font-weight: 600; }
+.booksel option { font-weight: 400; }
+/* the book-tag filter beside it, and the two arrangement selects */
+.btagsel { max-width: 12rem; }
+.viewsel, .chunksel { max-width: 14rem; }
+
+/* "nouns" / "verbs" / … headings between the chunks of the by-part-of-speech view.
+   Deliberately quiet: they're structure, not content. */
+.possec {
+  margin: 1.1rem 0 0.2rem; font-size: 0.74rem; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.06em; color: #999;
+  border-bottom: 1px dashed #8883; padding-bottom: 0.15rem;
+}
+.possec:first-of-type { margin-top: 0.4rem; }
+
+/* ---- background-job queue panel (/get and /books) ---- */
+.q-panel {
+  border: 1px solid #8884; border-radius: 10px; padding: 0.5rem 0.7rem;
+  margin: 0.6rem 0; background: #8880a;
+}
+.q-head { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.3rem; }
+.q-head .counts { flex: 1; min-width: 0; font-size: 0.85rem; }
+.q-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.25rem; }
+.q-job {
+  display: flex; align-items: center; gap: 0.5rem; min-width: 0;
+  font-size: 0.85rem; padding: 0.15rem 0;
+}
+.q-job.done { opacity: 0.6; }
+.q-kind {
+  flex: none; min-width: 4.5rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem; color: #888; text-transform: lowercase;
+}
+/* book titles are long and arrive from python — truncate, never reflow the row */
+.q-msg { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.q-status {
+  flex: none; font-size: 0.75rem; font-weight: 700; border-radius: 9px;
+  padding: 0.02rem 0.5rem; background: #8882; color: #888;
+}
+.q-status.s-running { background: #3498db22; color: #2980b9; }
+.q-status.s-done { background: #2ecc7126; color: #1e8449; }
+.q-status.s-failed { background: #c0392b1e; color: #c0392b; }
+.q-status.s-cancelled { background: #7f8c8d26; color: #6c7a7b; }
+.q-job .jobprog { flex: none; width: 7rem; height: 0.6rem; }
+
+/* ---- book tags (chips inside a /books card) ---- */
+.bt-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 0.4rem; }
+.bt-chip { display: inline-flex; align-items: center; gap: 2px; }
+/* derived src:/fmt: chips: present but plainly not yours to edit */
+.chip.bt-auto { opacity: 0.7; border-style: dashed; cursor: default; }
+.chip.bt-auto:hover { border-color: #8884; }
+.chip.bt-tag { cursor: default; color: #2980b9; border-color: #3498db55; }
+/* .catx is a 1.5rem circle — far too heavy next to a 0.82rem chip */
+.catx.bt-x {
+  width: 1rem; height: 1rem; font-size: 0.62rem; border-color: transparent; color: #aaa;
+}
+.catx.bt-x:hover { border-color: #c0392b; color: #c0392b; }
+.bt-add {
+  width: 5.5rem; font-size: 0.8rem; padding: 0.2rem 0.4rem; color: inherit;
+  border: 1px dashed #8884; border-radius: 12px; background: transparent;
+}
+.bt-add:focus { border-style: solid; border-color: var(--border-strong); }
+.bt-err { font-size: 0.78rem; }
+
+/* ---- catalog browser (/get) ---- */
+/* nothing synced yet: the one thing to do, said loudly (same shape as .dup-banner) */
+.cat-never {
+  background: #3498db14; border: 1px solid #3498db55; color: var(--blue-ink);
+  border-radius: 8px; padding: 0.6rem 0.9rem; margin: 0.8rem 0;
+}
+.cat-syncbar { gap: 1rem 1.4rem; }
+.cat-srcstat { display: inline-flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.cat-srcstat .counts { font-size: 0.85rem; font-weight: 500; color: #888; }
+/* the "primary" chip: the action we actually want you to take */
+.chip.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.chip.primary:hover { background: #16a0851a; border-color: var(--accent-strong); }
+.chip:disabled { opacity: 0.45; cursor: not-allowed; }
+.chip:disabled:hover { border-color: #8884; background: transparent; }
+
+.cat-bar { gap: 0.5rem; }
+/* the search box is the element that should absorb spare width */
+.cat-q {
+  flex: 1 1 12rem; min-width: 8rem; font-size: 0.95rem; padding: 0.28rem 0.55rem;
+  border: 1px solid var(--border-strong); border-radius: 6px; background: Canvas; color: inherit;
+}
+.cat-selbar .counts { font-size: 0.9rem; }
+.cat-notice { color: var(--accent-strong); font-weight: 500; margin: 0.2rem 0; }
+
+.cat-list { list-style: none; padding: 0; margin: 0.6rem 0; }
+.cat-row {
+  display: flex; align-items: baseline; gap: 0.55rem;
+  padding: 0.4rem 0.2rem; border-bottom: 1px solid #8882;
+}
+.cat-row:hover { background: #8881; }
+/* already in the library: still visible (so you can see you have it), but recessive */
+.cat-row.cat-have { opacity: 0.55; }
+.cat-pick { flex: none; width: 1rem; height: 1rem; cursor: pointer; }
+.cat-pick:disabled { cursor: default; }
+/* title + author on one line, meta + subjects on the next — two lines per result,
+   so 48 of them stay scannable. min-width:0 everywhere is what lets the
+   text-overflow actually fire inside a flex item. */
+.cat-main {
+  flex: 1; min-width: 0; display: flex; flex-wrap: wrap;
+  align-items: baseline; gap: 0.1rem 0.5rem;
+}
+.cat-title, .cat-author { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cat-title { flex: 1 1 12rem; font-weight: 600; }
+.cat-author { flex: 0 1 12rem; color: #888; font-size: 0.88rem; }
+/* force a line break before the meta row without an extra wrapper element */
+.cat-meta::before { content: ""; flex-basis: 100%; height: 0; }
+.cat-meta {
+  flex: 0 0 auto; font-weight: 400; color: #999; font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+}
+.cat-subs { flex: 1 1 auto; min-width: 0; display: flex; flex-wrap: wrap; gap: 2px; overflow: hidden; }
+.cat-subs .catchip { margin: 0; font-size: 0.72rem; padding: 0 0.35rem; color: #999; cursor: default; }
+.cat-done { flex: none; font-size: 0.8rem; white-space: nowrap; }
+.cat-pager { justify-content: center; margin: 0.8rem 0 1.6rem; }
+.cat-pager .counts { font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+
+@media (prefers-color-scheme: dark) {
+  /* Greys chosen against a white page; lift the ones that carry real information. */
+  .cat-author, .cat-meta, .cat-subs .catchip, .q-kind { color: #a4a4a4; }
+  .cat-srcstat .counts { color: #b0b0b0; }
+  .cat-row:hover { background: #8882; }
+  .q-panel { background: #8881; }
+}
+
 /* ---- mobile ---- */
 @media (max-width: 40rem) {
   body { margin: 1rem auto; padding: 0 0.7rem; }
@@ -643,8 +779,13 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
 
   /* let the filter bar breathe; book buttons scroll horizontally instead of wrapping tall */
   .bar { gap: 0.5rem; }
-  .bar > button, .catsel, .lvlsel, .catx { padding: 0.4rem 0.7rem; font-size: 0.95rem; }
+  .bar > button, .catsel, .lvlsel, .catx, .booksel { padding: 0.4rem 0.7rem; font-size: 0.95rem; }
   .toggle { margin-left: 0; }
+  /* the toolbar selects each get their own line rather than a two-per-row jumble */
+  .booksel, .btagsel, .viewsel, .chunksel, .cat-q { max-width: 100%; flex-basis: 100%; }
+  /* one result per two lines is already tight on a phone — drop the subject chips */
+  .cat-subs { display: none; }
+  .q-kind { min-width: 3.5rem; }
 
   /* the detail becomes a full-screen sheet with an explicit back button */
   .detail {

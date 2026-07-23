@@ -1,8 +1,9 @@
--- Per-user data: the tag collection and tag applications. Lives in its OWN
--- self-contained database (data/user.db, overridable via COOLWORDS_USER_DB) so
--- it is never touched by dictionary/book rebuilds. Keyed by STABLE TEXT
--- (book slug + lowercased headword), so tags survive re-imports, dictionary
--- rebuilds, and even deleting coolwords.db. NOT applied to coolwords.db
+-- Per-user data: the tag collection, word-tag applications, and book tags.
+-- Lives in its OWN self-contained database (data/user.db, overridable via
+-- COOLWORDS_USER_DB) so it is never touched by dictionary/book rebuilds. Keyed
+-- by STABLE TEXT (book slug, plus the lowercased headword for word tags), so
+-- tags survive re-imports, dictionary rebuilds, and even deleting
+-- coolwords.db. NOT applied to coolwords.db
 -- (ingest/db.py skips this file; the Leptos UI applies it to the user DB).
 
 -- The user's tag collection (definitions): builtin defaults + custom tags.
@@ -44,6 +45,33 @@ CREATE TABLE IF NOT EXISTS word_tags (
     PRIMARY KEY (book_slug, word, tag, rater)
 );
 CREATE INDEX IF NOT EXISTS idx_user_word_tags ON word_tags(book_slug, word);
+
+-- Tags on BOOKS (not words): 'fiction', 'poetry', 'to-read', plus derived ones
+-- like 'src.gutenberg' / 'fmt.epub'. Same contract as word_tags — keyed by the
+-- book's slug, no foreign key into coolwords.db — so a dictionary rebuild, a
+-- re-import, or deleting coolwords.db entirely leaves the tags intact. Deleting a
+-- book does NOT delete its tags; they lie dormant and reattach if the same slug
+-- comes back (deliberate: re-importing a book you'd already curated should not
+-- silently lose that work).
+--
+-- `auto` marks rows this app maintains rather than the user: they are reconciled
+-- from books.source / books.format (so a Standard Ebooks epub gets
+-- 'src.standardebooks' + 'fmt.epub' for free), and the reconciler is free to
+-- delete an auto row that no longer matches. It must never touch auto=0 rows —
+-- that's the user's own tagging, even if the name collides with a derived one.
+--
+-- `tag` is normalised on write: lowercased, restricted to [a-z0-9.:-], with '.'
+-- carrying the same hierarchy convention as the word tags ('src.gutenberg' nests
+-- under 'src') and ':' available for key:value tags.
+CREATE TABLE IF NOT EXISTS book_tags (
+    book_slug TEXT NOT NULL,
+    tag       TEXT NOT NULL,              -- normalised: lowercase, [a-z0-9.:-]
+    auto      INTEGER NOT NULL DEFAULT 0, -- 1 = derived from the book's source/format, not user-set
+    ts        TEXT,
+    PRIMARY KEY (book_slug, tag)
+);
+-- The tag-first lookup ("which books are tagged 'poetry'?") has no other index.
+CREATE INDEX IF NOT EXISTS idx_book_tags_tag ON book_tags(tag);
 
 -- Builtin defaults (the old hardcoded set). INSERT OR IGNORE so re-running and
 -- user edits to comments are preserved. 'star' is the quick ★ toggle.
