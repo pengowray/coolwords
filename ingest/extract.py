@@ -206,20 +206,29 @@ _TOC_ENTRY = re.compile(
 _TOC_WINDOW = 30000   # only look for a CONTENTS heading in the first ~30k chars of the body
 _TRANSCRIBER = re.compile(r"\n[ \t]*\r?\n[ \t]*(?:\*\s*)?Transcriber'?s?\s+Notes?\b", re.I)
 
-# The PG legal footer, as a SAFETY NET for when the `*** END OF … ***` marker is
+# The PG legal FOOTER, as a SAFETY NET for when the `*** END OF … ***` marker is
 # absent or malformed (older etexts, hand-edited files): otherwise the whole licence
-# leaks into the body. Each alternative is a phrase that appears ONLY in the legal
-# block, never in real prose, so cutting from the earliest match to the end is safe.
+# leaks into the body. These are TAIL signatures — a genuine end-of-book licence runs
+# to the end of the file, so we cut from the match to the end. Each phrase appears
+# ONLY in the legal block, never in real prose. (A head-of-file preamble like the
+# "Small Print!" block is NOT here — see _SMALL_PRINT — and the cut is guarded below
+# so a match with no real body before it can never zero out the histogram.)
 _PG_LICENSE_START = re.compile(
     r"\*\*\*\s*START:?\s*FULL\s+LICEN[SC]E"                     # modern licence-block marker
     r"|THE\s+FULL\s+PROJECT\s+GUTENBERG\s+LICEN[SC]E"           # licence heading
     # first licence section — require the PG-specific tail so a law book's own
     # "Section 1. General Terms of Use" heading can't trip it.
     r"|Section\s+1\.\s+General\s+Terms\s+of\s+Use\s+and\s+Redistributing\s+Project\s+Gutenberg"
-    r"|PLEASE\s+READ\s+THIS\s+BEFORE\s+YOU\s+DISTRIBUTE\s+OR\s+USE"  # legal preamble
-    r"|\*+\s*(?:START|BEGIN)\s+OF\s+THE\s+SMALL\s+PRINT"       # old "Small Print!" licence
-    r"|\bEnd\s+of\s+(?:the\s+)?Project\s+Gutenberg('?s\b|\s+E(?:Book|text)\b)",  # old end line (no ***)
+    # old end line (no ***). Accept a straight OR typographic apostrophe in "Gutenberg's".
+    r"|\bEnd\s+of\s+(?:the\s+)?Project\s+Gutenberg(['’]?s\b|\s+E(?:Book|text)\b)",
     re.I)
+
+# The pre-2005 "Small Print!" legal block is a HEAD-of-file preamble, and BOUNDED: a
+# start line naming "SMALL PRINT" through the matching "END … SMALL PRINT" line. It's
+# stripped IN PLACE (not cut-to-end) so it can never swallow the book body after it.
+_SMALL_PRINT = re.compile(
+    r"\*[^\n]*\bSMALL\s+PRINT\b.*?\bEND\b[^\n]*\bSMALL\s+PRINT\b[^\n]*",
+    re.I | re.S)
 
 
 def _subsegment_body(body: str) -> list[Segment]:
@@ -232,6 +241,17 @@ def _subsegment_body(body: str) -> list[Segment]:
         out.append(Segment("credits", False, rest[: m.end()], "transcription credit"))
         rest = rest[m.end():]
 
+    # A "Small Print!" legal block (very old etexts) sits at the head, before the text.
+    # Strip it as a BOUNDED region so the book body that follows is never eaten. Any
+    # real title/text before it is kept (under-strip).
+    if sp := _SMALL_PRINT.search(rest):
+        # keep whatever precedes exactly (empty prefixes are dropped by Extraction);
+        # this preserves the "segments concatenate back to `body`" contract.
+        out.append(Segment("body", True, rest[: sp.start()]))
+        out.append(Segment("gutenberg-licence", False, rest[sp.start(): sp.end()],
+                           "Project Gutenberg 'Small Print!' legal block"))
+        rest = rest[sp.end():]
+
     toc = _find_toc(rest)
     if toc:
         ts, te = toc
@@ -242,10 +262,14 @@ def _subsegment_body(body: str) -> list[Segment]:
 
     # Tail boilerplate: a transcriber's note and/or the PG legal footer. Cut from the
     # EARLIEST such marker to the end. The licence net matters most when the `*** END
-    # OF … ***` marker never fired (so `body` still holds the whole legal block) — the
-    # signatures are legal-only phrases, so this can't eat real prose.
+    # OF … ***` marker never fired (so `body` still holds the whole legal block).
     tn = _TRANSCRIBER.search(rest)
     lic = _PG_LICENSE_START.search(rest)
+    # GUARD: only treat the licence as a tail footer when real body precedes it, so a
+    # licence-like phrase near the start can never cut the whole book to nothing
+    # (the module errs toward under-stripping, never eating real text).
+    if lic and not rest[: lic.start()].strip():
+        lic = None
     if tn and lic:
         first, is_lic = (lic, True) if lic.start() < tn.start() else (tn, False)
     elif lic:
