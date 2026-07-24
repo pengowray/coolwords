@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "ssr")]
 use std::collections::BTreeSet;
 
+use leptos::portal::Portal;
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, MetaTags, Stylesheet, Title};
 use leptos_router::components::{Route, Router, Routes, A};
@@ -2223,15 +2224,16 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
     };
 
     // In-book occurrence count per (book, word), for the "sort by count" option — the
-    // same number a book's own word list ranks on. One scan bounded by the tagged set
-    // (joined through word_tags), so each entry can sum it over the books it reaches.
+    // same number a book's own word list ranks on. Bounded to the tagged set by a
+    // SEMI-join (`word_id IN (...)`), NOT a plain join: a word has one word_tags row
+    // per tag/book/rater, and joining would fan each occurrence row out that many
+    // times, multiplying SUM(count) by the number of tags on the word.
     let count_map: HashMap<(i64, i64), i64> = {
         let mut cs = conn
             .prepare(
                 "SELECT bo.book_id, bo.word_id, SUM(bo.count) FROM book_occurrences bo
-                   JOIN words w ON w.id = bo.word_id
-                   JOIN u.word_tags t ON t.word = w.word
                   WHERE bo.word_id IS NOT NULL
+                    AND bo.word_id IN (SELECT w.id FROM words w JOIN u.word_tags t ON t.word = w.word)
                   GROUP BY bo.book_id, bo.word_id",
             )
             .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -4173,40 +4175,52 @@ fn TagPicker(
                 };
                 let maxlv = def.max_level();
                 let caption = def.comment.clone().unwrap_or_default();
-                // one clone per reactive closure (a `sel` gate + an `on:click`) per button.
-                let (n_clr_s, n_clr_c) = (name.clone(), name.clone());
-                let (n_no_s, n_no_c) = (name.clone(), name.clone());
-                let (n_on_s, n_on_c) = (name.clone(), name.clone());
-                let (n_lv, n_head) = (name.clone(), name.clone());
                 view! {
-                    <div class="scalesheet-backdrop" on:click=move |_| pop.set(None)></div>
-                    <div class="scalesheet">
-                        <div class="scalesheet-head">
-                            <span class="scalesheet-name">{n_head}</span>
-                            {(!caption.is_empty()).then(|| view! {
-                                <span class="scalesheet-cap">{caption}</span>
-                            })}
-                        </div>
-                        <div class="scalesheet-btns">
-                            <button type="button" class="ratebtn clr" title="untag (off)"
-                                class:sel=move || tag_value(t, key, &n_clr_s).is_none()
-                                on:click=move |_| { set_tag_val(t, book_id, word_id, &n_clr_c, None); pop.set(None); }>"⌫ off"</button>
-                            <button type="button" class="ratebtn no" title="considered — not tagged"
-                                class:sel=move || tag_value(t, key, &n_no_s) == Some(0)
-                                on:click=move |_| { set_tag_val(t, book_id, word_id, &n_no_c, Some(0)); pop.set(None); }>"✗"</button>
-                            <button type="button" class="ratebtn onbtn" title="on (no rating)"
-                                class:sel=move || tag_value(t, key, &n_on_s) == Some(TAG_ON)
-                                on:click=move |_| { set_tag_on(t, book_id, word_id, &n_on_c); pop.set(None); }>"on"</button>
-                            {(2..=maxlv).map(|lv| {
-                                let nml = n_lv.clone();
-                                let ncl = n_lv.clone();
-                                view! { <button type="button" class="ratebtn"
-                                    class:sel=move || tag_value(t, key, &nml) == Some(lv)
-                                    on:click=move |_| { set_tag_val(t, book_id, word_id, &ncl, Some(lv)); pop.set(None); }>
-                                    {lv.to_string()}</button> }
-                            }).collect_view()}
-                        </div>
-                    </div>
+                    // Teleport to <body>. On desktop `.detail` is centred with a
+                    // `transform`, which makes it the containing block for any
+                    // position:fixed descendant — without this the sheet would dock to
+                    // the bottom of the detail modal instead of the viewport.
+                    <Portal>
+                        {
+                            // Portal children are an `Fn` (re-callable), so every name
+                            // clone is made here rather than captured from outside.
+                            let (n_head, cap) = (name.clone(), caption.clone());
+                            let (n_clr_s, n_clr_c) = (name.clone(), name.clone());
+                            let (n_no_s, n_no_c) = (name.clone(), name.clone());
+                            let (n_on_s, n_on_c) = (name.clone(), name.clone());
+                            let n_lv = name.clone();
+                            view! {
+                                <div class="scalesheet-backdrop" on:click=move |_| pop.set(None)></div>
+                                <div class="scalesheet">
+                                    <div class="scalesheet-head">
+                                        <span class="scalesheet-name">{n_head}</span>
+                                        {(!cap.is_empty()).then(|| view! {
+                                            <span class="scalesheet-cap">{cap}</span>
+                                        })}
+                                    </div>
+                                    <div class="scalesheet-btns">
+                                        <button type="button" class="ratebtn clr" title="untag (off)"
+                                            class:sel=move || tag_value(t, key, &n_clr_s).is_none()
+                                            on:click=move |_| { set_tag_val(t, book_id, word_id, &n_clr_c, None); pop.set(None); }>"⌫ off"</button>
+                                        <button type="button" class="ratebtn no" title="considered — not tagged"
+                                            class:sel=move || tag_value(t, key, &n_no_s) == Some(0)
+                                            on:click=move |_| { set_tag_val(t, book_id, word_id, &n_no_c, Some(0)); pop.set(None); }>"✗"</button>
+                                        <button type="button" class="ratebtn onbtn" title="on (no rating)"
+                                            class:sel=move || tag_value(t, key, &n_on_s) == Some(TAG_ON)
+                                            on:click=move |_| { set_tag_on(t, book_id, word_id, &n_on_c); pop.set(None); }>"on"</button>
+                                        {(2..=maxlv).map(|lv| {
+                                            let nml = n_lv.clone();
+                                            let ncl = n_lv.clone();
+                                            view! { <button type="button" class="ratebtn"
+                                                class:sel=move || tag_value(t, key, &nml) == Some(lv)
+                                                on:click=move |_| { set_tag_val(t, book_id, word_id, &ncl, Some(lv)); pop.set(None); }>
+                                                {lv.to_string()}</button> }
+                                        }).collect_view()}
+                                    </div>
+                                </div>
+                            }
+                        }
+                    </Portal>
                 }.into_any()
             }}
         </div>
