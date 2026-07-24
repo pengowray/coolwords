@@ -213,7 +213,9 @@ _TRANSCRIBER = re.compile(r"\n[ \t]*\r?\n[ \t]*(?:\*\s*)?Transcriber'?s?\s+Notes
 _PG_LICENSE_START = re.compile(
     r"\*\*\*\s*START:?\s*FULL\s+LICEN[SC]E"                     # modern licence-block marker
     r"|THE\s+FULL\s+PROJECT\s+GUTENBERG\s+LICEN[SC]E"           # licence heading
-    r"|Section\s+1\.\s+General\s+Terms\s+of\s+Use"             # first licence section
+    # first licence section — require the PG-specific tail so a law book's own
+    # "Section 1. General Terms of Use" heading can't trip it.
+    r"|Section\s+1\.\s+General\s+Terms\s+of\s+Use\s+and\s+Redistributing\s+Project\s+Gutenberg"
     r"|PLEASE\s+READ\s+THIS\s+BEFORE\s+YOU\s+DISTRIBUTE\s+OR\s+USE"  # legal preamble
     r"|\*+\s*(?:START|BEGIN)\s+OF\s+THE\s+SMALL\s+PRINT"       # old "Small Print!" licence
     r"|\bEnd\s+of\s+(?:the\s+)?Project\s+Gutenberg('?s\b|\s+E(?:Book|text)\b)",  # old end line (no ***)
