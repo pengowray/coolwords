@@ -114,8 +114,11 @@ def extract(path: Path, pdf_ocr: dict[int, str] | None = None) -> Extraction:
 # --------------------------------------------------------------------------- #
 #  plain text / Project Gutenberg                                             #
 # --------------------------------------------------------------------------- #
-_PG_START = re.compile(r"\*\*\*\s*START OF (?:THE|THIS) PROJECT GUTENBERG EBOOK.*?\*\*\*", re.I | re.S)
-_PG_END = re.compile(r"\*\*\*\s*END OF (?:THE|THIS) PROJECT GUTENBERG EBOOK.*?\*\*\*", re.I | re.S)
+# Accept both the modern "EBOOK" and the pre-2010 "ETEXT" wording — old etexts that
+# weren't recognised as PG kept their whole header + legal footer in the histogram
+# (that's where the trademark/merchantability/redistribute boilerplate leaked from).
+_PG_START = re.compile(r"\*\*\*\s*START OF (?:THE|THIS) PROJECT GUTENBERG E(?:BOOK|TEXT).*?\*\*\*", re.I | re.S)
+_PG_END = re.compile(r"\*\*\*\s*END OF (?:THE|THIS) PROJECT GUTENBERG E(?:BOOK|TEXT).*?\*\*\*", re.I | re.S)
 
 _TITLE_LINE = re.compile(r"^Title:[ \t]*(.+)$", re.I | re.M)
 _AUTHOR_LINE = re.compile(r"^Author:[ \t]*(.+)$", re.I | re.M)
@@ -203,6 +206,19 @@ _TOC_ENTRY = re.compile(
 _TOC_WINDOW = 30000   # only look for a CONTENTS heading in the first ~30k chars of the body
 _TRANSCRIBER = re.compile(r"\n[ \t]*\r?\n[ \t]*(?:\*\s*)?Transcriber'?s?\s+Notes?\b", re.I)
 
+# The PG legal footer, as a SAFETY NET for when the `*** END OF … ***` marker is
+# absent or malformed (older etexts, hand-edited files): otherwise the whole licence
+# leaks into the body. Each alternative is a phrase that appears ONLY in the legal
+# block, never in real prose, so cutting from the earliest match to the end is safe.
+_PG_LICENSE_START = re.compile(
+    r"\*\*\*\s*START:?\s*FULL\s+LICEN[SC]E"                     # modern licence-block marker
+    r"|THE\s+FULL\s+PROJECT\s+GUTENBERG\s+LICEN[SC]E"           # licence heading
+    r"|Section\s+1\.\s+General\s+Terms\s+of\s+Use"             # first licence section
+    r"|PLEASE\s+READ\s+THIS\s+BEFORE\s+YOU\s+DISTRIBUTE\s+OR\s+USE"  # legal preamble
+    r"|\*+\s*(?:START|BEGIN)\s+OF\s+THE\s+SMALL\s+PRINT"       # old "Small Print!" licence
+    r"|\bEnd\s+of\s+(?:the\s+)?Project\s+Gutenberg('?s\b|\s+E(?:Book|text)\b)",  # old end line (no ***)
+    re.I)
+
 
 def _subsegment_body(body: str) -> list[Segment]:
     """Split a Gutenberg body into kept prose + stripped credits/TOC/transcriber spans.
@@ -222,9 +238,27 @@ def _subsegment_body(body: str) -> list[Segment]:
         out.append(Segment("toc", False, rest[ts:te], "table of contents"))
         rest = rest[te:]
 
-    if tn := _TRANSCRIBER.search(rest):
-        out.append(Segment("body", True, rest[: tn.start()]))
-        out.append(Segment("transcriber-note", False, rest[tn.start():], "transcriber's note"))
+    # Tail boilerplate: a transcriber's note and/or the PG legal footer. Cut from the
+    # EARLIEST such marker to the end. The licence net matters most when the `*** END
+    # OF … ***` marker never fired (so `body` still holds the whole legal block) — the
+    # signatures are legal-only phrases, so this can't eat real prose.
+    tn = _TRANSCRIBER.search(rest)
+    lic = _PG_LICENSE_START.search(rest)
+    if tn and lic:
+        first, is_lic = (lic, True) if lic.start() < tn.start() else (tn, False)
+    elif lic:
+        first, is_lic = lic, True
+    elif tn:
+        first, is_lic = tn, False
+    else:
+        first, is_lic = None, False
+    if first:
+        out.append(Segment("body", True, rest[: first.start()]))
+        if is_lic:
+            out.append(Segment("gutenberg-licence", False, rest[first.start():],
+                               "Project Gutenberg licence / legal footer"))
+        else:
+            out.append(Segment("transcriber-note", False, rest[first.start():], "transcriber's note"))
     else:
         out.append(Segment("body", True, rest))
     return out
@@ -277,7 +311,7 @@ _CONTENT_EXT = re.compile(r'CipherReference\s+URI="[^"]*\.(?:x?html?|opf|ncx)"',
 # Spine items that are front/back matter rather than reading content. WORD-BOUNDED
 # so substrings don't misfire — e.g. "cover" must NOT match "Discoveries"/"Discovering".
 _EPUB_SKIP = re.compile(
-    r"\b(cover|copyright|colophon|imprint|dedication|contents|toc|nav"
+    r"\b(cover|copyright|uncopyright|colophon|imprint|dedication|contents|toc|nav"
     r"|acknowledg\w*|frontmatter|backmatter|halftitle|titlepage|advert\w*)\b"
     r"|title[\s_-]?page|half[\s_-]?title|front[\s_-]?matter|back[\s_-]?matter"
     r"|table[\s_-]?of[\s_-]?contents", re.I)
