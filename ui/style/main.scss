@@ -56,6 +56,17 @@ body {
 h1 { margin-bottom: 0; }
 .sub { color: #888; margin-top: 0.25rem; }
 .counts { font-weight: 600; }
+
+/* the word list's sticky book-title bar — pinned to the top of the screen while you
+   scroll the (long) list. Full column width, short, with a Canvas backing so the
+   list scrolls underneath it. Below the detail modal (40/41) and the rating sheet. */
+.booktitlebar {
+  position: sticky; top: 0; z-index: 30; background: Canvas;
+  margin: 0 0 0.1rem; padding: 0.35rem 0; border-bottom: 1px solid #8883;
+}
+.booktitle { margin: 0; font-size: 1.5rem; line-height: 1.2; }
+/* the "jump to a random book" die sits next to the book picker */
+.dicebtn { font-size: 1rem; line-height: 1; padding: 0.3rem 0.5rem; }
 .loading, .err { color: #888; }
 .err { color: #c0392b; }
 
@@ -198,17 +209,37 @@ h1 { margin-bottom: 0; }
 .ratebtn.sel { background: #3498db; color: #fff; border-color: #3498db; }
 .ratebtn.no.sel { background: #c0392b; border-color: #c0392b; } /* 0 = considered & declined */
 .ratebtn.clr.sel { background: #7f8c8d; border-color: #7f8c8d; }
-/* per-scale-chip anchored level picker: click a scale chip to reveal ⌫/✗/1..max */
-.chipwrap { position: relative; display: inline-flex; }
-.scalepop-backdrop { display: none; position: fixed; inset: 0; z-index: 19; }
-.scalepop-backdrop.open { display: block; }
-.scalepop {
-  display: none; position: absolute; top: calc(100% + 4px); left: 0; z-index: 20;
-  gap: 3px; flex-wrap: wrap; align-items: center;
-  padding: 0.35rem 0.4rem; border: 1px solid #8886; border-radius: 10px;
-  background: Canvas; box-shadow: 0 4px 14px #0003;
+/* the value-less "on" button (rating sheet + the rate-mode strip) */
+.ratebtn.onbtn.sel { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* the rating sheet: one per picker, docked to the bottom of the screen with big
+   finger targets (⌫ off / ✗ considered / on / 2..N level). Tapping a scale chip
+   opens it. z-index sits ABOVE the detail modal (40/41) so rating from inside the
+   detail works, and below the toast (100). Safe-area padding for notched phones
+   (needs viewport-fit=cover in the <meta viewport>, which the shell sets). */
+.scalesheet-backdrop { position: fixed; inset: 0; z-index: 59; }
+.scalesheet {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 60;
+  margin: 0 auto; max-width: 32rem;
+  background: Canvas; border: 1px solid #8886; border-bottom: none;
+  border-radius: 14px 14px 0 0; box-shadow: 0 -6px 24px #0004;
+  padding: 0.7rem 0.9rem calc(0.7rem + env(safe-area-inset-bottom));
+  animation: sheetin 0.15s ease-out;
 }
-.scalepop.open { display: inline-flex; }
+@keyframes sheetin { from { transform: translateY(100%); } to { transform: translateY(0); } }
+.scalesheet-head {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.3rem 0.6rem; margin-bottom: 0.55rem;
+}
+.scalesheet-name { font-weight: 700; font-size: 1rem; }
+.scalesheet-cap { color: #888; font-size: 0.85rem; }
+.scalesheet-btns { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.scalesheet .ratebtn {
+  min-width: 3rem; min-height: 2.9rem; flex: 1 1 auto; font-size: 1.05rem;
+  border-radius: 12px; padding: 0.5rem 0.7rem;
+}
+/* the off/untag button gets its own full-width row up top, so it reads as the
+   prominent "remove" (and can't be fat-fingered in place of a rating). */
+.scalesheet .ratebtn.clr { flex-basis: 100%; }
 /* scale ceiling input on the new-tag form + tags manager */
 .newtag-max, .maxin { width: 3.2rem; }
 /* live search over the collection under the new-tag box */
@@ -270,6 +301,14 @@ h1 { margin-bottom: 0; }
 .chip.add { background: #16a085; color: #fff; border-color: #16a085; padding: 0.25rem 0.8rem; }
 .detail-tags { display: block; margin: 0.3rem 0 0.8rem; }
 .detail-tags .star { font-size: 1.4rem; }
+/* the definition + book quote shown at the top of the tag picker, so you can see
+   what a word means (and how it reads) while rating it */
+.pickctx { margin-bottom: 0.5rem; }
+.pickctx-gloss { color: #999; font-size: 0.85rem; margin: 0 0 0.3rem; }
+.pickctx-ex {
+  border-left: 3px solid #8884; margin: 0.3rem 0; padding: 0.15rem 0.7rem;
+  color: #777; font-style: italic; font-size: 0.85rem;
+}
 
 /* ---- word cards (the main list) ---- */
 .wlist { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.4rem; }
@@ -333,6 +372,10 @@ h1 { margin-bottom: 0; }
   display: inline-block; margin-right: 0.4rem; font-weight: 700; font-size: 0.85rem;
   color: #fff; background: #16a085; border-radius: 9px; padding: 0.05rem 0.45rem;
   vertical-align: 0.05rem;
+}
+/* in-book occurrence count in the verbarium (shown when sorting "most in text") */
+.cc-count {
+  margin-left: 0.5rem; font-size: 0.8rem; color: #999; font-variant-numeric: tabular-nums;
 }
 .catsel, .lvlsel {
   padding: 0.25rem 0.4rem; border-radius: 6px;

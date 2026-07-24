@@ -87,6 +87,43 @@ impl TagDef {
     }
 }
 
+// ---- tag application values ----
+// A tag on a word is one of: absent (never considered), 0 (considered & declined),
+// "on" (applied, no numeric level — the value-less true state), or a level 1..N.
+// In the DB `word_tags.value` is NULL for "on" (aligning with the historical
+// NULL==applied), 0 for considered, and >=2 for a rated level. The old default for
+// a tapped-on tag was value=1, so `1` also reads as "on" (a one-time startup
+// migration rewrites 1->NULL; this alias covers any stray rows written afterwards).
+// The client store keeps the same states in an i32 with TAG_ON as the "on" sentinel.
+
+/// Client-store sentinel for the value-less "on" state (distinct from level 1..N and
+/// from the 0/considered state). Never written to the DB — "on" is NULL there.
+pub const TAG_ON: i32 = -1;
+
+/// True if a stored value means the tag is applied (chip lit): the value-less "on"
+/// or any real level (>=1). 0 (considered & declined) is remembered but NOT applied.
+pub fn applied(v: i32) -> bool {
+    v == TAG_ON || v >= 1
+}
+
+/// The numeric level to DISPLAY for a value, if any: Some(n) for a rated level
+/// (>=1), None for the value-less "on" or the 0/considered state. Guards against a
+/// sentinel ever rendering as "·-1".
+pub fn tag_level(v: i32) -> Option<i32> {
+    (v >= 1).then_some(v)
+}
+
+/// Map a raw DB `word_tags.value` to the client store's i32 encoding — the single
+/// source of truth for the read boundary (used by every server fn that hands tag
+/// values to the client). NULL and the legacy default 1 both become "on"; 0 stays
+/// considered; >=2 stays a rated level.
+pub fn value_from_db(v: Option<i32>) -> i32 {
+    match v {
+        None | Some(1) => TAG_ON,
+        Some(n) => n,
+    }
+}
+
 /// Normalize a free-text tag name to its canonical collection form, or None if
 /// it isn't a usable tag. Pure (client + server) so optimistic UI matches storage.
 ///
@@ -283,7 +320,7 @@ fn word_interest(t: Tagger, key: (i64, i64)) -> Option<Interest> {
         let map = m.get(&key)?;
         let mut acc: Option<Interest> = None;
         for (tag, &val) in map {
-            if val < 1 {
+            if !applied(val) {
                 continue;
             }
             fold_interest(&mut acc, tag_interest(t, tag));
@@ -320,10 +357,10 @@ fn group_tags(t: Tagger, book_id: i64, members: &[i64]) -> Vec<(String, Interest
     t.store.with(|m| {
         for &w in members {
             if let Some(set) = m.get(&(book_id, w)) {
-                // Only directly-applied tags (value >= 1); implied parents are NOT
-                // listed here (they'd double-count against the child in the pills).
+                // Only directly-applied tags (value-less "on" or a level); implied
+                // parents are NOT listed here (they'd double-count against the child).
                 for (tag, &val) in set {
-                    if val >= 1 && !tag.starts_with("pick:") {
+                    if applied(val) && !tag.starts_with("pick:") {
                         names.insert(tag.clone());
                     }
                 }
@@ -351,8 +388,10 @@ fn group_tag_values(t: Tagger, book_id: i64, members: &[i64]) -> Vec<(String, i3
         for &w in members {
             if let Some(set) = m.get(&(book_id, w)) {
                 for (tag, &val) in set {
-                    if val >= 1 && tag != "star" && !tag.starts_with("pick:") {
-                        let e = vals.entry(tag.clone()).or_insert(0);
+                    if applied(val) && tag != "star" && !tag.starts_with("pick:") {
+                        // Seed with TAG_ON (the value-less "on" floor) so a tag that's
+                        // only "on" stays "on" (not 0); any real level then wins the max.
+                        let e = vals.entry(tag.clone()).or_insert(TAG_ON);
                         *e = (*e).max(val);
                     }
                 }
@@ -396,7 +435,7 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
         <html lang="en" attr:data-base=base.clone()>
             <head>
                 <meta charset="utf-8"/>
-                <meta name="viewport" content="width=device-width, initial-scale=1"/>
+                <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
                 <AutoReload options=options.clone() />
                 <HydrationScripts options root=base.clone()/>
                 <MetaTags/>
@@ -432,6 +471,11 @@ pub struct CollectionEntry {
     /// Ranking number for a "smart" collection (e.g. net favourite − negative
     /// all-books tags), shown as a badge. `None` for an ordinary tag/all view.
     pub metric: Option<i64>,
+    /// Total in-book occurrences of this word across the books it appears in — the
+    /// same "count" you'd sort by within a single book. Drives the "sort: most in
+    /// text" option in the verbarium.
+    #[serde(default)]
+    pub count: i64,
     /// Primary part of speech ("noun"/"verb"/"adj"/…), for the by-part-of-speech
     /// view. `None` when the dictionary has no POS for the word (or it's unresolved).
     #[serde(default)]
@@ -814,6 +858,19 @@ pub(crate) fn migrate_user(u: &rusqlite::Connection) -> Result<(), ServerFnError
         u.execute("ALTER TABLE word_tags ADD COLUMN value INTEGER", [])
             .map_err(|e| ServerFnError::new(e.to_string()))?;
     }
+    // One-time: the old default for a tapped-on tag was value=1; "on" is now the
+    // value-less NULL state, kept distinct from a scale level. Rewrite legacy 1s to
+    // NULL once — loss-free under the schema's documented NULL==1==applied equivalence
+    // — so an explicit level 1 could be reintroduced later without ambiguity. Gated on
+    // user_version so it runs once, not on every connection (which is every server fn).
+    let ver: i64 = u.query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if ver < 1 {
+        u.execute("UPDATE word_tags SET value = NULL WHERE value = 1", [])
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        u.execute("PRAGMA user_version = 1", [])
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -958,15 +1015,18 @@ fn load_tags(
     let Some(slug) = slug else { return Ok(HashMap::new()) };
     // book-scoped tags for THIS book, plus word-scoped (global, book_slug='*') tags
     // for any of the book's words. `value` is the tri-state rating (NULL==1==applied).
+    // Raw `value` (nullable), mapped to the client encoding by `value_from_db` — the
+    // one read boundary for tag values, so "on" (NULL/legacy-1) vs level vs considered
+    // is decided in exactly one place.
     let mut stmt = conn
         .prepare(
-            "SELECT w.id, t.tag, COALESCE(t.value, 1) FROM u.word_tags t JOIN words w ON w.word = t.word
+            "SELECT w.id, t.tag, t.value FROM u.word_tags t JOIN words w ON w.word = t.word
              WHERE (t.book_slug = ?1 OR t.book_slug = '*') AND t.rater = 'me'",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     let mut map: HashMap<i64, Vec<(String, i32)>> = HashMap::new();
     for r in stmt
-        .query_map([slug], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i32>(2)?)))
+        .query_map([slug], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, value_from_db(r.get::<_, Option<i32>>(2)?))))
         .map_err(|e| ServerFnError::new(e.to_string()))?
         .filter_map(Result::ok)
     {
@@ -1599,9 +1659,9 @@ pub async fn get_candidates(
     for c in &mut out {
         c.pos = pos_map.get(&c.word_id).cloned();
         if let Some(t) = tags.get(&c.word_id) {
-            // applied names only (value >= 1); the client store separately carries
-            // the tri-state values via book_tags.
-            c.tags = t.iter().filter(|(_, v)| *v >= 1).map(|(n, _)| n.clone()).collect();
+            // applied names only (value-less "on" or a level); the client store
+            // separately carries the tri-state values via book_tags.
+            c.tags = t.iter().filter(|(_, v)| applied(*v)).map(|(n, _)| n.clone()).collect();
         }
         if let Some(b) = buckets.get(&c.word_id) {
             c.buckets = b.clone();
@@ -1889,12 +1949,13 @@ pub async fn set_tag(book_id: i64, word_id: i64, tag: String, on: bool) -> Resul
         return Err(ServerFnError::new("unknown book or word"));
     };
     if on {
-        // Upsert value=1 so turning a previously-declined (value 0) tag on actually
-        // applies it (a plain INSERT OR IGNORE would leave the 0 in place).
+        // Upsert value=NULL — the value-less "on" state (distinct from a scale level).
+        // Overwriting on conflict also lifts a previously-declined (value 0) or rated
+        // (value>=2) row back to plain "on"; a bare INSERT OR IGNORE would leave it.
         conn.execute(
             "INSERT INTO u.word_tags(book_slug, word, tag, rater, ts, value)
-             VALUES (?1, ?2, ?3, 'me', datetime('now'), 1)
-             ON CONFLICT(book_slug, word, tag, rater) DO UPDATE SET value = 1",
+             VALUES (?1, ?2, ?3, 'me', datetime('now'), NULL)
+             ON CONFLICT(book_slug, word, tag, rater) DO UPDATE SET value = NULL",
             rusqlite::params![key_slug, word, tag],
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -2161,6 +2222,27 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
         fold_pos(rows.into_iter())
     };
 
+    // In-book occurrence count per (book, word), for the "sort by count" option — the
+    // same number a book's own word list ranks on. One scan bounded by the tagged set
+    // (joined through word_tags), so each entry can sum it over the books it reaches.
+    let count_map: HashMap<(i64, i64), i64> = {
+        let mut cs = conn
+            .prepare(
+                "SELECT bo.book_id, bo.word_id, SUM(bo.count) FROM book_occurrences bo
+                   JOIN words w ON w.id = bo.word_id
+                   JOIN u.word_tags t ON t.word = w.word
+                  WHERE bo.word_id IS NOT NULL
+                  GROUP BY bo.book_id, bo.word_id",
+            )
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        let rows: Vec<((i64, i64), i64)> = cs
+            .query_map([], |r| Ok(((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?), r.get::<_, i64>(2)?)))
+            .map_err(|e| ServerFnError::new(e.to_string()))?
+            .filter_map(Result::ok)
+            .collect();
+        rows.into_iter().collect()
+    };
+
     let mut out: Vec<CollectionEntry> = by_word
         .into_iter()
         .map(|(word, a)| {
@@ -2168,7 +2250,10 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
             tags.sort_by(|x, y| int_rank(&x.1).cmp(&int_rank(&y.1)).then_with(|| x.0.cmp(&y.0)));
             let metric = special.then(|| net(&a.global_tags));
             let pos = pos_map.get(&a.word_id).cloned();
-            CollectionEntry { interest: eff(&tags), word, word_id: a.word_id, gloss: a.gloss, tags, books: a.books, metric, pos }
+            let count = a.books.iter()
+                .map(|(bid, _)| count_map.get(&(*bid, a.word_id)).copied().unwrap_or(0))
+                .sum();
+            CollectionEntry { interest: eff(&tags), word, word_id: a.word_id, gloss: a.gloss, tags, books: a.books, metric, pos, count }
         })
         .collect();
     if special {
@@ -2391,10 +2476,11 @@ pub async fn create_and_apply_tag(
         .map_err(|e| ServerFnError::new(e.to_string()))?
         .unwrap_or_else(|| SCOPE_BOOK.to_string());
     let key_slug = if actual == SCOPE_WORD { "*".to_string() } else { slug };
+    // Fresh application of a just-created tag = the value-less "on" state (NULL).
     conn.execute(
         "INSERT INTO u.word_tags(book_slug, word, tag, rater, ts, value)
-         VALUES (?1, ?2, ?3, 'me', datetime('now'), 1)
-         ON CONFLICT(book_slug, word, tag, rater) DO UPDATE SET value = 1",
+         VALUES (?1, ?2, ?3, 'me', datetime('now'), NULL)
+         ON CONFLICT(book_slug, word, tag, rater) DO UPDATE SET value = NULL",
         rusqlite::params![key_slug, word, clean],
     )
     .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -2962,19 +3048,19 @@ fn tag_value(t: Tagger, key: (i64, i64), tag: &str) -> Option<i32> {
     t.store.with(|m| m.get(&key).and_then(|s| s.get(tag).copied()))
 }
 fn has_tag(t: Tagger, key: (i64, i64), tag: &str) -> bool {
-    tag_value(t, key, tag).is_some_and(|v| v >= 1)
+    tag_value(t, key, tag).is_some_and(applied)
 }
 /// A tag counts as "on" for a word if directly applied OR any applied descendant
 /// implies it (child-implies-parent). Drives the parent chip's lit/implied state.
 fn implied_on(t: Tagger, key: (i64, i64), tag: &str) -> bool {
     t.store.with(|m| {
         m.get(&key).is_some_and(|s| {
-            s.iter().any(|(name, &v)| v >= 1 && (name == tag || is_ancestor(tag, name)))
+            s.iter().any(|(name, &v)| applied(v) && (name == tag || is_ancestor(tag, name)))
         })
     })
 }
 fn has_other_tags(t: Tagger, key: (i64, i64)) -> bool {
-    t.store.with(|m| m.get(&key).is_some_and(|s| s.iter().any(|(x, &v)| v >= 1 && x != "star")))
+    t.store.with(|m| m.get(&key).is_some_and(|s| s.iter().any(|(x, &v)| applied(v) && x != "star")))
 }
 /// Any in-book member of the group carries a non-star tag (drives the per-row
 /// "tags" button highlight regardless of which level introduced the tag).
@@ -2986,9 +3072,17 @@ fn toggle_tag(t: Tagger, book_id: i64, word_id: i64, tag: &str) {
     let next = !has_tag(t, key, tag);
     t.store.update(|m| {
         let set = m.entry(key).or_default();
-        if next { set.insert(tag.to_string(), 1); } else { set.remove(tag); }
+        if next { set.insert(tag.to_string(), TAG_ON); } else { set.remove(tag); }
     });
     t.action.dispatch(SetTag { book_id, word_id, tag: tag.to_string(), on: next });
+}
+/// Force a tag to the value-less "on" state (not a toggle): applies it if off, and
+/// clears any level/considered value back to plain "on" if already set. The rating
+/// sheet's "on" button — the only way back from `#fun:3` to `#fun`.
+fn set_tag_on(t: Tagger, book_id: i64, word_id: i64, tag: &str) {
+    let key = (book_id, word_id);
+    t.store.update(|m| { m.entry(key).or_default().insert(tag.to_string(), TAG_ON); });
+    t.action.dispatch(SetTag { book_id, word_id, tag: tag.to_string(), on: true });
 }
 /// Set a tag's tri-state value on a word (scale ratings + the 0/considered state).
 /// `value` None removes the row (untagged); Some(0) records considered-declined;
@@ -3124,6 +3218,27 @@ pub fn App() -> impl IntoView {
                 <ToastView/>
             </main>
         </Router>
+    }
+}
+
+/// splitmix64 finalizer — one good hash step. Used to derive shuffle/dice orders
+/// from a small seed so a seed of 1 vs 2 gives wildly different arrangements.
+fn mix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// Deterministic in-place Fisher–Yates shuffle driven by a splitmix64 stream. The
+/// SAME seed yields the SAME order on the server and the client, so a shuffled
+/// list hydrates without a mismatch; the "reshuffle" button just bumps the seed.
+fn shuffle_seeded<T>(v: &mut [T], seed: u64) {
+    let mut state = mix64(seed ^ 0xD1B5_4A32_D192_ED03);
+    for i in (1..v.len()).rev() {
+        state = mix64(state);
+        let j = (state % (i as u64 + 1)) as usize;
+        v.swap(i, j);
     }
 }
 
@@ -3668,11 +3783,22 @@ fn ToastView() -> impl IntoView {
 /// reveals scope/interest when you choose to create a brand-new tag. Scope is
 /// otherwise changed on the manage page. Plus per-word "good for: <bucket>" picks.
 #[component]
-fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView {
+fn TagPicker(
+    book_id: i64,
+    word_id: i64,
+    buckets: Vec<String>,
+    /// The headword, so the context quote can bold it (empty = no highlight).
+    #[prop(optional)] word: String,
+    /// Definition + a book context quote, shown at the top of the picker so you can
+    /// see what the word means (and how it's used) while tagging it (empty = absent).
+    #[prop(optional)] gloss: String,
+    #[prop(optional)] example: String,
+) -> impl IntoView {
     let t = expect_context::<Tagger>();
     let toast = expect_context::<Toast>();
     let key = (book_id, word_id);
     let has_buckets = !buckets.is_empty();
+    let has_context = !gloss.is_empty() || !example.is_empty();
     let new_name = RwSignal::new(String::new());
     let new_comment = RwSignal::new(String::new());
     let new_word = RwSignal::new(false); // scope: false = this book, true = all books
@@ -3686,9 +3812,10 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
     // "rate" mode: expand every tag to a tri-state / scale strip (⌫ untag, ✗ = 0
     // considered, 1..max = level) so the 0/considered state + scale levels are reachable.
     let rating = RwSignal::new(false);
-    // Anchored per-chip level picker: holds the name of the scale tag whose popover
-    // is open (None = closed). Lets you pick a precise level on one tag without the
-    // global "rate" mode exploding every tag into a strip.
+    // The rating sheet: holds the name of the scale tag whose bottom-docked rating
+    // sheet is open (None = closed). One shared sheet per picker, looked up by name —
+    // not a hidden popover per chip — so finger-sized buttons have room at the bottom
+    // of the screen without clipping at a chip's edge.
     let pop = RwSignal::new(Option::<String>::None);
     // Progressive disclosure: the scope/interest/comment form for creating a NEW tag
     // stays hidden until the user opts in ("create …"), so the common case (search +
@@ -3782,12 +3909,9 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                     let drag_name = name.clone();
                     let desc_name = name.clone();
                     // dedicated clones for the rate strip (the chip's own closures
-                    // consume on_name / click_name / name, so the strip can't reuse them).
-                    let (r_clr_s, r_clr_c, r_no_s, r_no_c, r_lv) =
-                        (name.clone(), name.clone(), name.clone(), name.clone(), name.clone());
-                    // clones for the anchored level picker (chip click opens it; the two
-                    // reactive `open` gates read it — one for the popover, one for the backdrop).
-                    let (pop_name, pop_show, pop_back) = (name.clone(), name.clone(), name.clone());
+                    // consume on_name / click_name / name, so the strip needs its own).
+                    let (r_clr_s, r_clr_c, r_no_s, r_no_c, r_on_s, r_on_c, r_lv) =
+                        (name.clone(), name.clone(), name.clone(), name.clone(), name.clone(), name.clone(), name.clone());
                     let title = d.comment.clone().unwrap_or_default();
                     let is_scale = d.is_scale();
                     let maxlv = d.max_level();
@@ -3811,14 +3935,22 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                             class:dropover=move || matches!(ds.over.get(), Some((ref n, false)) if *n == over_name)
                             on:pointerdown=down on:pointermove=mv on:pointerup=up
                             on:pointercancel=move |_| ds.reset()
-                            on:click=move |_| if !editing.get_untracked() {
-                                // bool: toggle applied/untagged. scale: open an anchored
-                                // level picker (⌫ / ✗ / 1..max) for just this tag — unless
-                                // the global "rate" strip is already showing one.
+                            on:click=move |_| {
+                                if editing.get_untracked() || rating.get_untracked() { return; }
                                 if is_scale {
-                                    if !rating.get_untracked() {
-                                        let n = pop_name.clone();
-                                        pop.update(|p| *p = (p.as_deref() != Some(n.as_str())).then_some(n));
+                                    // off → on + open the rating sheet; the value-less "on"
+                                    // → off; a rated/considered value → just open the sheet
+                                    // (don't disturb the value you deliberately set).
+                                    match tag_value(t, key, &click_name) {
+                                        None => {
+                                            toggle_tag(t, book_id, word_id, &click_name);
+                                            pop.set(Some(click_name.clone()));
+                                        }
+                                        Some(v) if v == TAG_ON => {
+                                            toggle_tag(t, book_id, word_id, &click_name);
+                                            pop.set(None);
+                                        }
+                                        Some(_) => pop.set(Some(click_name.clone())),
                                     }
                                 } else {
                                     toggle_tag(t, book_id, word_id, &click_name);
@@ -3826,11 +3958,12 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                                 }
                             }>
                             <span class="chiptext">{name.clone()}</span>
-                            // scale value badge (reactive), shown when applied.
+                            // scale value badge: a rated level only (·2..·N). The
+                            // value-less "on" state shows no number.
                             {is_scale.then(|| view! {
-                                <span class="chipval">{move || match tag_value(t, key, &lbl_name) {
-                                    Some(v) if v >= 1 => format!(" ·{v}"),
-                                    _ => String::new(),
+                                <span class="chipval">{move || match tag_value(t, key, &lbl_name).and_then(tag_level) {
+                                    Some(lv) => format!(" ·{lv}"),
+                                    None => String::new(),
                                 }}</span>
                             })}
                         </button>
@@ -3849,9 +3982,9 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                             </div>
                         }.into_any()
                     } else if rating.get() {
-                        // Rate mode: a tri-state / scale strip under every tag.
-                        // ⌫ = untag (never considered), ✗ = considered & declined (0),
-                        // 1..max = applied level (a bool tag has just "1" = yes).
+                        // Rate mode: a tri-state / scale strip under every tag —
+                        // ⌫ untag · ✗ considered(0) · on (value-less) · 2..max level.
+                        // (Level 1 is folded into "on": tapping a scale on has no rating.)
                         view! {
                             <div class="chipcell">
                                 {chip}
@@ -3862,57 +3995,23 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                                     <button type="button" class="ratebtn no" title="considered — not tagged"
                                         class:sel=move || tag_value(t, key, &r_no_s) == Some(0)
                                         on:click=move |_| set_tag_val(t, book_id, word_id, &r_no_c, Some(0))>"✗"</button>
-                                    {(1..=maxlv).map(|lv| {
+                                    <button type="button" class="ratebtn onbtn" title="on (no rating)"
+                                        class:sel=move || tag_value(t, key, &r_on_s) == Some(TAG_ON)
+                                        on:click=move |_| set_tag_on(t, book_id, word_id, &r_on_c)>"on"</button>
+                                    {(2..=maxlv).map(|lv| {
                                         let nml = r_lv.clone();
                                         let ncl = r_lv.clone();
                                         view! { <button type="button" class="ratebtn"
                                             class:sel=move || tag_value(t, key, &nml) == Some(lv)
                                             on:click=move |_| set_tag_val(t, book_id, word_id, &ncl, Some(lv))>
-                                            {if is_scale { lv.to_string() } else { "✓".to_string() }}</button> }
+                                            {lv.to_string()}</button> }
                                     }).collect_view()}
                                 </div>
                             </div>
                         }.into_any()
-                    } else if is_scale {
-                        // Normal mode: click the chip to reveal an anchored level picker
-                        // (⌫ untag / ✗ considered=0 / 1..max). A fixed backdrop closes it
-                        // on click-away; picking a level closes it too.
-                        view! {
-                            <span class="chipwrap">
-                                {chip}
-                                // Rendered once; visibility toggled by the reactive `open`
-                                // gates (CSS hides it when this tag's popover isn't the open one).
-                                <div class="scalepop-backdrop"
-                                    class:open=move || pop.get().as_deref() == Some(pop_back.as_str())
-                                    on:click=move |_| pop.set(None)></div>
-                                <div class="scalepop"
-                                    class:open=move || pop.get().as_deref() == Some(pop_show.as_str())>
-                                    <button type="button" class="ratebtn clr" title="untag"
-                                        class:sel=move || tag_value(t, key, &r_clr_s).is_none()
-                                        on:click=move |_| {
-                                            set_tag_val(t, book_id, word_id, &r_clr_c, None);
-                                            toast_tag(toast, t.tags, &r_clr_c); pop.set(None);
-                                        }>"⌫"</button>
-                                    <button type="button" class="ratebtn no" title="considered — not tagged"
-                                        class:sel=move || tag_value(t, key, &r_no_s) == Some(0)
-                                        on:click=move |_| {
-                                            set_tag_val(t, book_id, word_id, &r_no_c, Some(0));
-                                            toast_tag(toast, t.tags, &r_no_c); pop.set(None);
-                                        }>"✗"</button>
-                                    {(1..=maxlv).map(|lv| {
-                                        let nml = r_lv.clone();
-                                        let ncl = r_lv.clone();
-                                        view! { <button type="button" class="ratebtn"
-                                            class:sel=move || tag_value(t, key, &nml) == Some(lv)
-                                            on:click=move |_| {
-                                                set_tag_val(t, book_id, word_id, &ncl, Some(lv));
-                                                toast_tag(toast, t.tags, &ncl); pop.set(None);
-                                            }>{lv.to_string()}</button> }
-                                    }).collect_view()}
-                                </div>
-                            </span>
-                        }.into_any()
                     } else {
+                        // Normal mode: a scale chip's tap opens the shared bottom sheet
+                        // (rendered once below), so nothing extra is needed per chip.
                         chip.into_any()
                     }
                 }).collect_view()}
@@ -3922,6 +4021,27 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
 
     view! {
         <div class="picker tagpick">
+            // Context up top: the definition and a book quote (with the headword
+            // bolded), so you can see what the word means and how it reads while
+            // rating it — right next to the tag search.
+            {has_context.then(|| {
+                let g = gloss.clone();
+                let ex = example.clone();
+                let w = word.clone();
+                view! {
+                    <div class="pickctx">
+                        {(!g.is_empty()).then(|| view! { <p class="pickctx-gloss">{g}</p> })}
+                        {(!ex.is_empty()).then(|| {
+                            let segs = highlight(&ex, &w);
+                            view! { <blockquote class="pickctx-ex">
+                                {segs.into_iter().map(|(s, hit)| if hit {
+                                    view! { <strong>{s}</strong> }.into_any()
+                                } else { view! { {s} }.into_any() }).collect_view()}
+                            </blockquote> }
+                        })}
+                    </div>
+                }
+            })}
             <div class="pickhead">
                 <button type="button" class="descbtn" class:on=move || describe.get()
                     title="show / edit each tag's description"
@@ -4042,6 +4162,53 @@ fn TagPicker(book_id: i64, word_id: i64, buckets: Vec<String>) -> impl IntoView 
                 })}
                 <a class="managelink" href=format!("{}/tags", base_path())>"manage ↗"</a>
             </div>
+            // One shared rating sheet, docked to the bottom of the screen so the
+            // buttons are big enough for fingers (⌫ off · ✗ considered · on · 2..N).
+            // Driven by `pop` (the tapped scale tag). It shows the tag's caption too,
+            // so no toast is needed; tapping a button or the backdrop closes it.
+            {move || {
+                let Some(name) = pop.get() else { return ().into_any() };
+                let Some(def) = t.tags.with(|v| v.iter().find(|d| d.name == name).cloned()) else {
+                    return ().into_any();
+                };
+                let maxlv = def.max_level();
+                let caption = def.comment.clone().unwrap_or_default();
+                // one clone per reactive closure (a `sel` gate + an `on:click`) per button.
+                let (n_clr_s, n_clr_c) = (name.clone(), name.clone());
+                let (n_no_s, n_no_c) = (name.clone(), name.clone());
+                let (n_on_s, n_on_c) = (name.clone(), name.clone());
+                let (n_lv, n_head) = (name.clone(), name.clone());
+                view! {
+                    <div class="scalesheet-backdrop" on:click=move |_| pop.set(None)></div>
+                    <div class="scalesheet">
+                        <div class="scalesheet-head">
+                            <span class="scalesheet-name">{n_head}</span>
+                            {(!caption.is_empty()).then(|| view! {
+                                <span class="scalesheet-cap">{caption}</span>
+                            })}
+                        </div>
+                        <div class="scalesheet-btns">
+                            <button type="button" class="ratebtn clr" title="untag (off)"
+                                class:sel=move || tag_value(t, key, &n_clr_s).is_none()
+                                on:click=move |_| { set_tag_val(t, book_id, word_id, &n_clr_c, None); pop.set(None); }>"⌫ off"</button>
+                            <button type="button" class="ratebtn no" title="considered — not tagged"
+                                class:sel=move || tag_value(t, key, &n_no_s) == Some(0)
+                                on:click=move |_| { set_tag_val(t, book_id, word_id, &n_no_c, Some(0)); pop.set(None); }>"✗"</button>
+                            <button type="button" class="ratebtn onbtn" title="on (no rating)"
+                                class:sel=move || tag_value(t, key, &n_on_s) == Some(TAG_ON)
+                                on:click=move |_| { set_tag_on(t, book_id, word_id, &n_on_c); pop.set(None); }>"on"</button>
+                            {(2..=maxlv).map(|lv| {
+                                let nml = n_lv.clone();
+                                let ncl = n_lv.clone();
+                                view! { <button type="button" class="ratebtn"
+                                    class:sel=move || tag_value(t, key, &nml) == Some(lv)
+                                    on:click=move |_| { set_tag_val(t, book_id, word_id, &ncl, Some(lv)); pop.set(None); }>
+                                    {lv.to_string()}</button> }
+                            }).collect_view()}
+                        </div>
+                    </div>
+                }.into_any()
+            }}
         </div>
     }
 }
@@ -4115,6 +4282,10 @@ fn WordCard(
     let members_has = c.members.clone();
     let members_strip = c.members.clone();
     let word = c.word.clone();
+    // Copies for the tag picker's context header (definition + book quote).
+    let word_pick = c.word.clone();
+    let gloss_pick = c.gloss.clone().unwrap_or_default();
+    let example_pick = c.example.clone().unwrap_or_default();
     let gloss = c.gloss.clone().unwrap_or_default();
     let has_gloss = !gloss.is_empty();
     let in_book = c.in_book;
@@ -4164,7 +4335,8 @@ fn WordCard(
                 </button>
             </div>
             <Show when=move || open_picker.get() == Some(wid) fallback=|| ()>
-                <TagPicker book_id=b word_id=wid buckets=bk.clone()/>
+                <TagPicker book_id=b word_id=wid buckets=bk.clone()
+                    word=word_pick.clone() gloss=gloss_pick.clone() example=example_pick.clone()/>
             </Show>
         </article>
     }
@@ -4340,10 +4512,27 @@ fn HomePage() -> impl IntoView {
             _ => want,
         }
     });
+    // Mirror the book ids into a plain signal so the "random book" die can read the
+    // list from an event handler (reading the async resource there comes back empty).
+    let book_ids = RwSignal::new(Vec::<i64>::new());
+    Effect::new(move |_| {
+        if let Some(Ok(list)) = books.get() {
+            book_ids.set(list.iter().map(|b| b.id).collect());
+        }
+    });
     // Arrangement: unset (or anything unrecognised) = the ranked list; "pos" cycles
     // chunks of nouns/verbs/adjectives/adverbs. In the URL so a view is linkable.
     let (view_q, set_view) = query_signal::<String>("view");
     let pos_view = Memo::new(move |_| view_q.get().as_deref() == Some("pos"));
+    // "random" arrangement: the shown list shuffled by a seed. The seed is NOT in the
+    // URL (a display preference), and defaults to 1 so selecting "random" shuffles at
+    // once; the ↻ button bumps it for a fresh order. Server + client shuffle the same
+    // seeded way, so a shuffled list still hydrates cleanly.
+    let rand_view = Memo::new(move |_| view_q.get().as_deref() == Some("random"));
+    let shuffle_seed = RwSignal::new(1u64);
+    // Jump to a random book. A bumped nonce (mixed with the current book id so the
+    // first roll isn't always the same) drives the pick — no JS entropy source needed.
+    let dice = RwSignal::new(0u64);
     // Chunk size is a display preference, not an identity — deliberately NOT in the
     // URL, so a shared `?view=pos` link doesn't carry someone else's granularity.
     let pos_chunk = RwSignal::new(POS_CHUNK);
@@ -4428,11 +4617,36 @@ fn HomePage() -> impl IntoView {
     });
 
     view! {
-        <h1>"coolwords"</h1>
+        // The current book's title, pinned to the top of the screen while you scroll
+        // the (long) word list. Full-width and short; the reactive text updates on a
+        // book change while the bar itself stays put.
+        <div class="booktitlebar">
+            <h1 class="booktitle">
+                // Read the resource inside <Suspense> (the endorsed spot), so the
+                // sticky title doesn't trip the "resource read outside Suspense" warning.
+                <Suspense fallback=|| "coolwords".into_view()>
+                    {move || books.get().and_then(|r| r.ok())
+                        .and_then(|l| l.into_iter().find(|bk| bk.id == book.get()).map(|bk| bk.title))
+                        .unwrap_or_else(|| "coolwords".to_string())}
+                </Suspense>
+            </h1>
+        </div>
         <p class="sub">"★ to favourite; click \"tags\" to label; click a word for detail, a category to filter."</p>
 
         <div class="bar">
             <BookSelect books=books book=book set_book=set_book set_word=set_word/>
+            <button type="button" class="descbtn dicebtn" title="jump to a random book"
+                on:click=move |_| {
+                    let ids = book_ids.get_untracked();
+                    if ids.is_empty() { return; }
+                    dice.update(|n| *n = n.wrapping_add(1));
+                    let cur = book.get_untracked();
+                    let z = mix64(dice.get_untracked() ^ (cur as u64).wrapping_mul(0x9E3779B97F4A7C15));
+                    let mut i = (z % ids.len() as u64) as usize;
+                    if ids.len() > 1 && ids[i] == cur { i = (i + 1) % ids.len(); }
+                    set_book.set(Some(ids[i]));
+                    set_word.set(None);
+                }>"🎲"</button>
             <a class="srclink" href={let b = base_path(); move || format!("{b}/source?book={}", book.get())}
                 title="see which parts of this book were kept vs stripped">"view stripping"</a>
             <select class="lvlsel" title="merge related word forms: none keeps every form separate; higher levels group inflections, then derivations, then aggressively (untrembling→tremble) — frequency is combined across the family"
@@ -4483,7 +4697,7 @@ fn HomePage() -> impl IntoView {
             <Show when=move || category.get().is_some() fallback=|| ()>
                 <button class="catx" title="clear category filter" on:click=move |_| set_cat.set(None)>"×"</button>
             </Show>
-            <select class="catsel viewsel" title="ranked = straight down the interestingness ranking; by part of speech = 20 nouns, then 20 verbs, adjectives, adverbs, and round again"
+            <select class="catsel viewsel" title="ranked = straight down the interestingness ranking; by part of speech = 20 nouns, then 20 verbs, adjectives, adverbs, and round again; random = shuffled"
                 prop:value=move || view_q.get().unwrap_or_default()
                 on:change=move |ev| {
                     let v = event_target_value(&ev);
@@ -4491,6 +4705,7 @@ fn HomePage() -> impl IntoView {
                 }>
                 <option value="">"view: ranked"</option>
                 <option value="pos">"view: by part of speech"</option>
+                <option value="random">"view: random"</option>
             </select>
             <Show when=move || pos_view.get() fallback=|| ()>
                 <select class="catsel chunksel" title="how many of each part of speech before switching"
@@ -4502,6 +4717,10 @@ fn HomePage() -> impl IntoView {
                     <option value="20">"20 at a time"</option>
                     <option value="50">"50 at a time"</option>
                 </select>
+            </Show>
+            <Show when=move || rand_view.get() fallback=|| ()>
+                <button type="button" class="descbtn" title="shuffle again"
+                    on:click=move |_| shuffle_seed.update(|s| *s = s.wrapping_add(1))>"↻ reshuffle"</button>
             </Show>
             <label class="toggle">
                 <input type="checkbox" prop:checked=move || only_top.get()
@@ -4553,23 +4772,33 @@ fn HomePage() -> impl IntoView {
                     // CSS-level hide on the card, exactly as before: doing it here
                     // would rebuild the whole list every time you tag a word, and
                     // the page would reshuffle under the cursor mid-tagging.)
-                    let list: Vec<Candidate> = all.into_iter().filter(|c| !top || c.selected).collect();
+                    let mut list: Vec<Candidate> = all.into_iter().filter(|c| !top || c.selected).collect();
+                    // "random" view: shuffle the shown list by the seed (the ↻ button
+                    // bumps it). Seeded, so the SSR order and the hydrated order match.
+                    if rand_view.get() {
+                        shuffle_seeded(&mut list, shuffle_seed.get());
+                    }
                     let total = list.len();
                     let chunk = pos_chunk.get();
-                    let by_pos = pos_view.get();
+                    // random and by-POS are mutually exclusive (one view select), but be
+                    // explicit: a shuffle wins, so the flat shuffled order is what shows.
+                    let by_pos = pos_view.get() && !rand_view.get();
                     // Plain-text mode: each word on its own line (in the shown order),
                     // optionally with its merged forms (`dog/dogs`) and/or its tags as
                     // `#hashtag[:value]`, joined by the chosen separator, with a copy button.
                     if show_list.get() {
                         let forms_on = show_forms.get();
                         let tags_on = show_tags.get();
-                        let scale_names: HashSet<String> = tagger.tags
-                            .with(|defs| defs.iter().filter(|d| d.is_scale()).map(|d| d.name.clone()).collect());
                         let line = |c: &Candidate| -> String {
                             let head = if forms_on && c.forms.len() > 1 { c.forms.join("/") } else { c.word.clone() };
                             if !tags_on { return head; }
+                            // A rated level exports as `#tag:N`; the value-less "on" (and
+                            // any plain bool) as just `#tag`.
                             let hs = group_tag_values(tagger, b, &c.members).into_iter()
-                                .map(|(n, v)| if scale_names.contains(&n) { format!("#{n}:{v}") } else { format!("#{n}") })
+                                .map(|(n, v)| match tag_level(v) {
+                                    Some(lv) => format!("#{n}:{lv}"),
+                                    None => format!("#{n}"),
+                                })
                                 .collect::<Vec<_>>().join(" ");
                             if hs.is_empty() { head } else { format!("{head} // {hs}") }
                         };
@@ -4647,17 +4876,12 @@ fn HomePage() -> impl IntoView {
                                 <h2>{d.word.clone()}</h2>
                                 <div class="detail-tags">
                                     <Star book_id=b word_id=wid/>
-                                    <TagPicker book_id=b word_id=wid buckets=d.buckets.clone()/>
+                                    // The definition + book quote render at the top of the
+                                    // picker (see its `pickctx`), so they're not repeated here.
+                                    <TagPicker book_id=b word_id=wid buckets=d.buckets.clone()
+                                        word=d.word.clone() gloss=d.gloss.clone().unwrap_or_default()
+                                        example=d.example.clone().unwrap_or_default()/>
                                 </div>
-                                <p class="gloss">{d.gloss.clone().unwrap_or_default()}</p>
-                                {d.example.clone().map(|ex| {
-                                    let segs = highlight(&ex, &d.word);
-                                    view! { <blockquote class="ex">
-                                        {segs.into_iter().map(|(s, hit)| if hit {
-                                            view! { <strong>{s}</strong> }.into_any()
-                                        } else { view! { {s} }.into_any() }).collect_view()}
-                                    </blockquote> }
-                                })}
                                 <ul class="meta">
                                     <li>{format!("in this book: {}×", d.in_book)}</li>
                                     <li>{format!("frequency: {:.3}/M", d.freq_pm.unwrap_or(0.0))}</li>
@@ -5188,6 +5412,7 @@ fn CollectionCard(e: CollectionEntry, base: String) -> impl IntoView {
     let cls = format!("wcard ccard int-{}", e.interest);
     let word = e.word.clone();
     let metric = e.metric;
+    let count = e.count;
     let word_id = e.word_id;
     view! {
         <article class=cls>
@@ -5197,6 +5422,7 @@ fn CollectionCard(e: CollectionEntry, base: String) -> impl IntoView {
                     Some(h) => view! { <a class="word" href=h>{word}</a> }.into_any(),
                     None => view! { <span class="word">{word}</span> }.into_any(),
                 }}
+                {(count > 0).then(|| view! { <span class="cc-count" title="total times in the book(s) it appears in">{format!("{count}×")}</span> })}
                 {has_gloss.then(|| view! { <p class="gloss">{gloss}</p> })}
             </div>
             <div class="wc-tags">
@@ -5308,6 +5534,7 @@ fn CollectionPage() -> impl IntoView {
                 <option value="">"sort: default"</option>
                 <option value="interest">"sort: favourites first"</option>
                 <option value="az">"sort: A–Z"</option>
+                <option value="count">"sort: most in text"</option>
                 <option value="tags">"sort: most tags"</option>
                 <option value="books">"sort: most books"</option>
             </select>
@@ -5350,6 +5577,7 @@ fn CollectionPage() -> impl IntoView {
                     let int_rank = |i: &str| match i { "interesting" => 0, "neutral" => 1, _ => 2 };
                     match sort_q.get().as_deref() {
                         Some("az") => list.sort_by(|a, b| a.word.cmp(&b.word)),
+                        Some("count") => list.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.word.cmp(&b.word))),
                         Some("tags") => list.sort_by(|a, b| b.tags.len().cmp(&a.tags.len()).then_with(|| a.word.cmp(&b.word))),
                         Some("books") => list.sort_by(|a, b| b.books.len().cmp(&a.books.len()).then_with(|| a.word.cmp(&b.word))),
                         Some("interest") => list.sort_by(|a, b| int_rank(&a.interest).cmp(&int_rank(&b.interest)).then_with(|| a.word.cmp(&b.word))),

@@ -32,16 +32,20 @@ CREATE TABLE IF NOT EXISTS tags (
 );
 
 -- Tag applications. No foreign keys into the dictionary — fully self-contained.
--- `value` is the tri-state rating: NULL (legacy rows) == 1 == applied; an explicit
--- 0 means "considered and deliberately declined" (remembered, but NOT applied);
--- >=1 means applied (the magnitude, for scale tags). Absent row = never considered.
+-- `value` encodes the state: NULL == the value-less "on" (applied, no numeric level
+-- — the plain true state, and what a bool tag always is); 0 == "considered and
+-- deliberately declined" (remembered, but NOT applied); >=2 == applied at that scale
+-- level. Absent row = never considered. A legacy 1 (the old tap-on default) also
+-- reads as "on"; a one-time migration rewrites 1 -> NULL (see migrate_user), so
+-- level 1 is currently folded into "on". `COALESCE(value,1) >= 1` still means
+-- "applied" (NULL/on and every level count; only the 0 row is excluded).
 CREATE TABLE IF NOT EXISTS word_tags (
     book_slug TEXT NOT NULL,             -- e.g. 'gutenberg-2701'
     word      TEXT NOT NULL,             -- lowercased headword
     tag       TEXT NOT NULL,             -- references tags.name (by value; or 'pick:<bucket>')
     rater     TEXT NOT NULL DEFAULT 'me',
     ts        TEXT,
-    value     INTEGER,                   -- NULL==1==applied; 0==considered-declined; >=1 applied
+    value     INTEGER,                   -- NULL==on(value-less); 0==considered-declined; >=2==level
     PRIMARY KEY (book_slug, word, tag, rater)
 );
 CREATE INDEX IF NOT EXISTS idx_user_word_tags ON word_tags(book_slug, word);
