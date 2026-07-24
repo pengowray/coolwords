@@ -5690,7 +5690,11 @@ fn CollectionPage() -> impl IntoView {
                         let tags_on = show_tags.get();
                         let line = |e: &CollectionEntry| -> String {
                             if !tags_on { return e.word.clone(); }
-                            let hs = e.tags.iter().map(|(n, _)| format!("#{n}")).collect::<Vec<_>>().join(" ");
+                            // exclude the ★ quick-favourite marker + pick: buckets, matching
+                            // the words page's group_tag_values export.
+                            let hs = e.tags.iter()
+                                .filter(|(n, _)| n != "star" && !n.starts_with("pick:"))
+                                .map(|(n, _)| format!("#{n}")).collect::<Vec<_>>().join(" ");
                             if hs.is_empty() { e.word.clone() } else { format!("{} // {hs}", e.word) }
                         };
                         let joiner = match list_sep.get().as_str() { "sp" => " ", "comma" => ", ", _ => "\n" };
