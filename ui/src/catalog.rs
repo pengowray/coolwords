@@ -1016,19 +1016,28 @@ pub fn GetBooksPage() -> impl IntoView {
             })}
         </Suspense>
 
-        // ---- paging
+        // ---- paging. The gate (whether the pager shows at all) tracks `total`; the
+        // per-button state (disabled, the "page X of Y" label) must be REACTIVE
+        // closures, not values captured at build. A static `disabled=pg >= last`
+        // never updates when `page` changes, because Leptos reconciles this fragment
+        // in place rather than rebuilding it — so the buttons froze on their first
+        // state and "next" looked dead after one click.
         {move || {
-            let t = total.get();
-            let pg = page.get();
-            let last = if t <= 0 { 0 } else { (t - 1) / PER_PAGE };
-            (t > PER_PAGE).then(|| view! {
-                <div class="bar cat-pager">
-                    <button type="button" class="chip" disabled=pg <= 0
-                        on:click=move |_| page.update(|p| *p = (*p - 1).max(0))>"‹ prev"</button>
-                    <span class="counts">{format!("page {} of {}", pg + 1, last + 1)}</span>
-                    <button type="button" class="chip" disabled=pg >= last
-                        on:click=move |_| page.update(|p| *p = (*p + 1).min(last))>"next ›"</button>
-                </div>
+            (total.get() > PER_PAGE).then(|| {
+                let last = move || { let t = total.get(); if t <= 0 { 0 } else { (t - 1) / PER_PAGE } };
+                view! {
+                    <div class="bar cat-pager">
+                        <button type="button" class="chip" disabled={move || page.get() <= 0}
+                            on:click=move |_| page.update(|p| *p = (*p - 1).max(0))>"‹ prev"</button>
+                        <span class="counts">
+                            {move || format!("page {} of {}", page.get() + 1, last() + 1)}
+                        </span>
+                        // brace-wrap the value: an unbraced `>=` would let rstml read the
+                        // `>` as the tag close, leaking the rest of the button into its text.
+                        <button type="button" class="chip" disabled={move || page.get() >= last()}
+                            on:click=move |_| page.update(|p| *p = (*p + 1).min(last()))>"next ›"</button>
+                    </div>
+                }
             })
         }}
     }
