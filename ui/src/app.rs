@@ -92,9 +92,9 @@ impl TagDef {
 // A tag on a word is one of: absent (never considered), 0 (considered & declined),
 // "on" (applied, no numeric level — the value-less true state), or a level 1..N.
 // In the DB `word_tags.value` is NULL for "on" (aligning with the historical
-// NULL==applied), 0 for considered, and >=2 for a rated level. The old default for
-// a tapped-on tag was value=1, so `1` also reads as "on" (a one-time startup
-// migration rewrites 1->NULL; this alias covers any stray rows written afterwards).
+// NULL==applied), 0 for considered, and >=1 for a rated level. The old default for a
+// tapped-on tag WAS value=1, but a one-time startup migration rewrote those to NULL,
+// so `1` is now an unambiguous, choosable level again (not "on").
 // The client store keeps the same states in an i32 with TAG_ON as the "on" sentinel.
 
 /// Client-store sentinel for the value-less "on" state (distinct from level 1..N and
@@ -116,11 +116,12 @@ pub fn tag_level(v: i32) -> Option<i32> {
 
 /// Map a raw DB `word_tags.value` to the client store's i32 encoding — the single
 /// source of truth for the read boundary (used by every server fn that hands tag
-/// values to the client). NULL and the legacy default 1 both become "on"; 0 stays
-/// considered; >=2 stays a rated level.
+/// values to the client). NULL becomes the value-less "on"; 0 stays considered; >=1
+/// stays a rated level (the legacy default-1 rows were migrated to NULL, so a 1 here
+/// is a deliberate level).
 pub fn value_from_db(v: Option<i32>) -> i32 {
     match v {
-        None | Some(1) => TAG_ON,
+        None => TAG_ON,
         Some(n) => n,
     }
 }
@@ -477,6 +478,11 @@ pub struct CollectionEntry {
     /// text" option in the verbarium.
     #[serde(default)]
     pub count: i64,
+    /// General corpus frequency (per-million), for the "sort: rarest" option. `None`
+    /// when the word isn't in the frequency corpus (unresolved, or rarer than the ~1M
+    /// tracked words) — sorted last so a measured rarity leads.
+    #[serde(default)]
+    pub freq_pm: Option<f64>,
     /// Primary part of speech ("noun"/"verb"/"adj"/…), for the by-part-of-speech
     /// view. `None` when the dictionary has no POS for the word (or it's unresolved).
     #[serde(default)]
@@ -2082,6 +2088,7 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
     struct Acc {
         word_id: i64,
         gloss: Option<String>,
+        freq_pm: Option<f64>,
         tags: Vec<(String, String)>,        // (name, interest), deduped
         books: Vec<(i64, String)>,          // deduped by id
         global_tags: Vec<(String, String)>, // word-scoped ('*') tags only, deduped — drives the net metric
@@ -2134,15 +2141,15 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
         };
 
         if !by_word.contains_key(&word) {
-            let (wid, gloss): (i64, Option<String>) = conn
-                .query_row("SELECT id, gloss FROM words WHERE word = ?1", [&word], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
+            let (wid, gloss, freq_pm): (i64, Option<String>, Option<f64>) = conn
+                .query_row("SELECT id, gloss, freq_pm FROM words WHERE word = ?1", [&word], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                 })
                 .optional()
                 .map_err(|e| ServerFnError::new(e.to_string()))?
-                .unwrap_or((0, None));
+                .unwrap_or((0, None, None));
             by_word.insert(word.clone(), Acc {
-                word_id: wid, gloss, tags: Vec::new(), books: Vec::new(), global_tags: Vec::new(),
+                word_id: wid, gloss, freq_pm, tags: Vec::new(), books: Vec::new(), global_tags: Vec::new(),
             });
         }
         let acc = by_word.get_mut(&word).unwrap();
@@ -2255,7 +2262,7 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
             let count = a.books.iter()
                 .map(|(bid, _)| count_map.get(&(*bid, a.word_id)).copied().unwrap_or(0))
                 .sum();
-            CollectionEntry { interest: eff(&tags), word, word_id: a.word_id, gloss: a.gloss, tags, books: a.books, metric, pos, count }
+            CollectionEntry { interest: eff(&tags), word, word_id: a.word_id, gloss: a.gloss, freq_pm: a.freq_pm, tags, books: a.books, metric, pos, count }
         })
         .collect();
     if special {
@@ -3985,8 +3992,7 @@ fn TagPicker(
                         }.into_any()
                     } else if rating.get() {
                         // Rate mode: a tri-state / scale strip under every tag —
-                        // ⌫ untag · ✗ considered(0) · on (value-less) · 2..max level.
-                        // (Level 1 is folded into "on": tapping a scale on has no rating.)
+                        // ⌫ untag · ✗ considered(0) · on (applied, no rating) · 1..max level.
                         view! {
                             <div class="chipcell">
                                 {chip}
@@ -4000,7 +4006,8 @@ fn TagPicker(
                                     <button type="button" class="ratebtn onbtn" title="on (no rating)"
                                         class:sel=move || tag_value(t, key, &r_on_s) == Some(TAG_ON)
                                         on:click=move |_| set_tag_on(t, book_id, word_id, &r_on_c)>"on"</button>
-                                    {(2..=maxlv).map(|lv| {
+                                    // 1..max levels for a scale; a bool tag has just on/off (empty range).
+                                    {((if is_scale { 1 } else { 2 })..=maxlv).map(|lv| {
                                         let nml = r_lv.clone();
                                         let ncl = r_lv.clone();
                                         view! { <button type="button" class="ratebtn"
@@ -4208,7 +4215,7 @@ fn TagPicker(
                                         <button type="button" class="ratebtn onbtn" title="on (no rating)"
                                             class:sel=move || tag_value(t, key, &n_on_s) == Some(TAG_ON)
                                             on:click=move |_| { set_tag_on(t, book_id, word_id, &n_on_c); pop.set(None); }>"on"</button>
-                                        {(2..=maxlv).map(|lv| {
+                                        {(1..=maxlv).map(|lv| {
                                             let nml = n_lv.clone();
                                             let ncl = n_lv.clone();
                                             view! { <button type="button" class="ratebtn"
@@ -4543,6 +4550,8 @@ fn HomePage() -> impl IntoView {
     // once; the ↻ button bumps it for a fresh order. Server + client shuffle the same
     // seeded way, so a shuffled list still hydrates cleanly.
     let rand_view = Memo::new(move |_| view_q.get().as_deref() == Some("random"));
+    // "most in text": order the list by in-book occurrence count instead of rank.
+    let count_view = Memo::new(move |_| view_q.get().as_deref() == Some("count"));
     let shuffle_seed = RwSignal::new(1u64);
     // Jump to a random book. A bumped nonce (mixed with the current book id so the
     // first roll isn't always the same) drives the pick — no JS entropy source needed.
@@ -4554,6 +4563,9 @@ fn HomePage() -> impl IntoView {
     let hide_rejected = RwSignal::new(false);
     // Plain-text mode: swap the word cards for a copy-pasteable list of words (as on the verbarium).
     let show_list = RwSignal::new(false);
+    // Compact grid: a dense multi-column list (word + a small gloss), between the full
+    // cards and plain text.
+    let compact = RwSignal::new(false);
     // Plain-list options (behind the ▾ menu). Forms & hashtags are off by default.
     let list_menu = RwSignal::new(false);
     let show_forms = RwSignal::new(false);
@@ -4711,13 +4723,14 @@ fn HomePage() -> impl IntoView {
             <Show when=move || category.get().is_some() fallback=|| ()>
                 <button class="catx" title="clear category filter" on:click=move |_| set_cat.set(None)>"×"</button>
             </Show>
-            <select class="catsel viewsel" title="ranked = straight down the interestingness ranking; by part of speech = 20 nouns, then 20 verbs, adjectives, adverbs, and round again; random = shuffled"
+            <select class="catsel viewsel" title="ranked = straight down the interestingness ranking; most in text = by how often the word appears in this book; by part of speech = 20 nouns, then 20 verbs, adjectives, adverbs, and round again; random = shuffled"
                 prop:value=move || view_q.get().unwrap_or_default()
                 on:change=move |ev| {
                     let v = event_target_value(&ev);
                     if v.is_empty() { set_view.set(None); } else { set_view.set(Some(v)); }
                 }>
                 <option value="">"view: ranked"</option>
+                <option value="count">"view: most in text"</option>
                 <option value="pos">"view: by part of speech"</option>
                 <option value="random">"view: random"</option>
             </select>
@@ -4746,10 +4759,13 @@ fn HomePage() -> impl IntoView {
                     on:change=move |_| hide_rejected.update(|v| *v = !*v)/>
                 " hide rejected"
             </label>
+            <button type="button" class="descbtn" class:on=move || compact.get()
+                title="a compact multi-column grid — word plus a small gloss"
+                on:click=move |_| { compact.update(|v| *v = !*v); if compact.get_untracked() { show_list.set(false); } }>"▦ compact"</button>
             <div class="plwrap">
                 <button class="descbtn plmain" class:on=move || show_list.get()
                     title="show a plain-text list of the words shown, for copy/paste"
-                    on:click=move |_| show_list.update(|v| *v = !*v)>"▤ plain list"</button>
+                    on:click=move |_| { show_list.update(|v| *v = !*v); if show_list.get_untracked() { compact.set(false); } }>"▤ plain list"</button>
                 <button class="descbtn plmore" class:on=move || list_menu.get()
                     title="plain-list options" on:click=move |_| list_menu.update(|v| *v = !*v)>"▾"</button>
                 <Show when=move || list_menu.get() fallback=|| ()>
@@ -4791,12 +4807,15 @@ fn HomePage() -> impl IntoView {
                     // bumps it). Seeded, so the SSR order and the hydrated order match.
                     if rand_view.get() {
                         shuffle_seeded(&mut list, shuffle_seed.get());
+                    } else if count_view.get() {
+                        // "most in text": by in-book occurrence count, ties by rank (input order).
+                        list.sort_by(|a, b| b.in_book.cmp(&a.in_book));
                     }
                     let total = list.len();
                     let chunk = pos_chunk.get();
-                    // random and by-POS are mutually exclusive (one view select), but be
-                    // explicit: a shuffle wins, so the flat shuffled order is what shows.
-                    let by_pos = pos_view.get() && !rand_view.get();
+                    // these flat orderings are mutually exclusive with by-POS (one view
+                    // select), but be explicit: a flat re-sort wins over POS grouping.
+                    let by_pos = pos_view.get() && !rand_view.get() && !count_view.get();
                     // Plain-text mode: each word on its own line (in the shown order),
                     // optionally with its merged forms (`dog/dogs`) and/or its tags as
                     // `#hashtag[:value]`, joined by the chosen separator, with a copy button.
@@ -4842,6 +4861,32 @@ fn HomePage() -> impl IntoView {
                                     on:click=move |_| copy_to_clipboard(&text_copy)>"copy"</button>
                             </p>
                             <textarea class="plainlist" readonly=true rows=rows prop:value=text></textarea>
+                        }.into_any();
+                    }
+                    // Compact grid: a dense multi-column list — word (click for detail)
+                    // plus a small gloss. Interest colouring + "hide rejected" still apply.
+                    if compact.get() {
+                        return view! {
+                            <p class="counts">{format!("{total} shown")}</p>
+                            <div class="cgrid">
+                                {list.into_iter().map(|c| {
+                                    let wid = c.word_id;
+                                    let members = c.members.clone();
+                                    let members_r = c.members.clone();
+                                    let members_h = c.members.clone();
+                                    let g = short(&c.gloss, 60);
+                                    let word = c.word.clone();
+                                    view! {
+                                        <article class="ccell"
+                                            class:interesting=move || group_interest(tagger, b, &members) == Some(Interest::Interesting)
+                                            class:rejected=move || group_interest(tagger, b, &members_r) == Some(Interest::Uninteresting)
+                                            class:hidden=move || hide_rejected.get() && group_interest(tagger, b, &members_h) == Some(Interest::Uninteresting)>
+                                            <span class="ccell-word word" on:click=move |_| set_word.set(Some(wid))>{word}</span>
+                                            {(!g.is_empty()).then(|| view! { <span class="ccell-sub">{g}</span> })}
+                                        </article>
+                                    }
+                                }).collect_view()}
+                            </div>
                         }.into_any();
                     }
                     let card = move |c: Candidate| view! {
@@ -5480,6 +5525,13 @@ fn CollectionPage() -> impl IntoView {
     let words = Resource::new(move || tag_q.get(), collection_words);
     // Plain-text mode: swap the word cards for a copy-pasteable list of headwords.
     let show_list = RwSignal::new(false);
+    // Plain-list options (behind the ▾ menu), mirroring the words page. No "word forms"
+    // here — the verbarium's entries are headwords, not per-book merged surface forms.
+    let list_menu = RwSignal::new(false);
+    let show_tags = RwSignal::new(false);
+    let list_sep = RwSignal::new("nl".to_string()); // "nl" | "sp" | "comma"
+    // Compact grid view: a middle ground between full cards and plain text.
+    let compact = RwSignal::new(false);
 
     view! {
         <h1>"verbarium"</h1>
@@ -5548,6 +5600,7 @@ fn CollectionPage() -> impl IntoView {
                 <option value="">"sort: default"</option>
                 <option value="interest">"sort: favourites first"</option>
                 <option value="az">"sort: A–Z"</option>
+                <option value="rare">"sort: rarest"</option>
                 <option value="count">"sort: most in text"</option>
                 <option value="tags">"sort: most tags"</option>
                 <option value="books">"sort: most books"</option>
@@ -5572,9 +5625,32 @@ fn CollectionPage() -> impl IntoView {
                     <option value="50">"50 at a time"</option>
                 </select>
             </Show>
-            <button class="descbtn" class:on=move || show_list.get()
-                title="show a plain-text list of the words, for copy/paste"
-                on:click=move |_| show_list.update(|v| *v = !*v)>"▤ plain list"</button>
+            <button type="button" class="descbtn" class:on=move || compact.get()
+                title="a compact multi-column grid — word plus a small detail"
+                on:click=move |_| { compact.update(|v| *v = !*v); if compact.get_untracked() { show_list.set(false); } }>"▦ compact"</button>
+            <div class="plwrap">
+                <button class="descbtn plmain" class:on=move || show_list.get()
+                    title="show a plain-text list of the words, for copy/paste"
+                    on:click=move |_| { show_list.update(|v| *v = !*v); if show_list.get_untracked() { compact.set(false); } }>"▤ plain list"</button>
+                <button class="descbtn plmore" class:on=move || list_menu.get()
+                    title="plain-list options" on:click=move |_| list_menu.update(|v| *v = !*v)>"▾"</button>
+                <Show when=move || list_menu.get() fallback=|| ()>
+                    <div class="plmenu-backdrop" on:click=move |_| list_menu.set(false)></div>
+                    <div class="plmenu">
+                        <label><input type="checkbox" prop:checked=move || show_tags.get()
+                            on:change=move |_| { show_tags.update(|v| *v = !*v); show_list.set(true); }/>
+                            " tags as #hashtags"</label>
+                        <div class="plmenu-seps">"separate with:"
+                            <label><input type="radio" name="clsep" prop:checked=move || list_sep.get() == "nl"
+                                on:change=move |_| { list_sep.set("nl".into()); show_list.set(true); }/>" newlines"</label>
+                            <label><input type="radio" name="clsep" prop:checked=move || list_sep.get() == "sp"
+                                on:change=move |_| { list_sep.set("sp".into()); show_list.set(true); }/>" spaces"</label>
+                            <label><input type="radio" name="clsep" prop:checked=move || list_sep.get() == "comma"
+                                on:change=move |_| { list_sep.set("comma".into()); show_list.set(true); }/>" commas"</label>
+                        </div>
+                    </div>
+                </Show>
+            </div>
             <Show when=move || tag_q.get().is_some() fallback=|| ()>
                 <button class="catx" title="clear filter" on:click=move |_| set_tag.set(None)>"×"</button>
             </Show>
@@ -5591,6 +5667,11 @@ fn CollectionPage() -> impl IntoView {
                     let int_rank = |i: &str| match i { "interesting" => 0, "neutral" => 1, _ => 2 };
                     match sort_q.get().as_deref() {
                         Some("az") => list.sort_by(|a, b| a.word.cmp(&b.word)),
+                        // rarest first by corpus frequency; unknown freq (None) sorts last.
+                        Some("rare") => list.sort_by(|a, b| {
+                            let f = |e: &CollectionEntry| e.freq_pm.unwrap_or(f64::INFINITY);
+                            f(a).partial_cmp(&f(b)).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.word.cmp(&b.word))
+                        }),
                         Some("count") => list.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.word.cmp(&b.word))),
                         Some("tags") => list.sort_by(|a, b| b.tags.len().cmp(&a.tags.len()).then_with(|| a.word.cmp(&b.word))),
                         Some("books") => list.sort_by(|a, b| b.books.len().cmp(&a.books.len()).then_with(|| a.word.cmp(&b.word))),
@@ -5601,20 +5682,27 @@ fn CollectionPage() -> impl IntoView {
                     let count = list.len();
                     let chunk = pos_chunk.get();
                     let by_pos = pos_view.get();
-                    // Plain-text mode: one headword per line, with a copy button. In
-                    // the POS view the sections become `# nouns` comment lines — this
-                    // list is always newline-separated, so a heading can't be mistaken
-                    // for a word the way it could in a comma-run.
+                    // Plain-text mode: one headword per line (optionally with its tags as
+                    // `#hashtags`), joined by the chosen separator, with a copy button. In
+                    // the POS view the sections become `# nouns` comment lines, but only in
+                    // the newline flavour (a heading in a comma-run would read as a word).
                     if show_list.get() {
+                        let tags_on = show_tags.get();
+                        let line = |e: &CollectionEntry| -> String {
+                            if !tags_on { return e.word.clone(); }
+                            let hs = e.tags.iter().map(|(n, _)| format!("#{n}")).collect::<Vec<_>>().join(" ");
+                            if hs.is_empty() { e.word.clone() } else { format!("{} // {hs}", e.word) }
+                        };
+                        let joiner = match list_sep.get().as_str() { "sp" => " ", "comma" => ", ", _ => "\n" };
                         let text = if by_pos {
                             let mut parts: Vec<String> = Vec::new();
                             for (h, items) in pos_sections(list, |e| e.pos.clone(), chunk) {
-                                parts.push(format!("# {h}"));
-                                parts.extend(items.into_iter().map(|e| e.word));
+                                if joiner == "\n" { parts.push(format!("# {h}")); }
+                                parts.extend(items.iter().map(line));
                             }
-                            parts.join("\n")
+                            parts.join(joiner)
                         } else {
-                            list.iter().map(|e| e.word.clone()).collect::<Vec<_>>().join("\n")
+                            list.iter().map(line).collect::<Vec<_>>().join(joiner)
                         };
                         let text_copy = text.clone();
                         let rows = count.clamp(3, 24) as i32;
@@ -5624,6 +5712,33 @@ fn CollectionPage() -> impl IntoView {
                                     on:click=move |_| copy_to_clipboard(&text_copy)>"copy"</button>
                             </p>
                             <textarea class="plainlist" readonly=true rows=rows prop:value=text></textarea>
+                        }.into_any();
+                    }
+                    // Compact grid: a dense 2–3 column list, each cell just the word + a
+                    // small gloss. A middle ground between the full cards and plain text.
+                    if compact.get() {
+                        let base = base.clone();
+                        return view! {
+                            <p class="counts">{format!("{count} words")}</p>
+                            <div class="cgrid">
+                                {list.into_iter().map(|e| {
+                                    let href = (e.word_id > 0)
+                                        .then(|| e.books.first().map(|(bid, _)| format!("{base}/?book={bid}&word={}", e.word_id)))
+                                        .flatten();
+                                    let g = short(&e.gloss, 60);
+                                    let cls = format!("ccell int-{}", e.interest);
+                                    let word = e.word.clone();
+                                    view! {
+                                        <article class=cls>
+                                            {match href {
+                                                Some(h) => view! { <a class="ccell-word" href=h>{word}</a> }.into_any(),
+                                                None => view! { <span class="ccell-word">{word}</span> }.into_any(),
+                                            }}
+                                            {(!g.is_empty()).then(|| view! { <span class="ccell-sub">{g}</span> })}
+                                        </article>
+                                    }
+                                }).collect_view()}
+                            </div>
                         }.into_any();
                     }
                     if by_pos {

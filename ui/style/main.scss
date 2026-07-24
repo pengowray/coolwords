@@ -377,6 +377,31 @@ h1 { margin-bottom: 0; }
 .cc-count {
   margin-left: 0.5rem; font-size: 0.8rem; color: #999; font-variant-numeric: tabular-nums;
 }
+
+/* ---- compact grid: a dense 2–3 column word list (word + a small gloss), a middle
+   ground between the full cards and the plain-text export ---- */
+.cgrid {
+  /* ~18rem min keeps it to 2–3 columns in the 60rem content column (1 on a phone). */
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
+  gap: 0.4rem; margin-top: 0.4rem;
+}
+.ccell {
+  border: 1px solid #8883; border-radius: 8px; padding: 0.3rem 0.55rem;
+  display: flex; flex-direction: column; gap: 0.05rem; min-width: 0;
+}
+.ccell-word { font-weight: 600; cursor: pointer; }
+.ccell-word:hover { text-decoration: underline; }
+.ccell a.ccell-word { color: #2980b9; text-decoration: none; }
+.ccell a.ccell-word:hover { text-decoration: underline; }
+.ccell-sub {
+  color: #999; font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* words page uses reactive classes; verbarium uses the server-computed int-* */
+.ccell.interesting, .ccell.int-interesting { background: #16a0850f; border-color: #16a08533; }
+.ccell.rejected { opacity: 0.55; }
+.ccell.rejected .ccell-word { text-decoration: line-through; }
+.ccell.int-uninteresting { opacity: 0.7; }
+.ccell.hidden { display: none; }
 .catsel, .lvlsel {
   padding: 0.25rem 0.4rem; border-radius: 6px;
   border: 1px solid var(--border-strong); background: Canvas; color: inherit;

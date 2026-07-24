@@ -34,11 +34,11 @@ CREATE TABLE IF NOT EXISTS tags (
 -- Tag applications. No foreign keys into the dictionary — fully self-contained.
 -- `value` encodes the state: NULL == the value-less "on" (applied, no numeric level
 -- — the plain true state, and what a bool tag always is); 0 == "considered and
--- deliberately declined" (remembered, but NOT applied); >=2 == applied at that scale
--- level. Absent row = never considered. A legacy 1 (the old tap-on default) also
--- reads as "on"; a one-time migration rewrites 1 -> NULL (see migrate_user), so
--- level 1 is currently folded into "on". `COALESCE(value,1) >= 1` still means
--- "applied" (NULL/on and every level count; only the 0 row is excluded).
+-- deliberately declined" (remembered, but NOT applied); >=1 == applied at that scale
+-- level. Absent row = never considered. The old tap-on default was value=1; a
+-- one-time migration (see migrate_user) rewrote those to NULL, so a `1` here is now a
+-- deliberate level-1 rating, not "on". `COALESCE(value,1) >= 1` still means "applied"
+-- (NULL/on and every level count; only the 0 row is excluded).
 CREATE TABLE IF NOT EXISTS word_tags (
     book_slug TEXT NOT NULL,             -- e.g. 'gutenberg-2701'
     word      TEXT NOT NULL,             -- lowercased headword
