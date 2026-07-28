@@ -65,6 +65,7 @@ h1 { margin-bottom: 0; }
   margin: 0 0 0.1rem; padding: 0.35rem 0; border-bottom: 1px solid #8883;
 }
 .booktitle { margin: 0; font-size: 1.5rem; line-height: 1.2; }
+.bookby { margin: 0; font-size: 0.85rem; color: #888; line-height: 1.3; }
 /* the "jump to a random book" die sits next to the book picker */
 .dicebtn { font-size: 1rem; line-height: 1; padding: 0.3rem 0.5rem; }
 .loading, .err { color: #888; }
@@ -151,6 +152,11 @@ h1 { margin-bottom: 0; }
 .detail .caps { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; color: #999; margin: 0.8rem 0 0.2rem; }
 .detail .base { background: #f39c1218; border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.9rem; }
 .detail .family, .detail .rels { margin: 0.2rem 0; padding-left: 1.1rem; font-size: 0.9rem; }
+/* "more examples from this book" — the on-demand sentence list */
+.detail .exmore { margin: 0.6rem 0 0; }
+.exlist { list-style: none; margin: 0.2rem 0 0; padding: 0; }
+.exlist .ex { margin: 0.45rem 0; }
+.exlist strong { color: inherit; }
 .detail .rel { color: #2980b9; }
 .detail-actions { margin-top: 1rem; }
 
@@ -719,6 +725,25 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
 .btagsel { max-width: 12rem; }
 .viewsel, .chunksel { max-width: 14rem; }
 
+/* type-to-find over the whole library. The hit list floats over the word list, so
+   it needs to sit above it but below the detail modal (40/41). */
+.bfind { position: relative; display: inline-flex; }
+.bfind-q { flex: 0 1 11rem; min-width: 7rem; }
+.bfind-hits {
+  position: absolute; z-index: 20; top: calc(100% + 4px); left: 0;
+  min-width: 18rem; max-width: min(28rem, 90vw); max-height: 60vh; overflow-y: auto;
+  background: Canvas; border: 1px solid #8886; border-radius: 8px;
+  box-shadow: 0 8px 24px #0003; padding: 0.25rem;
+}
+.bfind-hit {
+  display: block; width: 100%; text-align: left; border: none; background: transparent;
+  color: inherit; cursor: pointer; border-radius: 6px; padding: 0.3rem 0.5rem; line-height: 1.25;
+}
+.bfind-hit:hover, .bfind-hit:focus-visible { background: #3498db22; }
+.bfind-title { display: block; font-weight: 600; font-size: 0.92rem; }
+.bfind-sub { display: block; font-size: 0.8rem; color: #888; }
+.bfind-none { margin: 0; padding: 0.3rem 0.5rem; color: #888; font-size: 0.9rem; }
+
 /* "nouns" / "verbs" / … headings between the chunks of the by-part-of-speech view.
    Deliberately quiet: they're structure, not content. */
 .possec {
@@ -727,6 +752,52 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
   border-bottom: 1px dashed #8883; padding-bottom: 0.15rem;
 }
 .possec:first-of-type { margin-top: 0.4rem; }
+
+/* ---- "what's left out?" report (words page) ---- */
+.counts .whybtn, .counts .listcopy { margin-left: 0.6rem; font-weight: 400; }
+.excl {
+  border: 1px solid #8884; border-radius: 10px; background: #8881;
+  padding: 0.7rem 0.9rem; margin: 0.6rem 0 1.2rem;
+}
+.excl-sum { margin: 0 0 0.5rem; }
+.excl-chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.excl-chip {
+  display: inline-flex; align-items: center; gap: 0.35rem; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 14px; background: Canvas;
+  color: inherit; font-size: 0.85rem; padding: 0.2rem 0.6rem;
+}
+.excl-chip:hover { border-color: #888; }
+.excl-chip.on { background: var(--blue); border-color: var(--blue); color: #fff; }
+.excl-n { font-variant-numeric: tabular-nums; opacity: 0.7; font-size: 0.8rem; }
+.excl-chip.on .excl-n { opacity: 0.85; }
+.excl-kept { margin: 0.5rem 0 0; color: #888; font-size: 0.9rem; }
+.excl-bar { display: flex; align-items: center; gap: 0.6rem; margin: 0.8rem 0 0.4rem; }
+.excl-cap { color: #888; font-size: 0.85rem; }
+
+.excl-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+.excl-table th {
+  text-align: left; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em;
+  color: #999; font-weight: 700; border-bottom: 1px solid #8883; padding: 0.2rem 0.5rem 0.25rem;
+}
+.excl-table td { padding: 0.18rem 0.5rem; border-bottom: 1px solid #8882; vertical-align: top; }
+.excl-table .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* the definition sits under the word rather than in a fifth column — the page is
+   60rem wide and a wrapping table reads worse than a two-line cell */
+.excl-gloss {
+  display: block; font-size: 0.8rem; color: #999; max-width: 26rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* tokens with no dictionary entry can't be opened — say so by not offering */
+.excl-oov { color: #888; font-style: italic; }
+.excl-head { color: #888; }
+.excl-why { color: #888; }
+.excl-foot { margin: 0.7rem 0 0; color: #888; font-size: 0.8rem; }
+@media (prefers-color-scheme: dark) {
+  .excl-kept, .excl-cap, .excl-why, .excl-head, .excl-oov, .excl-foot, .excl-gloss,
+  .bookby, .bfind-sub {
+    color: #a8a8a8;
+  }
+}
 
 /* ---- background-job queue panel (/get and /books) ---- */
 .q-panel {
@@ -850,7 +921,13 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
   .bar > button, .catsel, .lvlsel, .catx, .booksel { padding: 0.4rem 0.7rem; font-size: 0.95rem; }
   .toggle { margin-left: 0; }
   /* the toolbar selects each get their own line rather than a two-per-row jumble */
-  .booksel, .btagsel, .viewsel, .chunksel, .cat-q { max-width: 100%; flex-basis: 100%; }
+  .booksel, .btagsel, .viewsel, .chunksel, .cat-q, .bfind { max-width: 100%; flex-basis: 100%; }
+  .bfind-q { flex: 1 1 auto; }
+  .bfind-hits { min-width: 0; width: 100%; }
+  /* the left-out table has four columns and a definition line; let it scroll
+     sideways inside the panel rather than push the page wider */
+  .excl { overflow-x: auto; }
+  .excl-table { min-width: 26rem; }
   /* one result per two lines is already tight on a phone — drop the subject chips */
   .cat-subs { display: none; }
   .q-kind { min-width: 3.5rem; }

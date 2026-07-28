@@ -454,6 +454,12 @@ pub struct Book {
     pub id: i64,
     pub title: String,
     pub n_selected: i64,
+    /// Shown beside the title and matched by the book search box.
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Publication year (also the reference point for the era filters).
+    #[serde(default)]
+    pub year: Option<i64>,
 }
 
 /// One tagged word on the cross-book Collection page: which of the user's tags it
@@ -537,6 +543,15 @@ pub struct Candidate {
     /// view. `None` when the dictionary records no POS for this word.
     #[serde(default)]
     pub pos: Option<String>,
+}
+
+/// One page of ranked candidates plus how many there were to page through, so the
+/// "N shown" line can say whether you're seeing all of them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CandidatePage {
+    pub items: Vec<Candidate>,
+    /// Candidates matching the current category filter, before the display cap.
+    pub total: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1404,12 +1419,21 @@ pub async fn list_books() -> Result<Vec<Book>, ServerFnError> {
                        LEFT JOIN words w ON w.word = t.word
                        LEFT JOIN book_occurrences bo ON bo.word_id = w.id AND bo.book_id = b.id
                      WHERE g.interest = 'interesting' AND COALESCE(t.value, 1) >= 1
-                       AND (t.book_slug = b.slug OR (t.book_slug = '*' AND bo.word_id IS NOT NULL)))
+                       AND (t.book_slug = b.slug OR (t.book_slug = '*' AND bo.word_id IS NOT NULL))),
+                    b.author, b.year
              FROM books b ORDER BY b.id",
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     let rows = stmt
-        .query_map([], |r| Ok(Book { id: r.get(0)?, title: r.get(1)?, n_selected: r.get(2)? }))
+        .query_map([], |r| {
+            Ok(Book {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                n_selected: r.get(2)?,
+                author: r.get(3)?,
+                year: r.get(4)?,
+            })
+        })
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     let mut out = Vec::new();
     for r in rows {
@@ -1523,7 +1547,7 @@ pub async fn get_candidates(
     category: Option<String>,
     limit: i32,
     level: i64,
-) -> Result<Vec<Candidate>, ServerFnError> {
+) -> Result<CandidatePage, ServerFnError> {
     let conn = open_conn()?;
     let tags = load_tags(&conn, book_id)?;
     let buckets = load_buckets(&conn, book_id, level)?;
@@ -1603,6 +1627,10 @@ pub async fn get_candidates(
             .collect(),
     };
 
+    // How many matched before the display cap — the SQL path counts with the same
+    // WHERE, the trajectory path counts what survived classification.
+    let mut total = out.len() as i64;
+
     if needs_traj {
         let year = book_year(&conn, book_id)?;
         let corpus_end = corpus_last_decade(&conn);
@@ -1614,7 +1642,20 @@ pub async fn get_candidates(
         } else {
             out.retain(|c| traj.get(&c.word_id).is_some_and(|t| is_obsolete_now(t)));
         }
+        total = out.len() as i64;
         out.truncate(limit.max(0) as usize);
+    } else if out.len() as i32 >= limit.max(0) {
+        // Only worth a second query when the page came back full — otherwise what
+        // we already fetched IS the whole match set.
+        let count_sql = format!(
+            "SELECT count(*) FROM candidates c JOIN words w ON w.id = c.word_id
+             WHERE c.book_id = ?1 AND c.level = ?2{where_extra}"
+        );
+        total = match &bind_cat {
+            Some(v) => conn.query_row(&count_sql, rusqlite::params![book_id, level, v], |r| r.get(0)),
+            None => conn.query_row(&count_sql, rusqlite::params![book_id, level], |r| r.get(0)),
+        }
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
     }
 
     // in-book member word_ids per group representative at this level (level 0:
@@ -1687,7 +1728,7 @@ pub async fn get_candidates(
         }
         c.forms = forms;
     }
-    Ok(out)
+    Ok(CandidatePage { items: out, total })
 }
 
 #[server]
@@ -1876,6 +1917,95 @@ pub async fn word_detail(book_id: i64, word_id: i64, level: i64) -> Result<WordI
         book_year, categories, buckets, base, family, relations, trajectory, era, obsolete, root,
         also_in,
     })
+}
+
+/// One sentence from the book containing the word, with the surface form that matched.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BookExample {
+    pub form: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExampleSet {
+    pub examples: Vec<BookExample>,
+    /// Sentences found in the whole book — `examples` is capped, this is not.
+    pub total: i64,
+    /// The surface forms searched for (the merged group at the current level).
+    pub forms: Vec<String>,
+}
+
+/// Sentences from the book for a word (and, at merge levels above none, its merged
+/// forms). Only ONE example per token is stored at ingest time, so this re-reads the
+/// book's stored file through the Python extractor — a few hundred ms, hence it runs
+/// on demand behind the "more examples" button rather than with the word detail.
+#[server]
+pub async fn word_examples(
+    book_id: i64,
+    word_id: i64,
+    level: i64,
+    limit: i32,
+) -> Result<ExampleSet, ServerFnError> {
+    use rusqlite::OptionalExtension;
+    let conn = rusqlite::Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let slug: Option<String> = conn
+        .query_row("SELECT slug FROM books WHERE id = ?1", [book_id], |r| r.get(0))
+        .optional()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let Some(slug) = slug else {
+        return Err(ServerFnError::new("book not found"));
+    };
+
+    // The headword plus every in-book surface form that merges into it at this
+    // level — the same group the detail sheet lists under "forms merged here".
+    let mut fstmt = conn
+        .prepare(
+            "SELECT bo.token FROM book_occurrences bo
+             WHERE bo.book_id = ?1 AND bo.word_id IS NOT NULL AND (
+                 bo.word_id = ?2
+                 OR EXISTS (SELECT 1 FROM word_lemma wl
+                            WHERE wl.word_id = bo.word_id AND wl.level = ?3 AND wl.lemma_id = ?2))
+             ORDER BY bo.count DESC LIMIT 15",
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let mut forms: Vec<String> = fstmt
+        .query_map(rusqlite::params![book_id, word_id, level], |r| r.get::<_, String>(0))
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .filter_map(Result::ok)
+        .collect();
+    // The headword itself may not occur in the book (a merged lemma like "sev"),
+    // but searching for it costs nothing and keeps the list honest.
+    if let Some(hw) = conn
+        .query_row("SELECT word FROM words WHERE id = ?1", [word_id], |r| r.get::<_, String>(0))
+        .optional()
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+    {
+        if !forms.contains(&hw) {
+            forms.push(hw);
+        }
+    }
+    if forms.is_empty() {
+        return Ok(ExampleSet { examples: Vec::new(), total: 0, forms });
+    }
+
+    let joined = forms.join(",");
+    let lim = limit.clamp(1, 40).to_string();
+    let v = run_importer(&["--examples", &slug, "--words", &joined, "--limit", &lim]).map_err(
+        |e| {
+            // book_file()'s NO_FILE text names an internal directory; say the useful
+            // part instead (same situation the "view stripping" page explains).
+            if e.to_string().contains("no stored file") {
+                ServerFnError::new(
+                    "This book's text file is no longer stored. Re-import the book to read more examples.",
+                )
+            } else {
+                e
+            }
+        },
+    )?;
+    let examples: Vec<BookExample> = serde_json::from_value(v["examples"].clone())
+        .map_err(|e| ServerFnError::new(format!("parse: {e}")))?;
+    Ok(ExampleSet { examples, total: v["total"].as_i64().unwrap_or(0), forms })
 }
 
 /// Resolve the stable text application key for a (book, word, tag): the word's
@@ -4363,6 +4493,183 @@ fn WordCard(
     }
 }
 
+/// A failed server call as the user should read it. Leptos prefixes every
+/// `ServerFnError` with "error running server function: ", which is about our
+/// plumbing and tells the reader nothing they can act on.
+pub fn err_text<E: std::fmt::Display>(e: &E) -> String {
+    let s = e.to_string();
+    s.strip_prefix("error running server function: ").unwrap_or(&s).to_string()
+}
+
+/// The "N shown" line's text. Says "of M" only when the list is actually cut short —
+/// by the fetch cap, the varied-top-20 toggle, or a category filter — so the plain
+/// number keeps meaning "that's all of them".
+fn shown_text(shown: usize, matched: i64) -> String {
+    let n = crate::excluded::commas(shown as i64);
+    if (shown as i64) < matched {
+        format!("{n} of {} shown", crate::excluded::commas(matched))
+    } else {
+        format!("{n} shown")
+    }
+}
+
+/// Opens the "what's left out?" report. Sits in the counts line of every
+/// arrangement, so it's a component rather than four copies.
+#[component]
+fn WhyButton(open: RwSignal<bool>) -> impl IntoView {
+    view! {
+        <button type="button" class="descbtn whybtn" class:on=move || open.get()
+            title="which of this book's words never reach this list, and why"
+            on:click=move |_| open.update(|v| *v = !*v)>"what's left out?"</button>
+    }
+}
+
+/// "more examples from this book" in the word-detail sheet. Ingest stores only the
+/// FIRST sentence per word, so the rest need a pass over the book's stored text —
+/// slow enough (a Python re-extract) to stay behind a button rather than load with
+/// the rest of the detail.
+#[component]
+fn WordExamples(book_id: i64, word_id: i64, level: i64) -> impl IntoView {
+    let load = RwSignal::new(false);
+    let res = Resource::new(
+        move || (book_id, word_id, level, load.get()),
+        |(b, w, l, go)| async move {
+            if go { word_examples(b, w, l, 30).await.map(Some) } else { Ok(None) }
+        },
+    );
+    view! {
+        <Show when=move || !load.get() fallback=|| ()>
+            <button type="button" class="descbtn exmore"
+                title="search the book's text for every sentence using this word"
+                on:click=move |_| load.set(true)>"more examples from this book"</button>
+        </Show>
+        <Show when=move || load.get() fallback=|| ()>
+            <Suspense fallback=move || view! { <p class="loading">"reading the book…"</p> }>
+                {move || res.get().map(|r| match r {
+                    Err(e) => view! { <p class="err">{err_text(&e)}</p> }.into_any(),
+                    Ok(None) => ().into_any(),
+                    Ok(Some(set)) if set.examples.is_empty() =>
+                        view! { <p class="caps">"no sentences found in this book's stored text"</p> }.into_any(),
+                    Ok(Some(set)) => {
+                        let (n, total) = (set.examples.len() as i64, set.total);
+                        // At a merge level the sentences can use any form in the group,
+                        // so name them rather than leave a "dogs" quote unexplained.
+                        let searched = (set.forms.len() > 1)
+                            .then(|| format!("searched for: {}", set.forms.join(", ")))
+                            .unwrap_or_default();
+                        view! {
+                            <p class="caps" title=searched>{if n < total {
+                                format!("{n} of {total} sentences using this word")
+                            } else {
+                                format!("{n} sentences using this word")
+                            }}</p>
+                            <ul class="exlist">
+                                {set.examples.into_iter().map(|e| view! {
+                                    <li class="ex">
+                                        {highlight(&e.text, &e.form).into_iter().map(|(s, hit)| if hit {
+                                            view! { <strong>{s}</strong> }.into_any()
+                                        } else {
+                                            view! { {s} }.into_any()
+                                        }).collect_view()}
+                                    </li>
+                                }).collect_view()}
+                            </ul>
+                        }.into_any()
+                    }
+                })}
+            </Suspense>
+        </Show>
+    }
+}
+
+/// "Herman Melville · 1851" for a book, skipping whichever half is missing.
+/// EPUB metadata separates co-authors with semicolons; read as a list instead.
+fn byline(author: &Option<String>, year: Option<i64>) -> String {
+    let a = author.as_deref().unwrap_or("").trim().replace("; ", ", ").replace(';', ", ");
+    match (a.is_empty(), year) {
+        (false, Some(y)) => format!("{a} · {y}"),
+        (false, None) => a,
+        (true, Some(y)) => y.to_string(),
+        (true, None) => String::new(),
+    }
+}
+
+/// Type-to-find over the whole library, next to the book select. Matches title OR
+/// author (case-insensitive substring) and ignores the `?btag` filter — the point
+/// of searching is to reach a book you can't see. Enter opens the first hit.
+///
+/// Deliberately a SEPARATE closure from the select below it: keystrokes here would
+/// otherwise rebuild the grouped `<select>` on every character.
+#[component]
+fn BookSearch(
+    books: Resource<Result<Vec<Book>, ServerFnError>>,
+    set_book: SignalSetter<Option<i64>>,
+    set_word: SignalSetter<Option<i64>>,
+) -> impl IntoView {
+    const MAX_HITS: usize = 12;
+    let q = RwSignal::new(String::new());
+    // Mirror the loaded list into a plain signal: the results render and the Enter
+    // key handler both need it, and a resource read in either spot comes back empty.
+    let all = RwSignal::new(Vec::<Book>::new());
+    Effect::new(move |_| {
+        if let Some(Ok(list)) = books.get() {
+            all.set(list);
+        }
+    });
+    let matches = move || {
+        let needle = q.get().trim().to_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        all.get()
+            .into_iter()
+            .filter(|b| {
+                b.title.to_lowercase().contains(&needle)
+                    || b.author.as_deref().unwrap_or("").to_lowercase().contains(&needle)
+            })
+            .take(MAX_HITS)
+            .collect::<Vec<_>>()
+    };
+    let open = move |id: i64| {
+        set_book.set(Some(id));
+        set_word.set(None); // a new book's word ids mean nothing here
+        q.set(String::new());
+    };
+    view! {
+        <div class="bfind">
+            <input class="cat-q bfind-q" type="search" placeholder="find a book…"
+                title="search every book by title or author"
+                prop:value=move || q.get()
+                on:input=move |ev| q.set(event_target_value(&ev))
+                on:keydown=move |ev: web_sys::KeyboardEvent| match ev.key().as_str() {
+                    "Escape" => q.set(String::new()),
+                    "Enter" => { if let Some(b) = matches().first() { open(b.id); } }
+                    _ => {}
+                }/>
+            <Show when=move || !q.get().trim().is_empty() fallback=|| ()>
+                <div class="plmenu-backdrop" on:click=move |_| q.set(String::new())></div>
+                <div class="bfind-hits">
+                    {move || {
+                        let hits = matches();
+                        if hits.is_empty() {
+                            return view! { <p class="bfind-none">"no matching book"</p> }.into_any();
+                        }
+                        hits.into_iter().map(|b| {
+                            let (id, sub) = (b.id, byline(&b.author, b.year));
+                            view! {
+                                <button type="button" class="bfind-hit" on:click=move |_| open(id)>
+                                    <span class="bfind-title">{b.title}</span>
+                                    {(!sub.is_empty()).then(|| view! { <span class="bfind-sub">{sub}</span> })}
+                                </button>
+                            }
+                        }).collect_view().into_any()
+                    }}
+                </div>
+            </Show>
+        </div>
+    }
+}
+
 /// The current-book picker: a book-tag FILTER select plus the book select itself,
 /// whose options are grouped into `<optgroup>`s by book tag. Replaces the old
 /// one-button-per-book row, which stopped being usable somewhere around the
@@ -4399,7 +4706,7 @@ fn BookSelect(
             {move || {
                 let list = match books.get() {
                     Some(Ok(l)) => l,
-                    Some(Err(e)) => return view! { <span class="err">{format!("{e}")}</span> }.into_any(),
+                    Some(Err(e)) => return view! { <span class="err">{err_text(&e)}</span> }.into_any(),
                     None => return ().into_any(),
                 };
                 // Missing/failed tags just mean "no groups"; the picker still works.
@@ -4572,6 +4879,9 @@ fn HomePage() -> impl IntoView {
     let show_tags = RwSignal::new(false);
     let list_sep = RwSignal::new("nl".to_string()); // "nl" | "sp" | "comma"
     let open_picker = RwSignal::new(None::<i64>);
+    // "what's left out?" — the exclusion report under the list. Closed by default;
+    // its queries scan the whole book, so nothing runs until it's opened.
+    let excl_open = RwSignal::new(false);
 
     let tagger = Tagger {
         store: RwSignal::new(HashMap::new()),
@@ -4647,20 +4957,27 @@ fn HomePage() -> impl IntoView {
         // the (long) word list. Full-width and short; the reactive text updates on a
         // book change while the bar itself stays put.
         <div class="booktitlebar">
-            <h1 class="booktitle">
-                // Read the resource inside <Suspense> (the endorsed spot), so the
-                // sticky title doesn't trip the "resource read outside Suspense" warning.
-                <Suspense fallback=|| "coolwords".into_view()>
-                    {move || books.get().and_then(|r| r.ok())
-                        .and_then(|l| l.into_iter().find(|bk| bk.id == book.get()).map(|bk| bk.title))
-                        .unwrap_or_else(|| "coolwords".to_string())}
-                </Suspense>
-            </h1>
+            // Read the resource inside <Suspense> (the endorsed spot), so the
+            // sticky title doesn't trip the "resource read outside Suspense" warning.
+            <Suspense fallback=|| view! { <h1 class="booktitle">"coolwords"</h1> }>
+                {move || {
+                    let cur = books.get().and_then(|r| r.ok())
+                        .and_then(|l| l.into_iter().find(|bk| bk.id == book.get()));
+                    let title = cur.as_ref().map(|bk| bk.title.clone())
+                        .unwrap_or_else(|| "coolwords".to_string());
+                    let sub = cur.as_ref().map(|bk| byline(&bk.author, bk.year)).unwrap_or_default();
+                    view! {
+                        <h1 class="booktitle">{title}</h1>
+                        {(!sub.is_empty()).then(|| view! { <p class="bookby">{sub}</p> })}
+                    }
+                }}
+            </Suspense>
         </div>
         <p class="sub">"★ to favourite; click \"tags\" to label; click a word for detail, a category to filter."</p>
 
         <div class="bar">
             <BookSelect books=books book=book set_book=set_book set_word=set_word/>
+            <BookSearch books=books set_book=set_book set_word=set_word/>
             <button type="button" class="descbtn dicebtn" title="jump to a random book"
                 on:click=move |_| {
                     let ids = book_ids.get_untracked();
@@ -4792,17 +5109,19 @@ fn HomePage() -> impl IntoView {
 
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
             {move || candidates.get().map(|res| match res {
-                Err(e) => view! { <p class="err">{format!("Error: {e}")}</p> }.into_any(),
-                Ok(all) => {
+                Err(e) => view! { <p class="err">{format!("Error: {}", err_text(&e))}</p> }.into_any(),
+                Ok(page) => {
                     let b = book.get();
                     let top = only_top.get();
+                    let matched = page.total;
                     // FILTER FIRST, arrange after — the category filter already ran
                     // server-side, varied-top-20 runs here, and only what survives
                     // both is fed to the POS arrangement. ("hide rejected" stays a
                     // CSS-level hide on the card, exactly as before: doing it here
                     // would rebuild the whole list every time you tag a word, and
                     // the page would reshuffle under the cursor mid-tagging.)
-                    let mut list: Vec<Candidate> = all.into_iter().filter(|c| !top || c.selected).collect();
+                    let mut list: Vec<Candidate> =
+                        page.items.into_iter().filter(|c| !top || c.selected).collect();
                     // "random" view: shuffle the shown list by the seed (the ↻ button
                     // bumps it). Seeded, so the SSR order and the hydrated order match.
                     if rand_view.get() {
@@ -4856,9 +5175,10 @@ fn HomePage() -> impl IntoView {
                         let text_copy = text.clone();
                         let rows = total.clamp(3, 24) as i32;
                         return view! {
-                            <p class="counts">{format!("{total} shown")}
+                            <p class="counts">{shown_text(total, matched)}
                                 <button class="listcopy" title="copy the list to the clipboard"
                                     on:click=move |_| copy_to_clipboard(&text_copy)>"copy"</button>
+                                <WhyButton open=excl_open/>
                             </p>
                             <textarea class="plainlist" readonly=true rows=rows prop:value=text></textarea>
                         }.into_any();
@@ -4867,7 +5187,7 @@ fn HomePage() -> impl IntoView {
                     // plus a small gloss. Interest colouring + "hide rejected" still apply.
                     if compact.get() {
                         return view! {
-                            <p class="counts">{format!("{total} shown")}</p>
+                            <p class="counts">{shown_text(total, matched)}<WhyButton open=excl_open/></p>
                             <div class="cgrid">
                                 {list.into_iter().map(|c| {
                                     let wid = c.word_id;
@@ -4895,7 +5215,7 @@ fn HomePage() -> impl IntoView {
                     };
                     if by_pos {
                         return view! {
-                            <p class="counts">{format!("{total} shown")}</p>
+                            <p class="counts">{shown_text(total, matched)}<WhyButton open=excl_open/></p>
                             {pos_sections(list, |c| c.pos.clone(), chunk).into_iter().map(|(h, items)| view! {
                                 <h3 class="possec">{h}</h3>
                                 <div class="wlist">{items.into_iter().map(card).collect_view()}</div>
@@ -4903,7 +5223,7 @@ fn HomePage() -> impl IntoView {
                         }.into_any();
                     }
                     view! {
-                        <p class="counts">{format!("{total} shown")}</p>
+                        <p class="counts">{shown_text(total, matched)}<WhyButton open=excl_open/></p>
                         <div class="wlist">
                             {list.into_iter().map(card).collect_view()}
                         </div>
@@ -4912,13 +5232,15 @@ fn HomePage() -> impl IntoView {
             })}
         </Suspense>
 
+        <crate::excluded::ExcludedPanel book=book level=level open=excl_open set_word=set_word/>
+
         <Show when=move || selected.get().is_some() fallback=|| ()>
             <div class="detail-backdrop" on:click=move |_| set_word.set(None)></div>
             <aside class="detail">
                 <button class="close" title="back to the list" on:click=move |_| set_word.set(None)>"← back"</button>
                 <Suspense fallback=move || view! { <p class="loading">"…"</p> }>
                     {move || detail.get().map(|res| match res {
-                        Err(e) => view! { <p class="err">{format!("{e}")}</p> }.into_any(),
+                        Err(e) => view! { <p class="err">{err_text(&e)}</p> }.into_any(),
                         Ok(None) => ().into_any(),
                         Ok(Some(d)) => {
                             let b = book.get();
@@ -4947,6 +5269,11 @@ fn HomePage() -> impl IntoView {
                                     <li>{format!("syllables: {}", d.syllables.map(|n| n.to_string()).unwrap_or_default())}</li>
                                     <li>{format!("origin: {origin}")}</li>
                                 </ul>
+                                // One quote already sits at the top of the picker; this
+                                // fetches the rest, and only for a word used more than once.
+                                {(d.in_book > 1).then(|| view! {
+                                    <WordExamples book_id=b word_id=wid level=level.get()/>
+                                })}
                                 <Trajectory data=d.trajectory.clone() book_year=d.book_year/>
                                 {(d.era.is_some() || d.obsolete).then(|| {
                                     let era = d.era.clone();
@@ -5401,7 +5728,7 @@ fn TagsPage() -> impl IntoView {
         </datalist>
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
             {move || tags.get().map(|res| match res {
-                Err(e) => view! { <p class="err">{format!("{e}")}</p> }.into_any(),
+                Err(e) => view! { <p class="err">{err_text(&e)}</p> }.into_any(),
                 Ok(_) => view! {
                     <table class="tagtable">
                         <thead><tr>
@@ -5658,7 +5985,7 @@ fn CollectionPage() -> impl IntoView {
 
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
             {move || words.get().map(|res| match res {
-                Err(e) => view! { <p class="err">{format!("Error: {e}")}</p> }.into_any(),
+                Err(e) => view! { <p class="err">{format!("Error: {}", err_text(&e))}</p> }.into_any(),
                 Ok(mut list) => {
                     if list.is_empty() {
                         return view! { <p class="sub">"no tagged words here yet — favourite (★) or tag words on the words page."</p> }.into_any();

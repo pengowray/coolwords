@@ -6,6 +6,7 @@
 pub mod app;
 pub mod booktags;
 pub mod catalog;
+pub mod excluded;
 #[cfg(feature = "ssr")]
 pub mod jobs;
 

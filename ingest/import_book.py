@@ -12,6 +12,10 @@ UI, ui/src/app.rs):
       histogram, then run the per-book analysis pipeline (score, cluster,
       trajectory). Refuses if a *different* book already has this content hash.
 
+  python -m ingest.import_book --examples <slug> --words dog,dogs [--limit 20]
+      Every sentence in a committed book containing one of those surface forms.
+      Backs the word-detail sheet's "more examples" list.
+
 Keeping all extraction/segmentation/ingest here (not in Rust) means the import
 preview, the commit, and any future "view source" page share one code path.
 """
@@ -403,6 +407,73 @@ def do_reingest(slug: str, text_source: str, run_pipeline: bool = True) -> dict:
             "n_tokens": n_tokens, "n_types": n_types, "candidates": n_cand, "pipeline": steps}
 
 
+def _source_file(slug: str) -> Path:
+    """The committed source file, falling back to the repo's `data/books` (where
+    CLI-imported books from before the web importer still live)."""
+    try:
+        return book_file(slug)
+    except ExtractError:
+        for ext in (".txt", ".epub", ".pdf"):
+            p = PROJECT_ROOT / "data" / "books" / f"{slug}{ext}"
+            if p.exists():
+                return p
+        raise
+
+
+_MAX_EXAMPLES = 40
+
+
+def do_examples(slug: str, words: str, limit: int) -> dict:
+    """Every sentence in a book containing any of `words` (comma-separated surface
+    forms), up to `limit`. `book_occurrences.example` only stores the FIRST one per
+    token; the word-detail sheet calls this to show the rest on demand.
+
+    Re-extracts from the stored file using the same text source the book was
+    ingested from, so the sentences match the text that was actually analysed."""
+    forms = [w.strip().lower() for w in words.split(",") if w.strip()]
+    if not forms:
+        raise ExtractError("no words given", code="NO_WORDS")
+    limit = max(1, min(limit or 20, _MAX_EXAMPLES))
+    path = _source_file(slug)
+
+    con = connect()
+    row = con.execute("SELECT text_source FROM books WHERE slug = ?", (slug,)).fetchone()
+    con.close()
+    text_source = (row[0] if row else None) or "embedded"
+
+    # Mirror do_reingest: an OCR-ingested PDF re-reads its OCR cache (never re-OCRs).
+    # A missing/short cache just falls back to the embedded layer — an example
+    # sentence isn't worth failing the whole panel over.
+    pdf_ocr = None
+    if text_source.startswith("ocr"):
+        try:
+            eng = ocr.require_engine(text_source.split(":", 1)[1] if ":" in text_source else None)
+            cache = ocr.load_cache(path, eng)
+            if cache["pages"]:
+                pdf_ocr = {int(k): v for k, v in cache["pages"].items()}
+        except (ExtractError, OcrError):
+            pdf_ocr = None
+
+    ex = extract(path, pdf_ocr=pdf_ocr)
+    flat = re.sub(r"\s+", " ", ex.kept_text).replace("’", "'")
+    wanted = set(forms)
+    out: list[dict] = []
+    total = 0
+    for sentence in book._SENT_SPLIT.split(flat):
+        low = sentence.lower()
+        # Tokenize exactly as the histogram did, so "found" here means the same
+        # thing as the in-book count shown next to the word.
+        hits = wanted & set(book.TOKEN_RE.findall(low))
+        if not hits:
+            continue
+        total += 1
+        if len(out) < limit:
+            form = min(hits, key=low.find)
+            s = sentence.strip()
+            out.append({"form": form, "text": book.window_around(s, form, 400)})
+    return {"ok": True, "slug": slug, "forms": forms, "examples": out, "total": total}
+
+
 def do_rescore(slug: str) -> dict:
     """Re-run score + cluster for an already-imported book (no re-extraction).
 
@@ -459,6 +530,10 @@ def main() -> None:
                    help="re-run score + cluster for an already-imported book (background job)")
     g.add_argument("--refresh-trajectory", action="store_true", dest="refresh_trajectory",
                    help="re-run the global usage-over-time pass (background job)")
+    g.add_argument("--examples", metavar="SLUG",
+                   help="sentences in a committed book containing any of --words")
+    ap.add_argument("--words", default="", help="--examples: comma-separated surface forms")
+    ap.add_argument("--limit", type=int, default=20, help="--examples: max sentences returned")
     ap.add_argument("--slug", default="")
     ap.add_argument("--title", default="")
     ap.add_argument("--author", default="")
@@ -492,6 +567,8 @@ def main() -> None:
             result = do_rescore(args.rescore)
         elif args.refresh_trajectory:
             result = do_refresh_trajectory()
+        elif args.examples:
+            result = do_examples(args.examples, args.words, args.limit)
         else:
             if not args.slug:
                 raise SystemExit("--commit requires --slug")
