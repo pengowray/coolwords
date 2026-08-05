@@ -7,11 +7,24 @@
 #[tokio::main]
 async fn main() {
     use axum::extract::DefaultBodyLimit;
+    use axum::routing::get;
     use axum::Router;
     use leptos::logging::log;
     use leptos::prelude::*;
     use leptos_axum::{generate_route_list, LeptosRoutes};
     use coolwords_ui::app::*;
+    use coolwords_ui::buildinfo;
+
+    // First line in the log, before anything can fail: which build this is and when it
+    // started. Home Assistant's add-on log carries neither a date nor a version, so
+    // without this a log full of restarts can't tell you whether the build you just
+    // rebuilt is the one answering.
+    log!(
+        "[coolwords] {} (built {}) starting at {}",
+        buildinfo::VERSION,
+        buildinfo::built_at(),
+        buildinfo::started_at(),
+    );
 
     let conf = get_configuration(None).unwrap();
     let mut leptos_options = conf.leptos_options;
@@ -27,6 +40,10 @@ async fn main() {
     let routes = generate_route_list(App);
 
     let app = Router::new()
+        // Plain-text build identification, outside the Leptos routes so it answers even
+        // if the app itself is unhappy. Works through ingress and the tunnel alike:
+        // fetch it to see which build (and how long-lived a process) replied.
+        .route("/version", get(|| async { buildinfo::report() }))
         .leptos_routes(&leptos_options, routes, {
             let leptos_options = leptos_options.clone();
             move || shell(leptos_options.clone())

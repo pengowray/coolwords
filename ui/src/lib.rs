@@ -5,6 +5,8 @@
 
 pub mod app;
 pub mod booktags;
+#[cfg(feature = "ssr")]
+pub mod buildinfo;
 pub mod catalog;
 pub mod excluded;
 #[cfg(feature = "ssr")]

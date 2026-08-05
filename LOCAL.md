@@ -105,6 +105,20 @@ install is still registered and editing files won't switch it to local-build. Re
 Bumping `version:` in the root `config.yaml` isn't required for local rebuilds, but if
 you do bump it HA will surface a normal **Update** button too.
 
+### Did the rebuild take?
+HA's add-on log shows neither dates nor versions, so a log full of restarts can't tell
+you which build is answering. Two places now say:
+
+- the **first line of the log** on every start:
+  `[coolwords] 0.1.0 (built 2026-08-05T01:23:45Z) starting at 2026-08-05T01:24:02Z`
+- **`/version`** on the running server — open it from the sidebar panel URL (append
+  `/version`) or through the tunnel at `https://words.ffff.network/version`. It answers
+  in plain text with the version, build time, start time, and the current time, so it
+  also tells you how long the process has been up.
+
+If "built" is older than your rebuild, the Supervisor served a cached image: rebuild
+again, or bump `version:` in `config.yaml` first.
+
 ---
 
 ## Access (private by default) + exposing it
