@@ -48,10 +48,16 @@ paths resolve normally — nothing to configure app-side.
    ```yaml
    additional_hosts:
      - hostname: words.ffff.network
-       service: http://addon_local_coolwords:7575
+       service: http://local-coolwords:7575
    ```
-   `addon_local_coolwords` is this local add-on's internal hostname — confirm it on the
-   Coolwords add-on's info page under **Hostname**.
+   `local-coolwords` is this add-on's hostname on the internal network — dashes, and no
+   `addon_` prefix. The container is *named* `addon_local_coolwords`, but that name does
+   not resolve: the Supervisor points every add-on at the HA DNS server, which knows
+   add-ons by hostname only. Using the container name gets you a **502** from the tunnel.
+   Confirm the value on the Coolwords add-on's info page under **Hostname**, or on the box:
+   ```bash
+   ha addons info local_coolwords | grep -i hostname
+   ```
 4. Ensure a **proxied `words` CNAME** exists in Cloudflare DNS (the add-on usually
    creates it; otherwise add it manually pointing at your tunnel).
 
