@@ -437,9 +437,9 @@ def do_examples(slug: str, words: str, limit: int) -> dict:
     `book_occurrences.example` stores only the first example sentence for each word
     form, and the word detail sheet calls this function to show the others.
 
-    The text is extracted again from the stored file, from the same text source
-    (embedded text or an OCR cache) that the book was imported from, so the
-    sentences match the text that was word-counted."""
+    The text is extracted again from the stored file, using the book's current text
+    source (books.text_source: embedded text or an OCR cache, set at import and
+    changed by do_reingest), so the sentences match the text that was word-counted."""
     forms = [w.strip().lower() for w in words.split(",") if w.strip()]
     if not forms:
         raise ExtractError("no words given", code="NO_WORDS")
@@ -451,7 +451,7 @@ def do_examples(slug: str, words: str, limit: int) -> dict:
     con.close()
     text_source = (row[0] if row else None) or "embedded"
 
-    # For a PDF imported from OCR text, read the saved OCR cache, as do_reingest does.
+    # When the book's text source is OCR, read the saved OCR cache, as do_reingest does.
     # OCR is never run here. If the OCR engine is not available or its cache is empty,
     # use the PDF's embedded text layer, so the word detail sheet still gets example
     # sentences.
