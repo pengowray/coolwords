@@ -157,7 +157,7 @@ def _extract_txt(path: Path) -> Extraction:
 
     body_end = end.start() if end else len(text)
     body = text[body_start:body_end]
-    segs.extend(_subsegment_body(body))
+    segs.extend(_subsegment_body(body, end_marker_found=end is not None))
 
     if end:
         segs.append(Segment("gutenberg-licence", False, text[end.start():],
@@ -206,22 +206,28 @@ _TOC_ENTRY = re.compile(
 _TOC_WINDOW = 30000   # only look for a CONTENTS heading in the first ~30k chars of the body
 _TRANSCRIBER = re.compile(r"\n[ \t]*\r?\n[ \t]*(?:\*\s*)?Transcriber'?s?\s+Notes?\b", re.I)
 
-# The PG legal FOOTER, as a SAFETY NET for when the `*** END OF … ***` marker is
-# absent or malformed (older etexts, hand-edited files): otherwise the whole licence
-# leaks into the body. These are TAIL signatures — a genuine end-of-book licence runs
-# to the end of the file, so we cut from the match to the end. Each phrase appears
-# ONLY in the legal block, never in real prose. (A head-of-file preamble like the
-# "Small Print!" block is NOT here — see _SMALL_PRINT — and the cut is guarded below
-# so a match with no real body before it can never zero out the histogram.)
-_PG_LICENSE_START = re.compile(
+# Headings of the Project Gutenberg licence. They are searched for only when the
+# `*** END OF ... ***` marker is missing or malformed, because the licence is then
+# still in the body. Each phrase appears only in the licence. The licence runs to
+# the end of the file, so everything from the match to the end is removed.
+_PG_LICENCE_HEADING = re.compile(
     r"\*\*\*\s*START:?\s*FULL\s+LICEN[SC]E"                     # modern licence-block marker
     r"|THE\s+FULL\s+PROJECT\s+GUTENBERG\s+LICEN[SC]E"           # licence heading
-    # first licence section — require the PG-specific tail so a law book's own
-    # "Section 1. General Terms of Use" heading can't trip it.
-    r"|Section\s+1\.\s+General\s+Terms\s+of\s+Use\s+and\s+Redistributing\s+Project\s+Gutenberg"
-    # old end line (no ***). Accept a straight OR typographic apostrophe in "Gutenberg's".
-    r"|\bEnd\s+of\s+(?:the\s+)?Project\s+Gutenberg(['’]?s\b|\s+E(?:Book|text)\b)",
+    # First licence section heading. Require the words after "General Terms of Use"
+    # that name Project Gutenberg, so a law book with its own "Section 1. General
+    # Terms of Use" heading does not match.
+    r"|Section\s+1\.\s+General\s+Terms\s+of\s+Use\s+and\s+Redistributing\s+Project\s+Gutenberg",
     re.I)
+# The closing line of an older PG text, with no ***: "End of Project Gutenberg's
+# <title>" or "End of the Project Gutenberg EBook of <title>". Accept a straight or
+# typographic apostrophe in "Gutenberg's".
+_PG_END_LINE = re.compile(
+    r"\bEnd\s+of\s+(?:the\s+)?Project\s+Gutenberg(['’]?s\b|\s+E(?:Book|text)\b)", re.I)
+# A collection of works, such as PG #3200 (the works of Mark Twain), has one of these
+# closing lines after each work. A closing line starts the licence footer only when
+# it is less than this many characters before the licence heading, or before the
+# end of the body when there is no heading.
+_END_LINE_WINDOW = 10_000
 
 # The pre-2005 "Small Print!" legal block is a HEAD-of-file preamble, and BOUNDED: a
 # start line naming "SMALL PRINT" through the matching "END … SMALL PRINT" line. It's
@@ -231,9 +237,12 @@ _SMALL_PRINT = re.compile(
     re.I | re.S)
 
 
-def _subsegment_body(body: str) -> list[Segment]:
+def _subsegment_body(body: str, end_marker_found: bool = False) -> list[Segment]:
     """Split a Gutenberg body into kept prose + stripped credits/TOC/transcriber spans.
-    Concatenating the returned segment texts reproduces `body` exactly."""
+    Concatenating the returned segment texts reproduces `body` exactly.
+
+    `end_marker_found` is True when `body` ends at the `*** END OF ... ***` marker.
+    The licence is then outside `body`, so the licence headings are not searched for."""
     out: list[Segment] = []
     rest = body
 
@@ -260,34 +269,37 @@ def _subsegment_body(body: str) -> list[Segment]:
         out.append(Segment("toc", False, rest[ts:te], "table of contents"))
         rest = rest[te:]
 
-    # Tail boilerplate: a transcriber's note and/or the PG legal footer. Cut from the
-    # EARLIEST such marker to the end. The licence net matters most when the `*** END
-    # OF … ***` marker never fired (so `body` still holds the whole legal block).
+    # Tail boilerplate: a transcriber's note and/or the PG licence footer. Everything
+    # from the earlier of the two to the end of the body is removed.
     tn = _TRANSCRIBER.search(rest)
-    lic = _PG_LICENSE_START.search(rest)
-    # GUARD: only treat the licence as a tail footer when real body precedes it, so a
-    # licence-like phrase near the start can never cut the whole book to nothing
-    # (the module errs toward under-stripping, never eating real text).
-    if lic and not rest[: lic.start()].strip():
+    lic = _licence_start(rest, find_heading=not end_marker_found)
+    # Remove the licence only when there is text before it, so a licence phrase at the
+    # start of the body never removes the whole book.
+    if lic is not None and not rest[:lic].strip():
         lic = None
-    if tn and lic:
-        first, is_lic = (lic, True) if lic.start() < tn.start() else (tn, False)
-    elif lic:
-        first, is_lic = lic, True
-    elif tn:
-        first, is_lic = tn, False
-    else:
-        first, is_lic = None, False
-    if first:
-        out.append(Segment("body", True, rest[: first.start()]))
-        if is_lic:
-            out.append(Segment("gutenberg-licence", False, rest[first.start():],
-                               "Project Gutenberg licence / legal footer"))
-        else:
-            out.append(Segment("transcriber-note", False, rest[first.start():], "transcriber's note"))
+    if tn and (lic is None or tn.start() < lic):
+        out.append(Segment("body", True, rest[: tn.start()]))
+        out.append(Segment("transcriber-note", False, rest[tn.start():], "transcriber's note"))
+    elif lic is not None:
+        out.append(Segment("body", True, rest[:lic]))
+        out.append(Segment("gutenberg-licence", False, rest[lic:],
+                           "Project Gutenberg licence / legal footer"))
     else:
         out.append(Segment("body", True, rest))
     return out
+
+
+def _licence_start(text: str, find_heading: bool) -> int | None:
+    """Offset in `text` where the Project Gutenberg licence footer starts, or None.
+
+    With `find_heading`, the footer starts at the first licence heading. A PG closing
+    line less than _END_LINE_WINDOW characters before that heading, or before the end
+    of `text` when no heading is found, moves the start back to the closing line."""
+    heading = _PG_LICENCE_HEADING.search(text) if find_heading else None
+    limit = heading.start() if heading else len(text)
+    if end_line := _PG_END_LINE.search(text, max(0, limit - _END_LINE_WINDOW), limit):
+        return end_line.start()
+    return heading.start() if heading else None
 
 
 def _find_toc(rest: str) -> tuple[int, int] | None:
