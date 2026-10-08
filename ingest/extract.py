@@ -246,7 +246,8 @@ def _subsegment_body(body: str, end_marker_found: bool = False) -> list[Segment]
     Concatenating the returned segment texts reproduces `body` exactly.
 
     `end_marker_found` is True when `body` ends at the `*** END OF ... ***` marker.
-    The licence is then outside `body`, so the licence headings are not searched for."""
+    The licence is then outside `body`, so the licence headings are not searched for,
+    but a PG closing line near the end of `body` is still removed (see _licence_start)."""
     out: list[Segment] = []
     rest = body
 
