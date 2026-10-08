@@ -227,9 +227,9 @@ _PG_LICENCE_HEADING = re.compile(
 _PG_END_LINE = re.compile(
     r"\bEnd\s+of\s+(?:the\s+)?Project\s+Gutenberg(['’]?s\b|\s+E(?:Book|text)\b)", re.I)
 # A collection of works, such as PG #3200 (the works of Mark Twain), has a closing
-# line after each work. A closing line starts the licence footer only when
-# it is less than this many characters before the licence heading, or before the
-# end of the body when there is no heading.
+# line after each work. The licence footer starts at the last closing line that is
+# less than this many characters before the licence heading, or before the end of
+# the body when there is no heading.
 _END_LINE_WINDOW = 10_000
 
 # The "Small Print!" licence block in pre-2005 etexts. It runs from a start line that
@@ -307,14 +307,15 @@ def _subsegment_body(body: str, end_marker_found: bool = False) -> list[Segment]
 def _licence_start(text: str, find_heading: bool) -> int | None:
     """Offset in `text` where the Project Gutenberg licence footer starts, or None.
 
-    With `find_heading`, the footer starts at the first licence heading. When a PG
-    closing line is less than _END_LINE_WINDOW characters before that heading, or
-    before the end of `text` when no heading is found, the footer starts at the
-    closing line instead."""
+    With `find_heading`, the footer starts at the first licence heading. When one or
+    more PG closing lines are less than _END_LINE_WINDOW characters before that
+    licence heading, or before the end of `text` when no heading is found, the footer
+    starts at the last of those closing lines instead."""
     heading = _PG_LICENCE_HEADING.search(text) if find_heading else None
     limit = heading.start() if heading else len(text)
-    if end_line := _PG_END_LINE.search(text, max(0, limit - _END_LINE_WINDOW), limit):
-        return end_line.start()
+    end_lines = list(_PG_END_LINE.finditer(text, max(0, limit - _END_LINE_WINDOW), limit))
+    if end_lines:
+        return end_lines[-1].start()
     return heading.start() if heading else None
 
 
