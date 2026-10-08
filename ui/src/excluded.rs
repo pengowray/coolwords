@@ -217,8 +217,8 @@ pub async fn exclusion_report(book_id: i64, level: i64) -> Result<ExcludeReport,
 }
 
 /// The excluded words, at most `WORD_LIMIT` of them. When `reason` is empty, the
-/// list has the words for every reason. `sort` is "rare" (default) for the lowest general-English
-/// frequency first, or "count" for the most uses in this book first.
+/// list has the words for every reason. `sort` is "rare" (default) for the lowest
+/// general-English frequency first, or "count" for the most uses in this book first.
 #[server]
 pub async fn excluded_words(
     book_id: i64,
