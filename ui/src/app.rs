@@ -1771,6 +1771,9 @@ pub async fn word_detail(book_id: i64, word_id: i64, level: i64) -> Result<WordI
     // in_book is the merged group's count, the same number as the word list's "N×":
     // the candidate row's count, or for a word that is not a candidate at this level,
     // the sum over the word and every in-book form that merges into it.
+    // example is the word's own example sentence or, when the word has none in this
+    // book, the sentence for its most frequent merged form. CROSS JOIN makes SQLite
+    // read word_lemma first, so both lookups use an index.
     let (word, gloss, origin_code, origin_name, freq_pm, syllables, stem, in_book, example, book_year):
         (String, Option<String>, Option<String>, Option<String>, Option<f64>, Option<i64>,
          Option<String>, i64, Option<String>, Option<i64>) = conn
@@ -1786,7 +1789,13 @@ pub async fn word_detail(book_id: i64, word_id: i64, level: i64) -> Result<WordI
                                          WHERE wl.word_id = g.word_id AND wl.level = ?3
                                            AND wl.lemma_id = ?2))),
                         0),
-                    bo.example, (SELECT year FROM books WHERE id = ?1)
+                    COALESCE(bo.example,
+                        (SELECT g.example FROM word_lemma wl
+                           CROSS JOIN book_occurrences g
+                             ON g.word_id = wl.word_id AND g.book_id = ?1
+                          WHERE wl.level = ?3 AND wl.lemma_id = ?2 AND g.example IS NOT NULL
+                          ORDER BY g.count DESC LIMIT 1)),
+                    (SELECT year FROM books WHERE id = ?1)
              FROM words w
              LEFT JOIN lang_names ln ON ln.code = w.etymology_lang
              LEFT JOIN book_occurrences bo ON bo.word_id = w.id AND bo.book_id = ?1
@@ -5368,9 +5377,10 @@ fn HomePage() -> impl IntoView {
                                     <li>{format!("syllables: {}", d.syllables.map(|n| n.to_string()).unwrap_or_default())}</li>
                                     <li>{format!("origin: {origin}")}</li>
                                 </ul>
-                                // The tag picker above already shows one example sentence.
-                                // The "more examples" button appears only when the word and
-                                // its merged forms occur more than once in the book.
+                                // The tag picker above shows one example sentence that uses
+                                // the word or one of its merged forms. The "more examples"
+                                // button appears only when the word and its merged forms
+                                // occur more than once in the book.
                                 {(d.in_book > 1).then(|| view! {
                                     <WordExamples book_id=b word_id=wid level=level.get()/>
                                 })}
