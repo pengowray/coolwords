@@ -1,48 +1,16 @@
 """Filesystem locations for datasets and build artifacts.
 
-Edit DATASETS if the downloaded datasets move. Everything else is derived.
-
 A repo-root `.env` (gitignored) can override a few user-specific paths without
 touching code; see `load_dotenv` / `env` below. Today's knobs are
-`COOLWORDS_BOOKS_DIR` (where the import UI copies dropped books) and
-`COOLWORDS_GUTENBERG_MIRROR` (which mirror ingest/catalog.py downloads from).
+`COOLWORDS_DATASETS` (the downloaded reference datasets; every dataset path below
+is derived from it), `COOLWORDS_BOOKS_DIR` (where the import UI copies dropped
+books) and `COOLWORDS_GUTENBERG_MIRROR` (which mirror ingest/catalog.py downloads
+from).
 """
 import os
 from pathlib import Path
 
-# Root of the downloaded reference datasets.
-DATASETS = Path(r"P:\datasets-downloaded")
-
-CMUDICT = DATASETS / "datasets-CMU-dict-sphinx" / "cmusphinx" / "cmudict-0.7b"
-
-NGRAM_DIR = DATASETS / "datasets-ngrams-1grams"
-# The "top 1 million words" English corpus (2009): glob of zipped TSV shards.
-NGRAM_1M_GLOB = "googlebooks-eng-1M-1gram-20090715-*.csv.zip"
-NGRAM_1M_TOTALCOUNTS = NGRAM_DIR / "googlebooks-eng-1M-totalcounts-20090715.txt"
-
-WORDLE_DIR = DATASETS / "datasets-wordle"
-
-WORDNET_SQLITE = DATASETS / "datasets-wordnet" / "sqlite-5.2.0-31-all" / "Sqlunet.db"
-
-_WIKT = DATASETS / "datasets-wikt-wiktextract" / "2023-11-01"
-WIKTEXTRACT = _WIKT / "raw-wiktextract-data.json.gz"
-WIKTEXTRACT_SAMPLE = _WIKT / "raw-wiktextract-data-1000lines-sample.json"
-
-WORDVEC_DIR = DATASETS / "datasets-wordvec"
-FASTTEXT_VEC_ZIP = WORDVEC_DIR / "crawl-300d-2M.vec.zip"
-GOOGLENEWS_BIN_GZ = WORDVEC_DIR / "GoogleNews-vectors-negative300.bin.gz"
-
-# Build artifacts (relative to the project root). The two DB paths honour the same
-# env overrides the Rust UI reads (COOLWORDS_DB / COOLWORDS_USER_DB), so a packaged
-# deploy (e.g. the Home Assistant add-on) can point both sides at /share without a
-# repo-rooted data dir. The embedding sidecar is resolved as DB_PATH.parent/…npy by
-# its consumers, so it rides along with whatever COOLWORDS_DB points at.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = Path(os.environ.get("COOLWORDS_DB") or PROJECT_ROOT / "data" / "coolwords.db")
-# Per-user data (tags + tag collection), separate & self-contained.
-USER_DB_PATH = Path(os.environ.get("COOLWORDS_USER_DB") or PROJECT_ROOT / "data" / "user.db")
-SCHEMA_PATH = PROJECT_ROOT / "schema" / "dictionary.sql"
-
 ENV_PATH = PROJECT_ROOT / ".env"
 
 
@@ -76,6 +44,40 @@ def env(name: str, default: str = "") -> str:
         return os.environ[name]
     return load_dotenv().get(name, default)
 
+
+# Root of the downloaded reference datasets. Set COOLWORDS_DATASETS (real env var
+# or repo `.env`) to where they live on this machine.
+_DEFAULT_DATASETS = r"P:\datasets-downloaded" if os.name == "nt" else str(Path.home() / "datasets-downloaded")
+DATASETS = Path(env("COOLWORDS_DATASETS", _DEFAULT_DATASETS))
+
+CMUDICT = DATASETS / "datasets-CMU-dict-sphinx" / "cmusphinx" / "cmudict-0.7b"
+
+NGRAM_DIR = DATASETS / "datasets-ngrams-1grams"
+# The "top 1 million words" English corpus (2009): glob of zipped TSV shards.
+NGRAM_1M_GLOB = "googlebooks-eng-1M-1gram-20090715-*.csv.zip"
+NGRAM_1M_TOTALCOUNTS = NGRAM_DIR / "googlebooks-eng-1M-totalcounts-20090715.txt"
+
+WORDLE_DIR = DATASETS / "datasets-wordle"
+
+WORDNET_SQLITE = DATASETS / "datasets-wordnet" / "sqlite-5.2.0-31-all" / "Sqlunet.db"
+
+_WIKT = DATASETS / "datasets-wikt-wiktextract" / "2023-11-01"
+WIKTEXTRACT = _WIKT / "raw-wiktextract-data.json.gz"
+WIKTEXTRACT_SAMPLE = _WIKT / "raw-wiktextract-data-1000lines-sample.json"
+
+WORDVEC_DIR = DATASETS / "datasets-wordvec"
+FASTTEXT_VEC_ZIP = WORDVEC_DIR / "crawl-300d-2M.vec.zip"
+GOOGLENEWS_BIN_GZ = WORDVEC_DIR / "GoogleNews-vectors-negative300.bin.gz"
+
+# Build artifacts (relative to the project root). The two DB paths honour the same
+# env overrides the Rust UI reads (COOLWORDS_DB / COOLWORDS_USER_DB), so a packaged
+# deploy (e.g. the Home Assistant add-on) can point both sides at /share without a
+# repo-rooted data dir. The embedding sidecar is resolved as DB_PATH.parent/…npy by
+# its consumers, so it rides along with whatever COOLWORDS_DB points at.
+DB_PATH = Path(os.environ.get("COOLWORDS_DB") or PROJECT_ROOT / "data" / "coolwords.db")
+# Per-user data (tags + tag collection), separate & self-contained.
+USER_DB_PATH = Path(os.environ.get("COOLWORDS_USER_DB") or PROJECT_ROOT / "data" / "user.db")
+SCHEMA_PATH = PROJECT_ROOT / "schema" / "dictionary.sql"
 
 # Where the import UI copies dropped books. Override via COOLWORDS_BOOKS_DIR
 # (real env var or repo `.env`); defaults to a location outside the repo so the
