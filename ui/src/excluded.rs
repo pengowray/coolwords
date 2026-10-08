@@ -403,7 +403,7 @@ pub fn ExcludedPanel(
                                     <th>"word"</th>
                                     <th class="num" title="times this spelling appears in this book">"uses in this book"</th>
                                     <th class="num" title="lowercase uses per million words of general English, with merged forms added together">
-                                        "uses per million (general English)"</th>
+                                        "uses per million"<br/>"(general English)"</th>
                                     <th>"reason"</th>
                                 </tr></thead>
                                 <tbody>
