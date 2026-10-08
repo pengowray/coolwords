@@ -230,9 +230,10 @@ _PG_END_LINE = re.compile(
 # end of the body when there is no heading.
 _END_LINE_WINDOW = 10_000
 
-# The pre-2005 "Small Print!" legal block is a HEAD-of-file preamble, and BOUNDED: a
-# start line naming "SMALL PRINT" through the matching "END … SMALL PRINT" line. It's
-# stripped IN PLACE (not cut-to-end) so it can never swallow the book body after it.
+# The "Small Print!" licence block in pre-2005 etexts. It runs from a start line that
+# names "SMALL PRINT" to the matching "END ... SMALL PRINT" line, and it can be at the
+# top or the bottom of the file. Only the lines of the block are removed, so the book
+# text on either side of it is kept.
 _SMALL_PRINT = re.compile(
     r"\*[^\n]*\bSMALL\s+PRINT\b.*?\bEND\b[^\n]*\bSMALL\s+PRINT\b[^\n]*",
     re.I | re.S)
@@ -251,16 +252,23 @@ def _subsegment_body(body: str, end_marker_found: bool = False) -> list[Segment]
         out.append(Segment("credits", False, rest[: m.end()], "transcription credit"))
         rest = rest[m.end():]
 
-    # A "Small Print!" legal block (very old etexts) sits at the head, before the text.
-    # Strip it as a BOUNDED region so the book body that follows is never eaten. Any
-    # real title/text before it is kept (under-strip).
+    # A "Small Print!" licence block (very old etexts). When less text comes before the
+    # block than after it, the block is at the top of the file and the book is the text
+    # after it. Otherwise the book is the text before it. The TOC and tail scans below
+    # run on the book only.
+    after: list[Segment] = []
     if sp := _SMALL_PRINT.search(rest):
-        # keep whatever precedes exactly (empty prefixes are dropped by Extraction);
-        # this preserves the "segments concatenate back to `body`" contract.
-        out.append(Segment("body", True, rest[: sp.start()]))
-        out.append(Segment("gutenberg-licence", False, rest[sp.start(): sp.end()],
-                           "Project Gutenberg 'Small Print!' legal block"))
-        rest = rest[sp.end():]
+        block = Segment("gutenberg-licence", False, rest[sp.start(): sp.end()],
+                        "Project Gutenberg 'Small Print!' legal block")
+        # Keep the text on the other side of the block exactly as it is, even if it is
+        # not part of the book (_extract_txt drops it if it is blank), so the segments
+        # still join back into `body`.
+        if sp.start() < len(rest) - sp.end():
+            out += [Segment("body", True, rest[: sp.start()]), block]
+            rest = rest[sp.end():]
+        else:
+            after = [block, Segment("body", True, rest[sp.end():])]
+            rest = rest[: sp.start()]
 
     toc = _find_toc(rest)
     if toc:
@@ -290,7 +298,7 @@ def _subsegment_body(body: str, end_marker_found: bool = False) -> list[Segment]
                            "Project Gutenberg licence / legal footer"))
     else:
         out.append(Segment("body", True, rest))
-    return out
+    return out + after
 
 
 def _licence_start(text: str, find_heading: bool) -> int | None:
