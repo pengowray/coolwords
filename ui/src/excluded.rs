@@ -32,10 +32,10 @@
 //! | `score_group`: `freq_comb > MAX_FREQ_PM_LC` | `common`      |
 //!
 //! `score_group` checks `not alpha`, `not inwikt`, `formof`, `proper` and
-//! `offensive` in a single `or`, so the scorer gives those tests no order. The
-//! order of `nowikt`, `formof`, `proper` and `offensive` in the `CASE` is this
-//! module's choice: a word that fails more than one of them gets the reason that
-//! comes first in the table.
+//! `offensive` in a single `or` and returns `None` without recording which of
+//! those tests excluded the word. The order of `nowikt`, `formof`, `proper` and
+//! `offensive` in the `CASE` is this module's choice: a word that fails more than
+//! one of them gets the reason that comes first in the table.
 //!
 //! `nodict` and `nonalpha` test the word as it appears in the book. Every later test
 //! reads the word that the book's word is merged into at the current merge level,
@@ -216,8 +216,8 @@ pub async fn exclusion_report(book_id: i64, level: i64) -> Result<ExcludeReport,
     })
 }
 
-/// The excluded words, at most `WORD_LIMIT` of them. An empty `reason` lists the
-/// words for every reason. `sort` is "rare" (default) for the lowest general-English
+/// The excluded words, at most `WORD_LIMIT` of them. When `reason` is empty, the
+/// list has the words for every reason. `sort` is "rare" (default) for the lowest general-English
 /// frequency first, or "count" for the most uses in this book first.
 #[server]
 pub async fn excluded_words(
@@ -235,7 +235,8 @@ pub async fn excluded_words(
         "count" => format!("n DESC, {UNMEASURED_LAST} ASC, pm ASC"),
         _ => format!("{UNMEASURED_LAST} ASC, pm ASC, n DESC"),
     };
-    // A `reason` that is not a reason key lists the words for every reason.
+    // When `reason` is not one of the reason keys, the query lists the words for
+    // every reason.
     let want = if reasons().iter().any(|(k, _, _)| *k == reason) { reason } else { String::new() };
     let sql = format!(
         "SELECT word, head, word_id, n, pm, gloss, why FROM ({})
@@ -373,8 +374,9 @@ pub fn ExcludedPanel(
                         <option value="rare">"rarest first"</option>
                         <option value="count">"most used in this book"</option>
                     </select>
-                    // Shown only when the selected reason has more words than the
-                    // list returns.
+                    // A note that the table lists only the first WORD_LIMIT words.
+                    // The note appears only when the selected reason (or all reasons
+                    // together) excludes more than WORD_LIMIT words.
                     <Suspense fallback=|| ()>
                         {move || {
                             let rep = report.get()?.ok().flatten()?;
