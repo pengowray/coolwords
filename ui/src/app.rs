@@ -1659,8 +1659,9 @@ pub async fn get_candidates(
     };
 
     // Number of candidates that match, before the limit. Without an era or obsolete
-    // filter, it is the page length or, when the page is full, a count query with the
-    // same WHERE. With one, it is the number of candidates left after classification.
+    // filter, it is the page length or, when the page is full, the result of a count
+    // query with the same WHERE. With one, it is the number of candidates left after
+    // classification.
     let mut total = out.len() as i64;
 
     if needs_traj {
@@ -5280,11 +5281,11 @@ fn HomePage() -> impl IntoView {
                         let text = if !by_pos {
                             list.iter().map(line).collect::<Vec<_>>().join(joiner)
                         } else {
-                            // Headings only survive in the newline flavour, as `# nouns`
-                            // comment lines — a heading dropped into a space- or
-                            // comma-separated run would read as just another word, which
-                            // is worse than losing the labels. The ORDER is the same
-                            // either way, so the grouping still comes through.
+                            // In the by-part-of-speech view each section starts with a
+                            // heading line such as `# nouns`, but only when the separator
+                            // is newline: in space- or comma-separated text a heading
+                            // would look like another word. The word order is the same
+                            // with every separator.
                             let secs = pos_sections(list, |c| c.pos.clone(), chunk);
                             let mut parts: Vec<String> = Vec::new();
                             for (h, items) in secs {

@@ -36,8 +36,8 @@ CREATE TABLE IF NOT EXISTS tags (
 --   NULL = on: applied, with no rating level. A boolean tag that is on is always NULL.
 --   0    = considered and declined: remembered, but not applied.
 --   1..N = applied at that rating level.
--- No row = never considered. `COALESCE(value, 1) >= 1` means "applied": NULL and
--- every level count, 0 does not.
+-- No row = never considered. `COALESCE(value, 1) >= 1` means "applied": it is true
+-- for NULL and every level, and false for 0.
 CREATE TABLE IF NOT EXISTS word_tags (
     book_slug TEXT NOT NULL,             -- e.g. 'gutenberg-2701'
     word      TEXT NOT NULL,             -- lowercased headword
