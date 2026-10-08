@@ -89,13 +89,13 @@ impl TagDef {
 }
 
 // ---- tag application values ----
-// A tag on a word is one of: absent (never considered), 0 (considered & declined),
-// "on" (applied, no numeric level — the value-less true state), or a level 1..N.
-// In the DB `word_tags.value` is NULL for "on" (aligning with the historical
-// NULL==applied), 0 for considered, and >=1 for a rated level. The old default for a
-// tapped-on tag WAS value=1, but a one-time startup migration rewrote those to NULL,
-// so `1` is now an unambiguous, choosable level again (not "on").
-// The client store keeps the same states in an i32 with TAG_ON as the "on" sentinel.
+// A tag on a word is in one of four states. Columns: the state, how `word_tags`
+// stores it, and the i32 the client store keeps for it.
+//   never considered           no row          no entry
+//   considered and declined    value 0         0
+//   on (no rating level)       value NULL      TAG_ON
+//   rating level 1..N          value 1..N      1..N
+// N is the tag's top level (TagDef::max_level). Boolean tags have no levels.
 
 /// Client-store sentinel for the value-less "on" state (distinct from level 1..N and
 /// from the 0/considered state). Never written to the DB — "on" is NULL there.
@@ -114,11 +114,9 @@ pub fn tag_level(v: i32) -> Option<i32> {
     (v >= 1).then_some(v)
 }
 
-/// Map a raw DB `word_tags.value` to the client store's i32 encoding — the single
-/// source of truth for the read boundary (used by every server fn that hands tag
-/// values to the client). NULL becomes the value-less "on"; 0 stays considered; >=1
-/// stays a rated level (the legacy default-1 rows were migrated to NULL, so a 1 here
-/// is a deliberate level).
+/// Converts a `word_tags.value` from the DB to the client store's i32: NULL becomes
+/// TAG_ON, and 0 and every level stay as they are. Every server fn that sends tag
+/// values to the client converts them with this function.
 pub fn value_from_db(v: Option<i32>) -> i32 {
     match v {
         None => TAG_ON,
@@ -1048,10 +1046,8 @@ fn load_tags(
         .map_err(|e| ServerFnError::new(e.to_string()))?;
     let Some(slug) = slug else { return Ok(HashMap::new()) };
     // book-scoped tags for THIS book, plus word-scoped (global, book_slug='*') tags
-    // for any of the book's words. `value` is the tri-state rating (NULL==1==applied).
-    // Raw `value` (nullable), mapped to the client encoding by `value_from_db` — the
-    // one read boundary for tag values, so "on" (NULL/legacy-1) vs level vs considered
-    // is decided in exactly one place.
+    // for any of the book's words. `value_from_db` converts each raw `value` to the
+    // client store's i32.
     let mut stmt = conn
         .prepare(
             "SELECT w.id, t.tag, t.value FROM u.word_tags t JOIN words w ON w.word = t.word
@@ -1424,7 +1420,8 @@ pub async fn list_books() -> Result<Vec<Book>, ServerFnError> {
             // applied 'interesting'-class tag — book-scoped to this book, or word-scoped
             // (global) AND actually present in this book. A tag also satisfies an
             // interesting ANCESTOR (child implies parent: `t.tag LIKE g.name||'.%'`).
-            // COALESCE(value,1)>=1 excludes 0/considered (and legacy NULL == applied).
+            // COALESCE(value,1)>=1 counts NULL ("on") and every level, and excludes 0
+            // (considered and declined).
             "SELECT b.id, COALESCE(b.title, b.slug),
                     (SELECT count(DISTINCT t.word) FROM u.word_tags t
                        JOIN u.tags g ON (g.name = t.tag OR t.tag LIKE g.name || '.%')
@@ -2099,8 +2096,8 @@ pub async fn set_tag(book_id: i64, word_id: i64, tag: String, on: bool) -> Resul
     };
     if on {
         // Upsert value=NULL — the value-less "on" state (distinct from a scale level).
-        // Overwriting on conflict also lifts a previously-declined (value 0) or rated
-        // (value>=2) row back to plain "on"; a bare INSERT OR IGNORE would leave it.
+        // On conflict the upsert also sets a declined (value 0) or rated (value >= 1)
+        // row to plain "on", which a bare INSERT OR IGNORE would leave as it was.
         conn.execute(
             "INSERT INTO u.word_tags(book_slug, word, tag, rater, ts, value)
              VALUES (?1, ?2, ?3, 'me', datetime('now'), NULL)
@@ -4121,7 +4118,7 @@ fn TagPicker(
                                 }
                             }>
                             <span class="chiptext">{name.clone()}</span>
-                            // scale value badge: a rated level only (·2..·N). The
+                            // scale value badge: a rated level only (·1..·N). The
                             // value-less "on" state shows no number.
                             {is_scale.then(|| view! {
                                 <span class="chipval">{move || match tag_value(t, key, &lbl_name).and_then(tag_level) {
@@ -4326,7 +4323,7 @@ fn TagPicker(
                 <a class="managelink" href=format!("{}/tags", base_path())>"manage ↗"</a>
             </div>
             // One shared rating sheet, docked to the bottom of the screen so the
-            // buttons are big enough for fingers (⌫ off · ✗ considered · on · 2..N).
+            // buttons are big enough for fingers (⌫ off · ✗ considered · on · 1..N).
             // Driven by `pop` (the tapped scale tag). It shows the tag's caption too,
             // so no toast is needed; tapping a button or the backdrop closes it.
             {move || {

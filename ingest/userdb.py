@@ -32,7 +32,7 @@ def migrate_tag_columns(user: sqlite3.Connection) -> None:
                        ("fav", "INTEGER NOT NULL DEFAULT 0")):
         if name not in have:
             user.execute(f"ALTER TABLE tags ADD COLUMN {name} {decl}")
-    # word_tags.value: the tri-state rating (NULL==1==applied; 0==considered-declined).
+    # word_tags.value: NULL = on, 0 = considered and declined, 1 or more = a rating level.
     have_apps = {r[1] for r in user.execute("PRAGMA table_info(word_tags)")}
     if "value" not in have_apps:
         user.execute("ALTER TABLE word_tags ADD COLUMN value INTEGER")
