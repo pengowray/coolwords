@@ -15,10 +15,9 @@ async fn main() {
     use coolwords_ui::app::*;
     use coolwords_ui::buildinfo;
 
-    // First line in the log, before anything can fail: which build this is and when it
-    // started. Home Assistant's add-on log carries neither a date nor a version, so
-    // without this a log full of restarts can't tell you whether the build you just
-    // rebuilt is the one answering.
+    // Log one line with the version, build time and start time before anything else,
+    // so the line appears even if startup fails. Home Assistant's add-on log has no
+    // timestamps or version numbers, so this line shows which build is running.
     log!(
         "[coolwords] {} (built {}) starting at {}",
         buildinfo::VERSION,
@@ -40,9 +39,9 @@ async fn main() {
     let routes = generate_route_list(App);
 
     let app = Router::new()
-        // Plain-text build identification, outside the Leptos routes so it answers even
-        // if the app itself is unhappy. Works through ingress and the tunnel alike:
-        // fetch it to see which build (and how long-lived a process) replied.
+        // Returns the version, build time, start time and current time as plain text.
+        // The route is outside the Leptos routes, so it responds even when a page fails
+        // to render. It works through ingress and through the tunnel.
         .route("/version", get(|| async { buildinfo::report() }))
         .leptos_routes(&leptos_options, routes, {
             let leptos_options = leptos_options.clone();

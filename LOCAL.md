@@ -78,6 +78,8 @@ System → ⋮). Under **Local add-ons** you'll see **Coolwords (local build)** 
 A healthy start logs:
 ```
 [coolwords] starting on 0.0.0.0:7575 (db=/share/coolwords/coolwords.db)
+[coolwords] 0.1.0 (built 2026-08-05T01:23:45Z) starting at 2026-08-05T01:24:02Z
+listening on http://0.0.0.0:7575
 ```
 Open the **Web UI** link on the add-on page to confirm it loads on the LAN.
 
