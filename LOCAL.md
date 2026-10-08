@@ -141,7 +141,7 @@ no ports exposed. To also put it behind a Cloudflare tunnel + Access (Google log
 ## Notes
 - **Reference datasets** (CMUdict, ngrams, WordNet and so on) are needed only to
   build `coolwords.db`, which you do on your own machine, not on the HAOS box. The
-  ingest scripts read them from the folder set by `COOLWORDS_DATASETS` (an
+  ingest scripts read them from the folder set in `COOLWORDS_DATASETS` (an
   environment variable, or a line in the repo-root `.env`); see [README.md](README.md).
 - **OCR engine:** Tesseract only (RapidOCR omitted to keep the build small). Add
   `rapidocr-onnxruntime` to the `Dockerfile` pip line if you want it.

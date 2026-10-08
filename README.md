@@ -22,9 +22,9 @@ All of `data/` is reproducible from the scripts below and is gitignored.
 A book-independent reference DB of ~1.18M words and their properties, built from
 external datasets. Uses only the Python standard library.
 
-The scripts read the datasets from the folder named by `COOLWORDS_DATASETS`, set
+The scripts read the datasets from the folder set in `COOLWORDS_DATASETS`. Set it
 as an environment variable or as a line in a `.env` file at the repo root. If it
-is not set, they use `P:\datasets-downloaded` on Windows and `~/datasets-downloaded`
+is not set, the scripts use `P:\datasets-downloaded` on Windows and `~/datasets-downloaded`
 elsewhere. [ingest/paths.py](ingest/paths.py) lists the path of each dataset file
 inside that folder.
 
