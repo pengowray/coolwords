@@ -8,7 +8,7 @@
 //! This module reproduces those hard filters as one SQL `CASE`, in the same order
 //! `score_group` applies them, so every distinct word in a book lands in exactly
 //! one bucket: kept, or a named reason. The counts therefore add up to
-//! `books.n_types` — if they ever stop adding up, [`REASONS`] and `score.py` have
+//! `books.n_types` — if they ever stop adding up, [`reasons`] and `score.py` have
 //! drifted apart.
 //!
 //! # Keeping this in step with the scorer
@@ -51,22 +51,30 @@ const UNMEASURED_LAST: &str = "(CASE WHEN pm IS NULL OR pm <= 0 THEN 1 ELSE 0 EN
 /// Rows returned for one reason. Enough to browse; not enough to freeze the page.
 const WORD_LIMIT: i32 = 200;
 
-/// The buckets, in the order they're tested. `key` is what the UI passes back to
-/// [`excluded_words`]; `note` is the tooltip.
-pub const REASONS: &[(&str, &str, &str)] = &[
-    ("nodict", "not a dictionary word", "a name, a typo, a scanning error, or simply missing from the dictionary"),
-    ("nonalpha", "not plain letters", "words with a hyphen or apostrophe, like \"man-of-war\" or \"don't\""),
-    ("nowikt", "no Wiktionary entry", "in the dictionary, but with no Wiktionary entry to check it against"),
-    ("formof", "form of another word", "a plural, tense or comparative. It counts towards its base word instead."),
-    ("proper", "proper noun", "names of people, places and brands"),
-    ("offensive", "offensive", "some sense of it is tagged as a slur, vulgar or derogatory"),
-    ("capitalised", "usually capitalised", "over half its uses in print are capitalised, so it reads as a name"),
-    ("short", "under 3 letters", "the scorer needs at least 3 letters"),
-    ("common", "too common", "used more than 12 times per million words of general English"),
-];
+/// The reasons a word is excluded, in the order `why_select` tests them. Each entry
+/// is (key, chip label, chip tooltip). The UI sends `key` back to
+/// [`excluded_words`] to list the words for one reason.
+pub fn reasons() -> [(&'static str, String, String); 9] {
+    let r = |key, label: &str, note: &str| (key, label.to_string(), note.to_string());
+    [
+        r("nodict", "not a dictionary word", "a name, a typo, a scanning error, or simply missing from the dictionary"),
+        r("nonalpha", "characters other than a–z", "contains a hyphen, apostrophe, digit or accented letter, like \"man-of-war\", \"don't\" or \"café\""),
+        r("nowikt", "no Wiktionary entry", "Wiktionary has no entry for this word, so it can't be checked for names, forms of other words or offensive meanings"),
+        r("formof", "form of another word", "a form of another word in Wiktionary, such as a plural, past tense or alternative spelling. Forms are left out unless the merge setting combines them with their base word."),
+        r("proper", "proper noun", "names of people, places and brands"),
+        r("offensive", "offensive", "at least one meaning is labelled in Wiktionary as offensive, vulgar, derogatory, pejorative or a slur"),
+        r("capitalised", "usually capitalised", "more than half of its uses in general English are capitalised, so it is treated as a name"),
+        r("short", &format!("under {MIN_LEN} letters"), &format!("words shorter than {MIN_LEN} letters are not ranked")),
+        r("common", "too common", &format!("used more than {MAX_FREQ_PM_LC:.0} times per million words of general English")),
+    ]
+}
 
-pub fn reason_label(key: &str) -> &'static str {
-    REASONS.iter().find(|(k, _, _)| *k == key).map(|(_, l, _)| *l).unwrap_or("left out")
+pub fn reason_label(key: &str) -> String {
+    reasons()
+        .into_iter()
+        .find(|(k, _, _)| *k == key)
+        .map(|(_, label, _)| label)
+        .unwrap_or_else(|| "excluded".to_string())
 }
 
 /// One bucket with its size for this book and merge level.
@@ -170,25 +178,20 @@ pub async fn exclusion_report(book_id: i64, level: i64) -> Result<ExcludeReport,
         )
         .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let mut reasons: Vec<ExcludeReason> = REASONS
-        .iter()
+    let mut found: Vec<ExcludeReason> = reasons()
+        .into_iter()
         .filter_map(|(key, label, note)| {
-            let count = *counts.get(*key)?;
-            (count > 0).then(|| ExcludeReason {
-                key: key.to_string(),
-                label: label.to_string(),
-                note: note.to_string(),
-                count,
-            })
+            let count = *counts.get(key)?;
+            (count > 0).then(|| ExcludeReason { key: key.to_string(), label, note, count })
         })
         .collect();
-    reasons.sort_by(|a, b| b.count.cmp(&a.count));
+    found.sort_by(|a, b| b.count.cmp(&a.count));
 
     Ok(ExcludeReport {
         n_types,
         n_kept: counts.get("").copied().unwrap_or(0),
         n_candidates,
-        reasons,
+        reasons: found,
     })
 }
 
@@ -212,7 +215,7 @@ pub async fn excluded_words(
     // `reason` is compared against the CASE output as a bound parameter, so an
     // unknown value can only ever mean "no rows" — but fall back to "all" anyway,
     // which is what a stale chip in a URL should show.
-    let want = if REASONS.iter().any(|(k, _, _)| *k == reason) { reason } else { String::new() };
+    let want = if reasons().iter().any(|(k, _, _)| *k == reason) { reason } else { String::new() };
     let sql = format!(
         "SELECT word, head, word_id, n, pm, gloss, why FROM ({})
          WHERE why <> '' AND (?3 = '' OR why = ?3)
@@ -303,7 +306,7 @@ pub fn ExcludedPanel(
                             view! {
                                 <p class="excl-sum">
                                     <strong>{commas(left_out)}</strong>
-                                    {format!(" of this book's {} different words never reach the list:",
+                                    {format!(" of this book's {} distinct words are excluded from the ranking:",
                                              commas(rep.n_types))}
                                 </p>
                                 <div class="excl-chips">
@@ -325,10 +328,11 @@ pub fn ExcludedPanel(
                                     }).collect_view()}
                                 </div>
                                 <p class="excl-kept">{if merged > 0 {
-                                    format!("The other {} are scored, and merge into {} ranked entries.",
+                                    format!("The other {} distinct words are ranked. Merged forms count as one, \
+                                             so there are {} ranked words.",
                                             commas(rep.n_kept), commas(rep.n_candidates))
                                 } else {
-                                    format!("The other {} are scored and ranked.", commas(rep.n_kept))
+                                    format!("The other {} distinct words are ranked.", commas(rep.n_kept))
                                 }}</p>
                             }.into_any()
                         }
@@ -336,27 +340,44 @@ pub fn ExcludedPanel(
                 </Suspense>
 
                 <div class="excl-bar">
-                    <select class="catsel" title="which left-out words to show first"
+                    <select class="catsel" title="order of the excluded words"
                         prop:value=move || sort.get()
                         on:change=move |ev| sort.set(event_target_value(&ev))>
                         <option value="rare">"rarest first"</option>
                         <option value="count">"most used in this book"</option>
                     </select>
-                    <span class="excl-cap">{format!("showing the first {WORD_LIMIT}")}</span>
+                    // Shown only when the selected reason has more words than the
+                    // list returns.
+                    <Suspense fallback=|| ()>
+                        {move || {
+                            let rep = report.get()?.ok().flatten()?;
+                            let why = reason.get();
+                            let total: i64 = rep.reasons.iter()
+                                .filter(|r| why.is_empty() || r.key == why)
+                                .map(|r| r.count)
+                                .sum();
+                            (total > i64::from(WORD_LIMIT)).then(|| view! {
+                                <span class="excl-cap">
+                                    {format!("first {WORD_LIMIT} of {} words shown", commas(total))}
+                                </span>
+                            })
+                        }}
+                    </Suspense>
                 </div>
 
                 <Suspense fallback=move || view! { <p class="loading">"…"</p> }>
                     {move || words.get().map(|res| match res {
                         Err(e) => view! { <p class="err">{err_text(&e)}</p> }.into_any(),
                         Ok(list) if list.is_empty() =>
-                            view! { <p class="excl-kept">"No words left out."</p> }.into_any(),
+                            view! { <p class="excl-kept">"No excluded words."</p> }.into_any(),
                         Ok(list) => view! {
                             <table class="excl-table">
                                 <thead><tr>
                                     <th>"word"</th>
-                                    <th class="num" title="times this form appears in this book">"in this book"</th>
-                                    <th class="num" title="uses per million words of general English, the number the \"too common\" test reads">"uses per million"</th>
-                                    <th>"left out because"</th>
+                                    <th class="num" title="times this spelling appears in this book">"uses in this book"</th>
+                                    <th class="num" title="lowercase uses per million words of general English, with merged forms added together">
+                                        "uses per million (general English)"</th>
+                                    <th>"reason"</th>
                                 </tr></thead>
                                 <tbody>
                                     {list.into_iter().map(|w| {
@@ -377,7 +398,7 @@ pub fn ExcludedPanel(
                                                     }}
                                                     {w.head.map(|h| view! {
                                                         <small class="excl-head"
-                                                            title="the form this word merges into, which is what gets judged">
+                                                            title="the word this form is merged into; the reason applies to that word">
                                                             {format!(" → {h}")}</small>
                                                     })}
                                                     {(!gloss.is_empty()).then(|| view! {
@@ -409,11 +430,15 @@ pub fn ExcludedPanel(
                 </Suspense>
 
                 <p class="excl-foot">
-                    {format!("A word is judged on the form it merges into, shown after the arrow. \
-                              \"Too common\" means over {MAX_FREQ_PM_LC:.0} uses per million words of \
-                              general English, and \"under {MIN_LEN} letters\" counts letters only. \
-                              A dash means no measured frequency at all, which sorts last under \
-                              \"rarest first\": those are mostly names, contractions and misreadings.")}
+                    "→ shows the word a form is merged into. The reason applies to that word."
+                </p>
+                <p class="excl-foot">
+                    "— under \"uses per million\" means no frequency data. These words are mostly \
+                     names, contractions and misreadings, and are listed last under \"rarest first\"."
+                </p>
+                <p class="excl-foot">
+                    {format!("\"Too common\" means more than {MAX_FREQ_PM_LC:.0} lowercase uses per \
+                              million words of general English, with merged forms added together.")}
                 </p>
             </section>
         </Show>
