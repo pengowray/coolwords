@@ -205,6 +205,7 @@ _TOC_ENTRY = re.compile(
     r"|[ivxlcdm]+[.)]\s|\d+[.)]\s)", re.I)
 _TOC_WINDOW = 30000   # only look for a CONTENTS heading in the first ~30k chars of the body
 _TRANSCRIBER = re.compile(r"\n[ \t]*\r?\n[ \t]*(?:\*\s*)?Transcriber'?s?\s+Notes?\b", re.I)
+_TAIL_NOTE_SHARE = 0.2   # only a note in the last 20% of the text before the licence is removed
 
 # Headings of the Project Gutenberg licence. They are searched for only when the
 # `*** END OF ... ***` marker is missing or malformed, because the licence is then
@@ -271,13 +272,16 @@ def _subsegment_body(body: str, end_marker_found: bool = False) -> list[Segment]
 
     # Tail boilerplate: a transcriber's note and/or the PG licence footer. Everything
     # from the earlier of the two to the end of the body is removed.
-    tn = _TRANSCRIBER.search(rest)
     lic = _licence_start(rest, find_heading=not end_marker_found)
     # Remove the licence only when there is text before it, so a licence phrase at the
     # start of the body never removes the whole book.
     if lic is not None and not rest[:lic].strip():
         lic = None
-    if tn and (lic is None or tn.start() < lic):
+    # A transcriber's note at the top of the book stays in the body. Only a note in
+    # the last part of the text before the licence is removed.
+    book_end = len(rest) if lic is None else lic
+    tn = _TRANSCRIBER.search(rest, int(book_end * (1 - _TAIL_NOTE_SHARE)), book_end)
+    if tn:
         out.append(Segment("body", True, rest[: tn.start()]))
         out.append(Segment("transcriber-note", False, rest[tn.start():], "transcriber's note"))
     elif lic is not None:
