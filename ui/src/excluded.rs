@@ -1,19 +1,23 @@
-//! Why a book's words don't all reach the word list.
+//! The words page's "excluded words" panel: which of a book's distinct words are
+//! excluded from the ranking, and the reason for each one.
 //!
-//! `ingest/score.py` drops most of a book's vocabulary before anything is ranked:
-//! inflected forms, proper nouns, words too common to be interesting, tokens the
-//! dictionary has never heard of. That is invisible on the words page — you see
-//! "400 shown" and no hint that 14,000 words were set aside, or which ones.
+//! `ingest/score.py` excludes most of a book's distinct words before it ranks the
+//! rest: forms of other words, proper nouns, words that are too common, and words
+//! that are not in the dictionary. The words page lists only the ranked words, so
+//! this panel is the only place that shows how many words were excluded and which
+//! words they are.
 //!
-//! This module reproduces those hard filters as one SQL `CASE`, in the same order
-//! `score_group` applies them, so every distinct word in a book lands in exactly
-//! one bucket: kept, or a named reason. The counts therefore add up to
-//! `books.n_types` — if they ever stop adding up, [`reasons`] and `score.py` have
-//! drifted apart.
+//! `why_select` repeats the scorer's tests as one SQL `CASE`, which gives each
+//! distinct word in a book exactly one result: ranked, or the key of one reason from
+//! [`reasons`]. So the number of ranked words (`n_kept`) plus every reason's count
+//! always equals `books.n_types`. If `score.py` gains a test that `why_select`
+//! lacks, the words that the new test excludes pass every test in the `CASE` and
+//! are counted as ranked, and `n_kept` becomes larger than the sum of
+//! `candidates.n_forms` for that book and merge level.
 //!
-//! # Keeping this in step with the scorer
+//! # Matching the scorer
 //!
-//! The `CASE` in `why_select` mirrors `ingest/score.py`:
+//! Each reason key matches one test in `ingest/score.py`:
 //!
 //! | score.py                                    | key           |
 //! |---------------------------------------------|---------------|
@@ -27,12 +31,17 @@
 //! | `score_group`: `length < MIN_LEN`           | `short`       |
 //! | `score_group`: `freq_comb > MAX_FREQ_PM_LC` | `common`      |
 //!
-//! The first five are a single `or` in Python, so the ORDER among them is this
-//! module's editorial choice (most-explanatory first), not the scorer's.
+//! `score_group` checks `not alpha`, `not inwikt`, `formof`, `proper` and
+//! `offensive` in a single `or`, so the scorer gives those tests no order. The
+//! order of `nowikt`, `formof`, `proper` and `offensive` in the `CASE` is this
+//! module's choice: a word that fails more than one of them gets the reason that
+//! comes first in the table.
 //!
-//! Everything is judged on the GROUP REPRESENTATIVE at the current merge level,
-//! exactly as the scorer does — at level 2 "whales" is left out because "whale"
-//! is too common, and the table says so by showing `whales → whale`.
+//! `nodict` and `nonalpha` test the word as it appears in the book. Every later test
+//! reads the word that the book's word is merged into at the current merge level,
+//! as the scorer does.
+//! At merge level 2, "whales" is excluded because "whale" is too common, and the
+//! panel's table shows the row as `whales → whale`.
 
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -48,7 +57,8 @@ const MIN_LEN: i64 = 3;
 /// contractions — leading with them buries every word whose rarity is a fact.
 #[cfg(feature = "ssr")]
 const UNMEASURED_LAST: &str = "(CASE WHEN pm IS NULL OR pm <= 0 THEN 1 ELSE 0 END)";
-/// Rows returned for one reason. Enough to browse; not enough to freeze the page.
+/// Maximum number of words [`excluded_words`] returns. One reason can exclude
+/// thousands of words from a book, and a table that long makes the page slow.
 const WORD_LIMIT: i32 = 200;
 
 /// The reasons a word is excluded, in the order `why_select` tests them. Each entry
@@ -77,7 +87,8 @@ pub fn reason_label(key: &str) -> String {
         .unwrap_or_else(|| "excluded".to_string())
 }
 
-/// One bucket with its size for this book and merge level.
+/// One reason, with the number of distinct words it excludes from one book at one
+/// merge level.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExcludeReason {
     pub key: String,
@@ -86,45 +97,55 @@ pub struct ExcludeReason {
     pub count: i64,
 }
 
-/// The accounting for one book at one merge level. `n_kept + every reason count`
-/// equals `n_types`.
+/// How many of a book's distinct words are ranked, and how many each reason
+/// excludes, at one merge level. `n_kept` plus every reason's `count` equals
+/// `n_types`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExcludeReport {
     /// Distinct words in the book (`books.n_types`).
     pub n_types: i64,
-    /// Distinct words that survive into a scored group.
+    /// Distinct words that pass every test and are ranked, on their own or merged
+    /// with other forms.
     pub n_kept: i64,
-    /// Scored entries at this level — below `n_kept` wherever forms merged.
+    /// Entries in the ranked list at this merge level (`candidates` rows). Merged
+    /// forms are one entry, so this is smaller than `n_kept` when any forms are merged.
     pub n_candidates: i64,
-    /// Distinct words left out, by reason, biggest bucket first.
+    /// Every reason that excludes at least one word, with the most words first.
     pub reasons: Vec<ExcludeReason>,
 }
 
-/// One left-out word.
+/// One excluded word.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExcludedWord {
-    /// The form as it appears in the book.
+    /// The word as it appears in the book.
     pub word: String,
-    /// The merged form the filter actually judged, when it differs from `word`.
+    /// The word that `word` is merged into, when it differs from `word`. The reason
+    /// applies to this word.
     pub head: Option<String>,
-    /// Word id of the judged form, for opening its detail sheet. `None` when the
-    /// token isn't a dictionary word at all.
+    /// Id of the word the reason applies to (`head`, or `word` when `head` is
+    /// `None`), for opening its detail sheet. `None` when `word` is not in the
+    /// dictionary.
     pub word_id: Option<i64>,
-    /// Times this form appears in the book.
+    /// Times this spelling appears in the book.
     pub count: i64,
-    /// General-English frequency per million (lowercase uses), the number the
-    /// "too common" test reads. `None` when the word isn't in the corpus.
+    /// Lowercase uses per million words of general English, with merged forms added
+    /// together. The "too common" test compares this number with `MAX_FREQ_PM_LC`.
+    /// `None` when there is no frequency data.
     pub freq_pm: Option<f64>,
     pub gloss: Option<String>,
     pub reason: String,
 }
 
-/// One row per distinct word in the book, tagged with its reason key (`''` when it
-/// reaches the ranking) and everything the table shows. `?1` = book id, `?2` = merge
-/// level. The `CASE` order is the one documented at the top of this module.
+/// One row per distinct word in the book, with the columns the panel's table shows
+/// and `why`: the key of the reason that excludes the word, or `''` when the word is
+/// ranked. `?1` is the book id and `?2` the merge level. The module docs list the
+/// `CASE` tests in order. A word whose merged group is in `candidates` is ranked,
+/// whatever the later tests say.
 ///
-/// `tw` is the token's own dictionary row, `rw` the group representative at this
-/// level, `lf` the family's combined frequency — the three things `score.py` reads.
+/// `tw` is the `words` row of the word as it appears in the book, `rw` is the
+/// `words` row of the word that the book's word is merged into (the same row as
+/// `tw` when nothing is merged), and `lf` (`lemma_freq`) has the combined frequency
+/// of every form merged into `rw`. `score.py` reads the same three rows.
 #[cfg(feature = "ssr")]
 fn why_select() -> String {
     format!(
@@ -195,8 +216,9 @@ pub async fn exclusion_report(book_id: i64, level: i64) -> Result<ExcludeReport,
     })
 }
 
-/// The left-out words themselves. `reason` empty = every reason together;
-/// `sort` is "rare" (default) or "count".
+/// The excluded words, at most `WORD_LIMIT` of them. An empty `reason` lists the
+/// words for every reason. `sort` is "rare" (default) for the lowest general-English
+/// frequency first, or "count" for the most uses in this book first.
 #[server]
 pub async fn excluded_words(
     book_id: i64,
@@ -206,15 +228,14 @@ pub async fn excluded_words(
 ) -> Result<Vec<ExcludedWord>, ServerFnError> {
     let conn = rusqlite::Connection::open(crate::app::db_path())
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    // Rarity ties break on "used most here", and vice versa: a word that is both
-    // rare and frequent in this book is the one worth seeing first either way.
+    // "rare" lists the lowest general-English frequency first, with words that have
+    // no frequency data last. "count" lists the most uses in this book first. Each
+    // order breaks ties with the other order.
     let order = match sort.as_str() {
         "count" => format!("n DESC, {UNMEASURED_LAST} ASC, pm ASC"),
         _ => format!("{UNMEASURED_LAST} ASC, pm ASC, n DESC"),
     };
-    // `reason` is compared against the CASE output as a bound parameter, so an
-    // unknown value can only ever mean "no rows" — but fall back to "all" anyway,
-    // which is what a stale chip in a URL should show.
+    // A `reason` that is not a reason key lists the words for every reason.
     let want = if reasons().iter().any(|(k, _, _)| *k == reason) { reason } else { String::new() };
     let sql = format!(
         "SELECT word, head, word_id, n, pm, gloss, why FROM ({})
@@ -260,14 +281,15 @@ pub fn commas(n: i64) -> String {
     out
 }
 
-/// The words page's "what's left out?" panel: the filter accounting for the current
-/// book and merge level, plus the words themselves, rarest first.
+/// The words page's "excluded words" panel: for the current book and merge level,
+/// the number of distinct words each reason excludes, and a table of the excluded
+/// words.
 #[component]
 pub fn ExcludedPanel(
     book: Memo<i64>,
     level: Memo<i64>,
     open: RwSignal<bool>,
-    /// Opens a word's detail sheet, so a left-out word can still be read and tagged.
+    /// Opens a word's detail sheet, so an excluded word can still be read and tagged.
     set_word: SignalSetter<Option<i64>>,
 ) -> impl IntoView {
     // The reason chip the user clicked, with the book and merge level shown at the
@@ -282,8 +304,9 @@ pub fn ExcludedPanel(
     });
     let choose = move |key: String| chosen.set((book.get_untracked(), level.get_untracked(), key));
     let sort = RwSignal::new("rare".to_string());
-    // Both resources stay idle until the panel is opened — this is a whole-book
-    // scan, and most visits to the words page never ask for it.
+    // Both resources fetch nothing until the panel is open. Each query scans every
+    // distinct word in the book, and most visits to the words page never open the
+    // panel.
     let report = Resource::new(
         move || (book.get(), level.get(), open.get()),
         |(b, l, go)| async move {
@@ -410,12 +433,13 @@ pub fn ExcludedPanel(
                                                     })}
                                                 </td>
                                                 <td class="num">{w.count}</td>
-                                                // A recorded 0 means the corpus has no
-                                                // lowercase uses at all — same story as a
-                                                // missing row, so it reads the same way.
-                                                // Enough decimals that the rarest measured
-                                                // words still differ from each other: the
-                                                // corpus floor is a shade under 0.0004.
+                                                // A frequency of 0 means the corpus has
+                                                // no lowercase uses of the word, so the
+                                                // cell shows "—", the same as for no
+                                                // frequency data. Small values get 3 or 4
+                                                // decimal places because the lowest
+                                                // frequency in the corpus is just under
+                                                // 0.0004 per million.
                                                 <td class="num">{match w.freq_pm {
                                                     Some(f) if f >= 1.0 => format!("{f:.1}"),
                                                     Some(f) if f >= 0.001 => format!("{f:.3}"),
