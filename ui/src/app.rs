@@ -4566,6 +4566,33 @@ fn WhyButton(open: RwSignal<bool>) -> impl IntoView {
     }
 }
 
+/// The body of a word list: each item rendered by `item` inside one
+/// `<div class={class}>`. In the by-part-of-speech view (`by_pos`), the items are
+/// split by `pos_sections`, and each section gets a heading and its own div. The
+/// words page and the verbarium use this for both the cards (`wlist`) and the
+/// compact grid (`cgrid`).
+fn word_list<T, V: IntoView + 'static>(
+    items: Vec<T>,
+    class: &'static str,
+    item: impl Fn(T) -> V,
+    by_pos: bool,
+    chunk: usize,
+    pos_of: impl Fn(&T) -> Option<String>,
+) -> AnyView {
+    if by_pos {
+        pos_sections(items, pos_of, chunk)
+            .into_iter()
+            .map(|(h, sec)| view! {
+                <h3 class="possec">{h}</h3>
+                <div class=class>{sec.into_iter().map(&item).collect_view()}</div>
+            })
+            .collect_view()
+            .into_any()
+    } else {
+        view! { <div class=class>{items.into_iter().map(item).collect_view()}</div> }.into_any()
+    }
+}
+
 /// "more examples from this book" in the word-detail sheet. Ingest stores only the
 /// FIRST sentence per word, so the rest need a pass over the book's stored text —
 /// slow enough (a Python re-extract) to stay behind a button rather than load with
@@ -5232,48 +5259,35 @@ fn HomePage() -> impl IntoView {
                     }
                     // Compact grid: a dense multi-column list — word (click for detail)
                     // plus a small gloss. Interest colouring + "hide rejected" still apply.
-                    if compact.get() {
-                        return view! {
-                            <p class="counts">{shown_text(total, matched)}<WhyButton open=excl_open/></p>
-                            <div class="cgrid">
-                                {list.into_iter().map(|c| {
-                                    let wid = c.word_id;
-                                    let members = c.members.clone();
-                                    let members_r = c.members.clone();
-                                    let members_h = c.members.clone();
-                                    let g = short(&c.gloss, 60);
-                                    let word = c.word.clone();
-                                    view! {
-                                        <article class="ccell"
-                                            class:interesting=move || group_interest(tagger, b, &members) == Some(Interest::Interesting)
-                                            class:rejected=move || group_interest(tagger, b, &members_r) == Some(Interest::Uninteresting)
-                                            class:hidden=move || hide_rejected.get() && group_interest(tagger, b, &members_h) == Some(Interest::Uninteresting)>
-                                            <span class="ccell-word word" on:click=move |_| set_word.set(Some(wid))>{word}</span>
-                                            {(!g.is_empty()).then(|| view! { <span class="ccell-sub">{g}</span> })}
-                                        </article>
-                                    }
-                                }).collect_view()}
-                            </div>
-                        }.into_any();
-                    }
+                    let cell = move |c: Candidate| {
+                        let wid = c.word_id;
+                        let members = c.members.clone();
+                        let members_r = c.members.clone();
+                        let members_h = c.members.clone();
+                        let g = short(&c.gloss, 60);
+                        view! {
+                            <article class="ccell"
+                                class:interesting=move || group_interest(tagger, b, &members) == Some(Interest::Interesting)
+                                class:rejected=move || group_interest(tagger, b, &members_r) == Some(Interest::Uninteresting)
+                                class:hidden=move || hide_rejected.get() && group_interest(tagger, b, &members_h) == Some(Interest::Uninteresting)>
+                                <span class="ccell-word word" on:click=move |_| set_word.set(Some(wid))>{c.word}</span>
+                                {(!g.is_empty()).then(|| view! { <span class="ccell-sub">{g}</span> })}
+                            </article>
+                        }
+                    };
                     let card = move |c: Candidate| view! {
                         <WordCard c=c book_id=b set_word=set_word set_cat=set_cat
                             hide_rejected=hide_rejected open_picker=open_picker/>
                     };
-                    if by_pos {
-                        return view! {
-                            <p class="counts">{shown_text(total, matched)}<WhyButton open=excl_open/></p>
-                            {pos_sections(list, |c| c.pos.clone(), chunk).into_iter().map(|(h, items)| view! {
-                                <h3 class="possec">{h}</h3>
-                                <div class="wlist">{items.into_iter().map(card).collect_view()}</div>
-                            }).collect_view()}
-                        }.into_any();
-                    }
+                    let pos_of = |c: &Candidate| c.pos.clone();
+                    let body = if compact.get() {
+                        word_list(list, "cgrid", cell, by_pos, chunk, pos_of)
+                    } else {
+                        word_list(list, "wlist", card, by_pos, chunk, pos_of)
+                    };
                     view! {
                         <p class="counts">{shown_text(total, matched)}<WhyButton open=excl_open/></p>
-                        <div class="wlist">
-                            {list.into_iter().map(card).collect_view()}
-                        </div>
+                        {body}
                     }.into_any()
                 }
             })}
@@ -6095,54 +6109,36 @@ fn CollectionPage() -> impl IntoView {
                     }
                     // Compact grid: a dense 2–3 column list, each cell just the word + a
                     // small gloss. A middle ground between the full cards and plain text.
-                    if compact.get() {
+                    let cell = {
                         let base = base.clone();
-                        return view! {
-                            <p class="counts">{format!("{count} words")}</p>
-                            <div class="cgrid">
-                                {list.into_iter().map(|e| {
-                                    let href = (e.word_id > 0)
-                                        .then(|| e.books.first().map(|(bid, _)| format!("{base}/?book={bid}&word={}", e.word_id)))
-                                        .flatten();
-                                    let g = short(&e.gloss, 60);
-                                    let cls = format!("ccell int-{}", e.interest);
-                                    let word = e.word.clone();
-                                    view! {
-                                        <article class=cls>
-                                            {match href {
-                                                Some(h) => view! { <a class="ccell-word" href=h>{word}</a> }.into_any(),
-                                                None => view! { <span class="ccell-word">{word}</span> }.into_any(),
-                                            }}
-                                            {(!g.is_empty()).then(|| view! { <span class="ccell-sub">{g}</span> })}
-                                        </article>
-                                    }
-                                }).collect_view()}
-                            </div>
-                        }.into_any();
-                    }
-                    if by_pos {
-                        return view! {
-                            <p class="counts">{format!("{count} words")}</p>
-                            {pos_sections(list, |e| e.pos.clone(), chunk).into_iter().map(|(h, items)| {
-                                let base = base.clone();
-                                view! {
-                                    <h3 class="possec">{h}</h3>
-                                    <div class="wlist">
-                                        {items.into_iter().map(|e| view! {
-                                            <CollectionCard e=e base=base.clone()/>
-                                        }).collect_view()}
-                                    </div>
-                                }
-                            }).collect_view()}
-                        }.into_any();
-                    }
+                        move |e: CollectionEntry| {
+                            let href = (e.word_id > 0)
+                                .then(|| e.books.first().map(|(bid, _)| format!("{base}/?book={bid}&word={}", e.word_id)))
+                                .flatten();
+                            let g = short(&e.gloss, 60);
+                            let cls = format!("ccell int-{}", e.interest);
+                            let word = e.word;
+                            view! {
+                                <article class=cls>
+                                    {match href {
+                                        Some(h) => view! { <a class="ccell-word" href=h>{word}</a> }.into_any(),
+                                        None => view! { <span class="ccell-word">{word}</span> }.into_any(),
+                                    }}
+                                    {(!g.is_empty()).then(|| view! { <span class="ccell-sub">{g}</span> })}
+                                </article>
+                            }
+                        }
+                    };
+                    let card = move |e: CollectionEntry| view! { <CollectionCard e=e base=base.clone()/> };
+                    let pos_of = |e: &CollectionEntry| e.pos.clone();
+                    let body = if compact.get() {
+                        word_list(list, "cgrid", cell, by_pos, chunk, pos_of)
+                    } else {
+                        word_list(list, "wlist", card, by_pos, chunk, pos_of)
+                    };
                     view! {
                         <p class="counts">{format!("{count} words")}</p>
-                        <div class="wlist">
-                            {list.into_iter().map(|e| view! {
-                                <CollectionCard e=e base=base.clone()/>
-                            }).collect_view()}
-                        </div>
+                        {body}
                     }.into_any()
                 }
             })}
