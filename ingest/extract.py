@@ -196,7 +196,7 @@ def _clean_title(s: str) -> str:
 # A body may begin with a "Produced by …" credit and/or a table of contents, and
 # end with a "Transcriber's Note". These strippers are conservative: each only
 # fires on a clearly-marked region and otherwise leaves the text in the body.
-_CREDITS = re.compile(r"\A\s*((?:Produced by|E-?text prepared by|Prepared by)\b.*?)(\n[ \t]*\n)",
+_CREDITS = re.compile(r"\A\s*((?:Produced by|E-?text prepared by|Prepared by)\b.*?)(\r?\n[ \t]*\r?\n)",
                       re.I | re.S)
 _TOC_HEAD = re.compile(r"(?m)^[ \t]*(?:CONTENTS|TABLE OF CONTENTS)[ \t]*\r?$", re.I)
 _TOC_ENTRY = re.compile(
