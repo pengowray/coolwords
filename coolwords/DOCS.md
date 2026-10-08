@@ -34,10 +34,10 @@ sidebar" is on in the add-on's info page.
 ## Exposing it at words.ffff.network
 
 The tunnel does **not** require publishing the LAN port. The Cloudflared add-on runs on
-the same internal Docker network and reaches Coolwords by container hostname, so `ports`
-stays `null` (zero LAN exposure) and Cloudflare Access is the only gate. The tunnel hits
-the container directly (not through ingress), so the app serves at the root and asset
-paths resolve normally — nothing to configure app-side.
+the same internal Docker network and reaches Coolwords by its add-on hostname
+(`local-coolwords`), so `ports` stays `null` (zero LAN exposure) and Cloudflare Access is
+the only gate. The tunnel hits the container directly (not through ingress), so the app
+serves at the root and asset paths resolve normally — nothing to configure app-side.
 
 ### A. Tunnel via the Cloudflared add-on
 1. Install a **Cloudflared** HA add-on (e.g. the community `brenner-tobias` one:
@@ -50,11 +50,12 @@ paths resolve normally — nothing to configure app-side.
      - hostname: words.ffff.network
        service: http://local-coolwords:7575
    ```
-   `local-coolwords` is this add-on's hostname on the internal network — dashes, and no
-   `addon_` prefix. The container is *named* `addon_local_coolwords`, but that name does
-   not resolve: the Supervisor points every add-on at the HA DNS server, which knows
-   add-ons by hostname only. Using the container name gets you a **502** from the tunnel.
-   Confirm the value on the Coolwords add-on's info page under **Hostname**, or on the box:
+   `local-coolwords` is this add-on's hostname on the Supervisor's internal network. It
+   uses dashes, not underscores, and has no `addon_` prefix. The container is *named*
+   `addon_local_coolwords`, but that name does not resolve, because every add-on uses the
+   HA DNS server, which resolves add-ons by hostname only. If `service:` uses the
+   container name, the tunnel returns a **502** error. Check the hostname on the
+   Coolwords add-on's info page under **Hostname**, or on the box:
    ```bash
    ha addons info local_coolwords | grep -i hostname
    ```
