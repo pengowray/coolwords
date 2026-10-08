@@ -114,9 +114,9 @@ def extract(path: Path, pdf_ocr: dict[int, str] | None = None) -> Extraction:
 # --------------------------------------------------------------------------- #
 #  plain text / Project Gutenberg                                             #
 # --------------------------------------------------------------------------- #
-# Accept both the modern "EBOOK" and the pre-2010 "ETEXT" wording — old etexts that
-# weren't recognised as PG kept their whole header + legal footer in the histogram
-# (that's where the trademark/merchantability/redistribute boilerplate leaked from).
+# Match both "EBOOK" and the older "ETEXT" in the START and END marker lines. When the
+# START marker does not match, the file is not recognised as Project Gutenberg and
+# its PG header stays in the kept text.
 _PG_START = re.compile(r"\*\*\*\s*START OF (?:THE|THIS) PROJECT GUTENBERG E(?:BOOK|TEXT).*?\*\*\*", re.I | re.S)
 _PG_END = re.compile(r"\*\*\*\s*END OF (?:THE|THIS) PROJECT GUTENBERG E(?:BOOK|TEXT).*?\*\*\*", re.I | re.S)
 
@@ -205,12 +205,14 @@ _TOC_ENTRY = re.compile(
     r"|[ivxlcdm]+[.)]\s|\d+[.)]\s)", re.I)
 _TOC_WINDOW = 30000   # only look for a CONTENTS heading in the first ~30k chars of the body
 _TRANSCRIBER = re.compile(r"\n[ \t]*\r?\n[ \t]*(?:\*\s*)?Transcriber'?s?\s+Notes?\b", re.I)
-_TAIL_NOTE_SHARE = 0.2   # only a note in the last 20% of the text before the licence is removed
+# A transcriber's note is removed only when it starts in the last 20% of the text
+# before the licence footer, or before the end of the body when there is no footer.
+_TAIL_NOTE_SHARE = 0.2
 
 # Headings of the Project Gutenberg licence. They are searched for only when the
 # `*** END OF ... ***` marker is missing or malformed, because the licence is then
 # still in the body. Each phrase appears only in the licence. The licence runs to
-# the end of the file, so everything from the match to the end is removed.
+# the end of the file, so everything from the heading to the end of the body is removed.
 _PG_LICENCE_HEADING = re.compile(
     r"\*\*\*\s*START:?\s*FULL\s+LICEN[SC]E"                     # modern licence-block marker
     r"|THE\s+FULL\s+PROJECT\s+GUTENBERG\s+LICEN[SC]E"           # licence heading
@@ -224,8 +226,8 @@ _PG_LICENCE_HEADING = re.compile(
 # typographic apostrophe in "Gutenberg's".
 _PG_END_LINE = re.compile(
     r"\bEnd\s+of\s+(?:the\s+)?Project\s+Gutenberg(['’]?s\b|\s+E(?:Book|text)\b)", re.I)
-# A collection of works, such as PG #3200 (the works of Mark Twain), has one of these
-# closing lines after each work. A closing line starts the licence footer only when
+# A collection of works, such as PG #3200 (the works of Mark Twain), has a closing
+# line after each work. A closing line starts the licence footer only when
 # it is less than this many characters before the licence heading, or before the
 # end of the body when there is no heading.
 _END_LINE_WINDOW = 10_000
@@ -252,10 +254,10 @@ def _subsegment_body(body: str, end_marker_found: bool = False) -> list[Segment]
         out.append(Segment("credits", False, rest[: m.end()], "transcription credit"))
         rest = rest[m.end():]
 
-    # A "Small Print!" licence block (very old etexts). When less text comes before the
-    # block than after it, the block is at the top of the file and the book is the text
-    # after it. Otherwise the book is the text before it. The TOC and tail scans below
-    # run on the book only.
+    # Very old etexts have a "Small Print!" licence block. When less text comes before
+    # the block than after it, the block is at the top of the file and the book is the
+    # text after it. Otherwise the book is the text before it. The TOC and tail scans
+    # below run on the book only.
     after: list[Segment] = []
     if sp := _SMALL_PRINT.search(rest):
         block = Segment("gutenberg-licence", False, rest[sp.start(): sp.end()],
@@ -285,8 +287,8 @@ def _subsegment_body(body: str, end_marker_found: bool = False) -> list[Segment]
     # start of the body never removes the whole book.
     if lic is not None and not rest[:lic].strip():
         lic = None
-    # A transcriber's note at the top of the book stays in the body. Only a note in
-    # the last part of the text before the licence is removed.
+    # Search for a transcriber's note only in the last 20% (_TAIL_NOTE_SHARE) of the
+    # text before the licence, so a note at the top of the book stays in the body.
     book_end = len(rest) if lic is None else lic
     tn = _TRANSCRIBER.search(rest, int(book_end * (1 - _TAIL_NOTE_SHARE)), book_end)
     if tn:
@@ -304,9 +306,10 @@ def _subsegment_body(body: str, end_marker_found: bool = False) -> list[Segment]
 def _licence_start(text: str, find_heading: bool) -> int | None:
     """Offset in `text` where the Project Gutenberg licence footer starts, or None.
 
-    With `find_heading`, the footer starts at the first licence heading. A PG closing
-    line less than _END_LINE_WINDOW characters before that heading, or before the end
-    of `text` when no heading is found, moves the start back to the closing line."""
+    With `find_heading`, the footer starts at the first licence heading. When a PG
+    closing line is less than _END_LINE_WINDOW characters before that heading, or
+    before the end of `text` when no heading is found, the footer starts at the
+    closing line instead."""
     heading = _PG_LICENCE_HEADING.search(text) if find_heading else None
     limit = heading.start() if heading else len(text)
     if end_line := _PG_END_LINE.search(text, max(0, limit - _END_LINE_WINDOW), limit):
