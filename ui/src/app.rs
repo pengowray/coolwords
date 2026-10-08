@@ -410,6 +410,15 @@ fn group_tag_values(t: Tagger, book_id: i64, members: &[i64]) -> Vec<(String, i3
     out
 }
 
+/// A tag in the plain-list export on the words page and the verbarium: `#tag:N` for
+/// rating level N, `#tag` for "on".
+fn hashtag(name: &str, value: i32) -> String {
+    match tag_level(value) {
+        Some(lv) => format!("#{name}:{lv}"),
+        None => format!("#{name}"),
+    }
+}
+
 /// Per-interest counts of a family's applied collection tags: (interesting,
 /// neutral, uninteresting). Used for the compact count pills when a word carries
 /// too many tags to list as chips.
@@ -472,6 +481,10 @@ pub struct CollectionEntry {
     pub interest: String,
     /// Applied collection tags: (name, interest). `pick:` buckets are excluded.
     pub tags: Vec<(String, String)>,
+    /// Each tag in `tags` with its value in the client store's i32 (TAG_ON or a
+    /// rating level). A word rated in several books has its highest level here.
+    #[serde(default)]
+    pub tag_values: HashMap<String, i32>,
     /// Books this word (with these tags) reaches: (book_id, title).
     pub books: Vec<(i64, String)>,
     /// Ranking number for a "smart" collection (e.g. net favourite − negative
@@ -2255,6 +2268,7 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
         gloss: Option<String>,
         freq_pm: Option<f64>,
         tags: Vec<(String, String)>,        // (name, interest), deduped
+        values: HashMap<String, i32>,       // tag name -> highest value_from_db value
         books: Vec<(i64, String)>,          // deduped by id
         global_tags: Vec<(String, String)>, // word-scoped ('*') tags only, deduped — drives the net metric
     }
@@ -2267,20 +2281,20 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
     // always fetch ALL applications (never a per-tag WHERE) so that a word matched by
     // the `tag` filter still carries its OTHER tags in the row — the tag filter is
     // applied to the assembled per-word rows below, not to this scan.
-    let base_sql = "SELECT t.word, t.tag, g.interest, t.book_slug \
+    let base_sql = "SELECT t.word, t.tag, g.interest, t.book_slug, t.value \
                     FROM u.word_tags t JOIN u.tags g ON g.name = t.tag \
                     WHERE t.rater = 'me' AND COALESCE(t.value, 1) >= 1";
-    let rows: Vec<(String, String, String, String)> = {
+    let rows: Vec<(String, String, String, String, Option<i32>)> = {
         let mut s = conn.prepare(base_sql).map_err(|e| ServerFnError::new(e.to_string()))?;
         let v = s
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
             .map_err(|e| ServerFnError::new(e.to_string()))?
             .filter_map(Result::ok)
             .collect();
         v
     };
 
-    for (word, tagname, interest, book_slug) in rows {
+    for (word, tagname, interest, book_slug, value) in rows {
         // Resolve this application's books.
         let app_books: Vec<(i64, String)> = if book_slug == "*" {
             if let Some(v) = word_books.get(&word) {
@@ -2314,10 +2328,14 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
                 .map_err(|e| ServerFnError::new(e.to_string()))?
                 .unwrap_or((0, None, None));
             by_word.insert(word.clone(), Acc {
-                word_id: wid, gloss, freq_pm, tags: Vec::new(), books: Vec::new(), global_tags: Vec::new(),
+                word_id: wid, gloss, freq_pm, tags: Vec::new(), values: HashMap::new(),
+                books: Vec::new(), global_tags: Vec::new(),
             });
         }
         let acc = by_word.get_mut(&word).unwrap();
+        // Seeded with TAG_ON, as in group_tag_values, so any rating level wins the max.
+        let best = acc.values.entry(tagname.clone()).or_insert(TAG_ON);
+        *best = (*best).max(value_from_db(value));
         if book_slug == "*" && !acc.global_tags.iter().any(|(n, _)| n == &tagname) {
             acc.global_tags.push((tagname.clone(), interest.clone()));
         }
@@ -2427,7 +2445,10 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
             let count = a.books.iter()
                 .map(|(bid, _)| count_map.get(&(*bid, a.word_id)).copied().unwrap_or(0))
                 .sum();
-            CollectionEntry { interest: eff(&tags), word, word_id: a.word_id, gloss: a.gloss, freq_pm: a.freq_pm, tags, books: a.books, metric, pos, count }
+            CollectionEntry {
+                interest: eff(&tags), word, word_id: a.word_id, gloss: a.gloss, freq_pm: a.freq_pm,
+                tags, tag_values: a.values, books: a.books, metric, pos, count,
+            }
         })
         .collect();
     if special {
@@ -5218,13 +5239,8 @@ fn HomePage() -> impl IntoView {
                         let line = |c: &Candidate| -> String {
                             let head = if forms_on && c.forms.len() > 1 { c.forms.join("/") } else { c.word.clone() };
                             if !tags_on { return head; }
-                            // A rated level exports as `#tag:N`; the value-less "on" (and
-                            // any plain bool) as just `#tag`.
                             let hs = group_tag_values(tagger, b, &c.members).into_iter()
-                                .map(|(n, v)| match tag_level(v) {
-                                    Some(lv) => format!("#{n}:{lv}"),
-                                    None => format!("#{n}"),
-                                })
+                                .map(|(n, v)| hashtag(&n, v))
                                 .collect::<Vec<_>>().join(" ");
                             if hs.is_empty() { head } else { format!("{head} // {hs}") }
                         };
@@ -6083,7 +6099,8 @@ fn CollectionPage() -> impl IntoView {
                             // the words page's group_tag_values export.
                             let hs = e.tags.iter()
                                 .filter(|(n, _)| n != "star" && !n.starts_with("pick:"))
-                                .map(|(n, _)| format!("#{n}")).collect::<Vec<_>>().join(" ");
+                                .map(|(n, _)| hashtag(n, e.tag_values.get(n).copied().unwrap_or(TAG_ON)))
+                                .collect::<Vec<_>>().join(" ");
                             if hs.is_empty() { e.word.clone() } else { format!("{} // {hs}", e.word) }
                         };
                         let joiner = match list_sep.get().as_str() { "sp" => " ", "comma" => ", ", _ => "\n" };
