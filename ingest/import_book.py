@@ -97,11 +97,14 @@ def _dup_lookup(con, content_hash: str, exclude_slug: str = ""):
 
 
 def book_file(slug: str) -> Path:
-    """The committed source file for a slug: BOOKS_DIR/<slug>.<ext>."""
-    for ext in (".pdf", ".epub", ".txt"):
-        p = BOOKS_DIR / f"{slug}{ext}"
-        if p.exists():
-            return p
+    """The book's stored source file, BOOKS_DIR/<slug>.<ext>. If it is missing, the
+    repo's data/books/<slug>.<ext>, where books imported from the command line
+    before the web importer existed are kept."""
+    for d in (BOOKS_DIR, PROJECT_ROOT / "data" / "books"):
+        for ext in (".pdf", ".epub", ".txt"):
+            p = d / f"{slug}{ext}"
+            if p.exists():
+                return p
     raise ExtractError(f"no stored file for '{slug}' in {BOOKS_DIR}", code="NO_FILE")
 
 
@@ -418,20 +421,6 @@ def do_reingest(slug: str, text_source: str, run_pipeline: bool = True) -> dict:
             "n_tokens": n_tokens, "n_types": n_types, "candidates": n_cand, "pipeline": steps}
 
 
-def _source_file(slug: str) -> Path:
-    """The book's stored source file, BOOKS_DIR/<slug>.<ext>. If it is missing, the
-    repo's data/books/<slug>.<ext>, where books imported from the command line
-    before the web importer existed are kept."""
-    try:
-        return book_file(slug)
-    except ExtractError:
-        for ext in (".txt", ".epub", ".pdf"):
-            p = PROJECT_ROOT / "data" / "books" / f"{slug}{ext}"
-            if p.exists():
-                return p
-        raise
-
-
 _MAX_EXAMPLES = 40
 
 
@@ -448,7 +437,7 @@ def do_examples(slug: str, words: str, limit: int) -> dict:
     if not forms:
         raise ExtractError("no words given", code="NO_WORDS")
     limit = max(1, min(limit or 20, _MAX_EXAMPLES))
-    path = _source_file(slug)
+    path = book_file(slug)
 
     con = connect()
     row = con.execute("SELECT text_source FROM books WHERE slug = ?", (slug,)).fetchone()
