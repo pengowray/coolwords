@@ -2603,11 +2603,14 @@ pub async fn create_tag(
         .unwrap_or_else(|| SCOPE_BOOK.to_string());
     if actual == SCOPE_WORD {
         conn.execute(
-            // Several book-scoped rows for the same word collapse to one '*' row;
-            // applied-wins (MAX of COALESCE(value,1)) so a rating in one book isn't
-            // clobbered by a 0/considered in another. GROUP BY makes the pick deterministic.
+            // The book-scoped rows for one word become one '*' row. Its value is the
+            // highest rating level if any book has one, NULL ("on") if any book has the
+            // tag on, and 0 only when every book has the word as considered and declined.
             "INSERT OR IGNORE INTO word_tags(book_slug, word, tag, rater, ts, value)
-             SELECT '*', word, tag, rater, MAX(ts), MAX(COALESCE(value, 1))
+             SELECT '*', word, tag, rater, MAX(ts),
+                    CASE WHEN MAX(value) >= 1 THEN MAX(value)
+                         WHEN count(*) > count(value) THEN NULL
+                         ELSE 0 END
              FROM word_tags WHERE tag = ?1 AND book_slug <> '*'
              GROUP BY word, tag, rater",
             [&clean],
@@ -2879,9 +2882,14 @@ pub async fn set_tag_scope(name: String, scope: String, convert_book: i64) -> Re
         // book→word: collapse this tag's book-scoped rows into the global '*' sentinel.
         // `value` is carried so scale ratings / 0-considered rows survive the move.
         tx.execute(
-            // collapse to one '*' row per (word,tag,rater); applied-wins on `value`.
+            // One '*' row per word. Its value is the highest rating level if any book
+            // has one, NULL ("on") if any book has the tag on, and 0 only when every
+            // book has the word as considered and declined.
             "INSERT OR IGNORE INTO u.word_tags(book_slug, word, tag, rater, ts, value)
-             SELECT '*', word, tag, rater, MAX(ts), MAX(COALESCE(value, 1))
+             SELECT '*', word, tag, rater, MAX(ts),
+                    CASE WHEN MAX(value) >= 1 THEN MAX(value)
+                         WHEN count(*) > count(value) THEN NULL
+                         ELSE 0 END
              FROM u.word_tags WHERE tag = ?1 AND book_slug <> '*'
              GROUP BY word, tag, rater",
             [&name],
