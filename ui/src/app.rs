@@ -2605,7 +2605,6 @@ pub async fn create_tag(
     // If this tag ends up word-scoped, collapse any book-keyed applications into the
     // global '*' sentinel (mirrors set_tag_scope's book→word migration) so a racing
     // set_tag that auto-registered it book-scoped can't leave the rows mis-keyed.
-    // `value` is carried so scale ratings / 0-considered rows survive the re-home.
     let actual: String = conn
         .query_row("SELECT scope FROM tags WHERE name = ?1", [&clean], |r| r.get(0))
         .optional()
@@ -2890,7 +2889,6 @@ pub async fn set_tag_scope(name: String, scope: String, convert_book: i64) -> Re
     let tx = conn.transaction().map_err(|e| ServerFnError::new(e.to_string()))?;
     if scope == SCOPE_WORD {
         // book→word: collapse this tag's book-scoped rows into the global '*' sentinel.
-        // `value` is carried so scale ratings / 0-considered rows survive the move.
         tx.execute(
             // One '*' row per word. Its value is the highest rating level if any book
             // has one, NULL ("on") if any book has the tag on, and 0 only when every
