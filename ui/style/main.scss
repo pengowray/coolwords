@@ -725,10 +725,12 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
 .btagsel { max-width: 12rem; }
 .viewsel, .chunksel { max-width: 14rem; }
 
-/* type-to-find over the whole library. The hit list floats over the word list, so
-   it needs to sit above it but below the detail modal (40/41). */
+/* Book search: a search box with a list of matching books under it. The list covers
+   the word list, with a z-index below the detail modal's (40 and 41). The search box
+   has a higher z-index than the click-away layer (.plmenu-backdrop, z-index 19), so a
+   click in the box moves the cursor and keeps the search text. */
 .bfind { position: relative; display: inline-flex; }
-.bfind-q { flex: 0 1 11rem; min-width: 7rem; }
+.bfind-q { flex: 0 1 11rem; min-width: 7rem; position: relative; z-index: 20; }
 .bfind-hits {
   position: absolute; z-index: 20; top: calc(100% + 4px); left: 0;
   min-width: 18rem; max-width: min(28rem, 90vw); max-height: 60vh; overflow-y: auto;
