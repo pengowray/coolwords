@@ -490,14 +490,14 @@ pub struct CollectionEntry {
     /// Ranking number for a "smart" collection (e.g. net favourite − negative
     /// all-books tags), shown as a badge. `None` for an ordinary tag/all view.
     pub metric: Option<i64>,
-    /// Total in-book occurrences of this word across the books it appears in — the
-    /// same "count" you'd sort by within a single book. Drives the "sort: most in
-    /// text" option in the verbarium.
+    /// Total in-book occurrences of this word across the books it appears in, for
+    /// the verbarium's "sort: most used in your books" option.
     #[serde(default)]
     pub count: i64,
-    /// General corpus frequency (per-million), for the "sort: rarest" option. `None`
-    /// when the word isn't in the frequency corpus (unresolved, or rarer than the ~1M
-    /// tracked words) — sorted last so a measured rarity leads.
+    /// General corpus frequency (per million words), for the verbarium's "sort:
+    /// rarest in English" option. `None` when the word is not in the dictionary
+    /// (`word_id` is 0) or the frequency corpus has no count for it. Words with `None`
+    /// sort after words with a frequency.
     #[serde(default)]
     pub freq_pm: Option<f64>,
     /// Primary part of speech ("noun"/"verb"/"adj"/…), for the by-part-of-speech
@@ -4203,7 +4203,7 @@ fn TagPicker(
                                     {((if is_scale { 1 } else { 2 })..=maxlv).map(|lv| {
                                         let nml = r_lv.clone();
                                         let ncl = r_lv.clone();
-                                        view! { <button type="button" class="ratebtn"
+                                        view! { <button type="button" class="ratebtn" title=format!("rating {lv}")
                                             class:sel=move || tag_value(t, key, &nml) == Some(lv)
                                             on:click=move |_| set_tag_val(t, book_id, word_id, &ncl, Some(lv))>
                                             {lv.to_string()}</button> }
@@ -4411,7 +4411,7 @@ fn TagPicker(
                                         {(1..=maxlv).map(|lv| {
                                             let nml = n_lv.clone();
                                             let ncl = n_lv.clone();
-                                            view! { <button type="button" class="ratebtn"
+                                            view! { <button type="button" class="ratebtn" title=format!("rating {lv}")
                                                 class:sel=move || tag_value(t, key, &nml) == Some(lv)
                                                 on:click=move |_| { set_tag_val(t, book_id, word_id, &ncl, Some(lv)); pop.set(None); }>
                                                 {lv.to_string()}</button> }
@@ -4564,26 +4564,26 @@ pub fn err_text<E: std::fmt::Display>(e: &E) -> String {
     s.strip_prefix("error running server function: ").unwrap_or(&s).to_string()
 }
 
-/// The "N shown" line's text. Says "of M" only when the list is actually cut short —
-/// by the fetch cap, the varied-top-20 toggle, or a category filter — so the plain
-/// number keeps meaning "that's all of them".
+/// The counts line above the word list. It says "N of M" only when the list is cut
+/// short, by the 400-word fetch limit or by "varied top-20 only", so a single number
+/// means every ranked word that matches the category filter is shown.
 fn shown_text(shown: usize, matched: i64) -> String {
     let n = crate::excluded::commas(shown as i64);
     if (shown as i64) < matched {
-        format!("{n} of {} shown", crate::excluded::commas(matched))
+        format!("{n} of {} ranked words shown", crate::excluded::commas(matched))
     } else {
-        format!("{n} shown")
+        format!("{n} ranked words shown")
     }
 }
 
-/// Opens the "what's left out?" report. Sits in the counts line of every
-/// arrangement, so it's a component rather than four copies.
+/// The "excluded words" button on the counts line above the word list. It shows or
+/// hides the excluded words panel (`crate::excluded::ExcludedPanel`).
 #[component]
 fn WhyButton(open: RwSignal<bool>) -> impl IntoView {
     view! {
         <button type="button" class="descbtn whybtn" class:on=move || open.get()
-            title="which of this book's words never reach this list, and why"
-            on:click=move |_| open.update(|v| *v = !*v)>"what's left out?"</button>
+            title="Show or hide the words in this book that are excluded from the ranking, with the reason for each. They appear below the word list."
+            on:click=move |_| open.update(|v| *v = !*v)>"excluded words"</button>
     }
 }
 
@@ -4649,9 +4649,9 @@ fn WordExamples(book_id: i64, word_id: i64, level: i64) -> impl IntoView {
                             .unwrap_or_default();
                         view! {
                             <p class="caps" title=searched>{if n < total {
-                                format!("{n} of {total} sentences using this word")
+                                format!("{n} of {total} sentences shown")
                             } else {
-                                format!("{n} sentences using this word")
+                                format!("{n} sentences shown")
                             }}</p>
                             <ul class="exlist">
                                 {set.examples.into_iter().map(|e| view! {
@@ -4970,8 +4970,8 @@ fn HomePage() -> impl IntoView {
     let show_tags = RwSignal::new(false);
     let list_sep = RwSignal::new("nl".to_string()); // "nl" | "sp" | "comma"
     let open_picker = RwSignal::new(None::<i64>);
-    // "what's left out?" — the exclusion report under the list. Closed by default;
-    // its queries scan the whole book, so nothing runs until it's opened.
+    // Whether the "excluded words" panel under the list is open. Closed by default:
+    // its queries scan the whole book, so they run only once the panel is opened.
     let excl_open = RwSignal::new(false);
 
     let tagger = Tagger {
@@ -5135,14 +5135,18 @@ fn HomePage() -> impl IntoView {
             <Show when=move || category.get().is_some() fallback=|| ()>
                 <button class="catx" title="clear category filter" on:click=move |_| set_cat.set(None)>"×"</button>
             </Show>
-            <select class="catsel viewsel" title="ranked = straight down the interestingness ranking; most in text = by how often the word appears in this book; by part of speech = 20 nouns, then 20 verbs, adjectives, adverbs, and round again; random = shuffled"
+            <select class="catsel viewsel"
+                title=move || {
+                    let n = pos_chunk.get();
+                    format!("ranked: most interesting first\nmost used in this book: highest count in this book first\nby part of speech: {n} nouns, {n} verbs, {n} adjectives, {n} adverbs, then repeat\nrandom: shuffled")
+                }
                 prop:value=move || view_q.get().unwrap_or_default()
                 on:change=move |ev| {
                     let v = event_target_value(&ev);
                     if v.is_empty() { set_view.set(None); } else { set_view.set(Some(v)); }
                 }>
                 <option value="">"view: ranked"</option>
-                <option value="count">"view: most in text"</option>
+                <option value="count">"view: most used in this book"</option>
                 <option value="pos">"view: by part of speech"</option>
                 <option value="random">"view: random"</option>
             </select>
@@ -5172,7 +5176,7 @@ fn HomePage() -> impl IntoView {
                 " hide rejected"
             </label>
             <button type="button" class="descbtn" class:on=move || compact.get()
-                title="a compact multi-column grid — word plus a small gloss"
+                title="compact grid: each word with a short gloss"
                 on:click=move |_| { compact.update(|v| *v = !*v); if compact.get_untracked() { show_list.set(false); } }>"▦ compact"</button>
             <div class="plwrap">
                 <button class="descbtn plmain" class:on=move || show_list.get()
@@ -5189,7 +5193,7 @@ fn HomePage() -> impl IntoView {
                         <label><input type="checkbox" prop:checked=move || show_tags.get()
                             on:change=move |_| { show_tags.update(|v| *v = !*v); show_list.set(true); }/>
                             " tags as #hashtags"</label>
-                        <div class="plmenu-seps">"separate with:"
+                        <div class="plmenu-seps">"separate words with:"
                             <label><input type="radio" name="plsep" prop:checked=move || list_sep.get() == "nl"
                                 on:change=move |_| { list_sep.set("nl".into()); show_list.set(true); }/>" newlines"</label>
                             <label><input type="radio" name="plsep" prop:checked=move || list_sep.get() == "sp"
@@ -6005,12 +6009,16 @@ fn CollectionPage() -> impl IntoView {
                 <option value="">"sort: default"</option>
                 <option value="interest">"sort: favourites first"</option>
                 <option value="az">"sort: A–Z"</option>
-                <option value="rare">"sort: rarest"</option>
-                <option value="count">"sort: most in text"</option>
+                <option value="rare">"sort: rarest in English"</option>
+                <option value="count">"sort: most used in your books"</option>
                 <option value="tags">"sort: most tags"</option>
                 <option value="books">"sort: most books"</option>
             </select>
-            <select class="catsel viewsel" title="ranked = the sort above, straight down; by part of speech = 20 nouns, then 20 verbs, adjectives, adverbs, and round again"
+            <select class="catsel viewsel"
+                title=move || {
+                    let n = pos_chunk.get();
+                    format!("ranked: in the order set by the sort menu\nby part of speech: {n} nouns, {n} verbs, {n} adjectives, {n} adverbs, then repeat")
+                }
                 prop:value=move || view_q.get().unwrap_or_default()
                 on:change=move |ev| {
                     let v = event_target_value(&ev);
@@ -6031,7 +6039,7 @@ fn CollectionPage() -> impl IntoView {
                 </select>
             </Show>
             <button type="button" class="descbtn" class:on=move || compact.get()
-                title="a compact multi-column grid — word plus a small detail"
+                title="compact grid: each word with a short gloss"
                 on:click=move |_| { compact.update(|v| *v = !*v); if compact.get_untracked() { show_list.set(false); } }>"▦ compact"</button>
             <div class="plwrap">
                 <button class="descbtn plmain" class:on=move || show_list.get()
@@ -6045,7 +6053,7 @@ fn CollectionPage() -> impl IntoView {
                         <label><input type="checkbox" prop:checked=move || show_tags.get()
                             on:change=move |_| { show_tags.update(|v| *v = !*v); show_list.set(true); }/>
                             " tags as #hashtags"</label>
-                        <div class="plmenu-seps">"separate with:"
+                        <div class="plmenu-seps">"separate words with:"
                             <label><input type="radio" name="clsep" prop:checked=move || list_sep.get() == "nl"
                                 on:change=move |_| { list_sep.set("nl".into()); show_list.set(true); }/>" newlines"</label>
                             <label><input type="radio" name="clsep" prop:checked=move || list_sep.get() == "sp"

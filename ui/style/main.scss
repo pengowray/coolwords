@@ -379,7 +379,7 @@ h1 { margin-bottom: 0; }
   color: #fff; background: #16a085; border-radius: 9px; padding: 0.05rem 0.45rem;
   vertical-align: 0.05rem;
 }
-/* in-book occurrence count in the verbarium (shown when sorting "most in text") */
+/* verbarium card: how many times the word occurs in its books */
 .cc-count {
   margin-left: 0.5rem; font-size: 0.8rem; color: #999; font-variant-numeric: tabular-nums;
 }
@@ -755,7 +755,7 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
 }
 .possec:first-of-type { margin-top: 0.4rem; }
 
-/* ---- "what's left out?" report (words page) ---- */
+/* ---- "excluded words" panel (words page) ---- */
 .counts .whybtn, .counts .listcopy { margin-left: 0.6rem; font-weight: 400; }
 .excl {
   border: 1px solid #8884; border-radius: 10px; background: #8881;
@@ -926,7 +926,7 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
   .booksel, .btagsel, .viewsel, .chunksel, .cat-q, .bfind { max-width: 100%; flex-basis: 100%; }
   .bfind-q { flex: 1 1 auto; }
   .bfind-hits { min-width: 0; width: 100%; }
-  /* the left-out table has four columns and a definition line; let it scroll
+  /* the excluded words table has four columns and a definition line; let it scroll
      sideways inside the panel rather than push the page wider */
   .excl { overflow-x: auto; }
   .excl-table { min-width: 26rem; }
