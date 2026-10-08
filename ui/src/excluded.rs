@@ -11,8 +11,8 @@
 //! distinct word in a book exactly one result: ranked, or the key of one reason from
 //! [`reasons`]. So the number of ranked words (`n_kept`) plus every reason's count
 //! always equals `books.n_types`. If `score.py` gains a test that `why_select`
-//! lacks, the words that the new test excludes pass every test in the `CASE` and
-//! are counted as ranked, and `n_kept` becomes larger than the sum of
+//! lacks, the words that only the new test excludes pass every test in the `CASE`
+//! and are counted as ranked, and `n_kept` becomes larger than the sum of
 //! `candidates.n_forms` for that book and merge level.
 //!
 //! # Matching the scorer
