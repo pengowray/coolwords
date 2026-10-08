@@ -873,24 +873,36 @@ pub(crate) fn migrate_user(u: &rusqlite::Connection) -> Result<(), ServerFnError
                 .map_err(|e| ServerFnError::new(e.to_string()))?;
         }
     }
-    // `value` on word_tags is the tri-state rating (NULL==1==applied). Nullable, no
-    // default, so legacy rows read as applied.
+    // `value` on word_tags: NULL = on, 0 = considered and declined, 1 or more = a
+    // rating level. Nullable with no default, so rows from before the column existed
+    // read as "on".
     let have_apps = cols("word_tags")?;
     if !have_apps.contains("value") {
         u.execute("ALTER TABLE word_tags ADD COLUMN value INTEGER", [])
             .map_err(|e| ServerFnError::new(e.to_string()))?;
     }
-    // One-time: the old default for a tapped-on tag was value=1; "on" is now the
-    // value-less NULL state, kept distinct from a scale level. Rewrite legacy 1s to
-    // NULL once — loss-free under the schema's documented NULL==1==applied equivalence
-    // — so an explicit level 1 could be reintroduced later without ambiguity. Gated on
-    // user_version so it runs once, not on every connection (which is every server fn).
+    // One-time data migrations, numbered by PRAGMA user_version so each runs once
+    // per DB rather than on every connection (every server fn opens one).
     let ver: i64 = u.query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(|e| ServerFnError::new(e.to_string()))?;
+    // 1: rows with value=1 were written by the old default for a tapped-on tag and
+    // mean "on", so they become NULL.
     if ver < 1 {
         u.execute("UPDATE word_tags SET value = NULL WHERE value = 1", [])
             .map_err(|e| ServerFnError::new(e.to_string()))?;
         u.execute("PRAGMA user_version = 1", [])
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+    }
+    // 2: a boolean tag has no levels, so a value of 1 or more on one means "on" and
+    // becomes NULL. `pick:` tags have no row in `tags`, so their rows are not changed.
+    if ver < 2 {
+        u.execute(
+            "UPDATE word_tags SET value = NULL
+             WHERE value >= 1 AND tag IN (SELECT name FROM tags WHERE kind = 'bool')",
+            [],
+        )
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        u.execute("PRAGMA user_version = 2", [])
             .map_err(|e| ServerFnError::new(e.to_string()))?;
     }
     Ok(())
@@ -2107,9 +2119,10 @@ pub async fn set_tag(book_id: i64, word_id: i64, tag: String, on: bool) -> Resul
 }
 
 /// Set a tag's tri-state value on a word: None removes the row (untagged); Some(0)
-/// records "considered & declined" (remembered, not applied); Some(n) applies at
-/// level n (clamped to the tag's scale ceiling). The application key follows the
-/// tag's scope exactly like set_tag.
+/// records "considered & declined" (remembered, not applied); Some(n) applies a
+/// scale tag at level n (lowered to the tag's top level if above it) and applies a
+/// boolean tag as plain "on" (NULL). The application key follows the tag's scope
+/// exactly like set_tag.
 #[server]
 pub async fn set_tag_value(
     book_id: i64,
@@ -2136,26 +2149,30 @@ pub async fn set_tag_value(
         .map_err(|e| ServerFnError::new(e.to_string()))?;
         ensure_parents(&conn, "u.tags", &tag)?;
     }
-    // clamp a positive level to this tag's scale ceiling (defensive).
-    let value = value.map(|v| {
+    // The value column to write (None = delete the row; Some(None) = NULL, "on"). A
+    // positive value is a level only on a scale tag, lowered to the tag's top level
+    // if above it; on a boolean tag it means "on".
+    let stored: Option<Option<i32>> = value.map(|v| {
         if v <= 0 {
-            v.max(0)
+            Some(0)
         } else if is_pick {
-            1
+            Some(1)
         } else {
-            let max: i64 = conn
-                .query_row("SELECT scale_max FROM u.tags WHERE name = ?1", [&tag], |r| r.get(0))
+            let (kind, max): (String, i64) = conn
+                .query_row("SELECT kind, scale_max FROM u.tags WHERE name = ?1", [&tag], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
                 .optional()
                 .ok()
                 .flatten()
-                .unwrap_or(1);
-            v.min(max.max(1) as i32)
+                .unwrap_or_else(|| ("bool".to_string(), 1));
+            (kind == "scale" && max > 1).then(|| v.min(max as i32))
         }
     });
     let Some((key_slug, word)) = apply_key(&conn, book_id, word_id, &tag)? else {
         return Err(ServerFnError::new("unknown book or word"));
     };
-    match value {
+    match stored {
         Some(v) => {
             conn.execute(
                 "INSERT INTO u.word_tags(book_slug, word, tag, rater, ts, value)
@@ -2748,8 +2765,8 @@ pub async fn set_tag_interest(name: String, interest: String) -> Result<(), Serv
 }
 
 /// Convert a tag between a plain boolean and a 1..scale_max scale. Shrinking a
-/// scale clamps any stored ratings above the new ceiling (bool clamps them to 1).
-/// `star` stays boolean.
+/// scale lowers any stored rating above the new top level to that level. Converting
+/// to a boolean sets every rated word to "on" (NULL). `star` stays boolean.
 #[server]
 pub async fn set_tag_scale(name: String, kind: String, scale_max: i64) -> Result<(), ServerFnError> {
     if name == "star" && kind == "scale" {
@@ -2757,11 +2774,18 @@ pub async fn set_tag_scale(name: String, kind: String, scale_max: i64) -> Result
     }
     let (kind, scale_max) = norm_kind(&kind, scale_max);
     let conn = open_user()?;
-    // Clamp existing ratings to the new ceiling (never touches 0/considered rows).
-    conn.execute(
-        "UPDATE word_tags SET value = ?1 WHERE tag = ?2 AND value > ?1",
-        rusqlite::params![scale_max, name],
-    )
+    // Neither statement changes 0 (considered and declined) rows.
+    if kind == "bool" {
+        conn.execute(
+            "UPDATE word_tags SET value = NULL WHERE tag = ?1 AND value >= 1",
+            rusqlite::params![name],
+        )
+    } else {
+        conn.execute(
+            "UPDATE word_tags SET value = ?1 WHERE tag = ?2 AND value > ?1",
+            rusqlite::params![scale_max, name],
+        )
+    }
     .map_err(|e| ServerFnError::new(e.to_string()))?;
     conn.execute(
         "UPDATE tags SET kind = ?1, scale_max = ?2 WHERE name = ?3",
