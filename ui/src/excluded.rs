@@ -270,7 +270,17 @@ pub fn ExcludedPanel(
     /// Opens a word's detail sheet, so a left-out word can still be read and tagged.
     set_word: SignalSetter<Option<i64>>,
 ) -> impl IntoView {
-    let reason = RwSignal::new(String::new());
+    // The reason chip the user clicked, with the book and merge level shown at the
+    // time. `reason` is that chip's reason while the same book and merge level are
+    // shown, and "" (all reasons) otherwise, because another book or merge level may
+    // have no words for that reason.
+    let chosen = RwSignal::new((0_i64, 0_i64, String::new()));
+    let reason = Memo::new(move |_| {
+        chosen.with(|(b, l, key)| {
+            if (*b, *l) == (book.get(), level.get()) { key.clone() } else { String::new() }
+        })
+    });
+    let choose = move |key: String| chosen.set((book.get_untracked(), level.get_untracked(), key));
     let sort = RwSignal::new("rare".to_string());
     // Both resources stay idle until the panel is opened — this is a whole-book
     // scan, and most visits to the words page never ask for it.
@@ -286,12 +296,6 @@ pub fn ExcludedPanel(
             if go { excluded_words(b, l, why, s).await } else { Ok(Vec::new()) }
         },
     );
-    // A book or level change invalidates the chosen bucket's counts, so start over
-    // on "all" rather than leave a chip selected that may no longer exist.
-    Effect::new(move |_| {
-        let _ = (book.get(), level.get());
-        reason.set(String::new());
-    });
 
     view! {
         <Show when=move || open.get() fallback=|| ()>
@@ -312,7 +316,7 @@ pub fn ExcludedPanel(
                                 <div class="excl-chips">
                                     <button type="button" class="excl-chip"
                                         class:on=move || reason.get().is_empty()
-                                        on:click=move |_| reason.set(String::new())>
+                                        on:click=move |_| choose(String::new())>
                                         "all reasons"
                                     </button>
                                     {rep.reasons.iter().map(|r| {
@@ -320,7 +324,7 @@ pub fn ExcludedPanel(
                                         view! {
                                             <button type="button" class="excl-chip" title=r.note.clone()
                                                 class:on=move || reason.get() == k2
-                                                on:click=move |_| reason.set(k.clone())>
+                                                on:click=move |_| choose(k.clone())>
                                                 {r.label.clone()}
                                                 <span class="excl-n">{commas(r.count)}</span>
                                             </button>
