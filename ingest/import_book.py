@@ -13,8 +13,9 @@ UI, ui/src/app.rs):
       trajectory). Refuses if a *different* book already has this content hash.
 
   python -m ingest.import_book --examples <slug> --words dog,dogs [--limit 20]
-      Every sentence in a committed book containing one of those surface forms.
-      Backs the word-detail sheet's "more examples" list.
+      Find the sentences in an imported book that contain any of the --words forms.
+      The JSON object lists the first --limit sentences (default 20, at most 40) and
+      the total number found. The word detail sheet's "more examples" list uses it.
 
 Keeping all extraction/segmentation/ingest here (not in Rust) means the import
 preview, the commit, and any future "view source" page share one code path.
@@ -347,6 +348,13 @@ def do_ocr_status(slug: str) -> dict:
     return out
 
 
+def _ocr_cache_pages(path: Path, text_source: str) -> tuple[str, dict[int, str]]:
+    """The OCR engine named by `text_source` ("ocr" or "ocr:<engine>"), and that
+    engine's cached text for the PDF at `path`, keyed by 0-based page number."""
+    eng = ocr.require_engine(text_source.split(":", 1)[1] if ":" in text_source else None)
+    return eng, {int(k): v for k, v in ocr.load_cache(path, eng)["pages"].items()}
+
+
 def do_reingest(slug: str, text_source: str, run_pipeline: bool = True) -> dict:
     """Re-tokenize a committed book from a chosen text source (embedded, or a cached
     OCR engine — no re-OCR), replace its histogram, and re-score. Preserves the
@@ -365,15 +373,14 @@ def do_reingest(slug: str, text_source: str, run_pipeline: bool = True) -> dict:
     pdf_ocr = None
     src_label = "embedded"
     if text_source.startswith("ocr"):
-        eng = ocr.require_engine(text_source.split(":", 1)[1] if ":" in text_source else None)
-        cache = ocr.load_cache(path, eng)
+        eng, pages = _ocr_cache_pages(path, text_source)
         embedded = extract_mod.pdf_page_texts(path)
-        if len(cache["pages"]) < len(embedded):
+        if len(pages) < len(embedded):
             con.close()
             return {"ok": False, "code": "OCR_INCOMPLETE",
                     "error": f"OCR cache for {eng} is incomplete "
-                             f"({len(cache['pages'])}/{len(embedded)} pages) — run OCR first."}
-        pdf_ocr = {int(k): v for k, v in cache["pages"].items()}
+                             f"({len(pages)}/{len(embedded)} pages) — run OCR first."}
+        pdf_ocr = pages
         src_label = f"ocr:{eng}"
 
     print("reingest: extract", file=sys.stderr, flush=True)
@@ -408,8 +415,9 @@ def do_reingest(slug: str, text_source: str, run_pipeline: bool = True) -> dict:
 
 
 def _source_file(slug: str) -> Path:
-    """The committed source file, falling back to the repo's `data/books` (where
-    CLI-imported books from before the web importer still live)."""
+    """The book's stored source file, BOOKS_DIR/<slug>.<ext>. If it is missing, the
+    repo's data/books/<slug>.<ext>, where books imported from the command line
+    before the web importer existed are kept."""
     try:
         return book_file(slug)
     except ExtractError:
@@ -424,12 +432,14 @@ _MAX_EXAMPLES = 40
 
 
 def do_examples(slug: str, words: str, limit: int) -> dict:
-    """Every sentence in a book containing any of `words` (comma-separated surface
-    forms), up to `limit`. `book_occurrences.example` only stores the FIRST one per
-    token; the word-detail sheet calls this to show the rest on demand.
+    """The sentences in a book that contain any of `words` (comma-separated surface
+    forms): the first `limit` of them, and the total number found.
+    `book_occurrences.example` stores only the first example sentence for each word
+    form, and the word detail sheet calls this function to show the others.
 
-    Re-extracts from the stored file using the same text source the book was
-    ingested from, so the sentences match the text that was actually analysed."""
+    The text is extracted again from the stored file, from the same text source
+    (embedded text or an OCR cache) that the book was imported from, so the
+    sentences match the text that was word-counted."""
     forms = [w.strip().lower() for w in words.split(",") if w.strip()]
     if not forms:
         raise ExtractError("no words given", code="NO_WORDS")
@@ -441,16 +451,14 @@ def do_examples(slug: str, words: str, limit: int) -> dict:
     con.close()
     text_source = (row[0] if row else None) or "embedded"
 
-    # Mirror do_reingest: an OCR-ingested PDF re-reads its OCR cache (never re-OCRs).
-    # A missing/short cache just falls back to the embedded layer — an example
-    # sentence isn't worth failing the whole panel over.
+    # For a PDF imported from OCR text, read the saved OCR cache, as do_reingest does.
+    # OCR is never run here. If the OCR engine is not available or its cache is empty,
+    # use the PDF's embedded text layer, so the word detail sheet still gets example
+    # sentences.
     pdf_ocr = None
     if text_source.startswith("ocr"):
         try:
-            eng = ocr.require_engine(text_source.split(":", 1)[1] if ":" in text_source else None)
-            cache = ocr.load_cache(path, eng)
-            if cache["pages"]:
-                pdf_ocr = {int(k): v for k, v in cache["pages"].items()}
+            pdf_ocr = _ocr_cache_pages(path, text_source)[1] or None
         except (ExtractError, OcrError):
             pdf_ocr = None
 
