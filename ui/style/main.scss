@@ -387,7 +387,8 @@ h1 { margin-bottom: 0; }
 /* ---- compact grid: a dense 2–3 column word list (word + a small gloss), a middle
    ground between the full cards and the plain-text export ---- */
 .cgrid {
-  /* ~18rem min keeps it to 2–3 columns in the 60rem content column (1 on a phone). */
+  /* Each column is at least 18rem wide, so the grid has 2–3 columns in the 60rem
+     content column and 1 on a phone. */
   display: grid; grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
   gap: 0.4rem; margin-top: 0.4rem;
 }
@@ -402,7 +403,8 @@ h1 { margin-bottom: 0; }
 .ccell-sub {
   color: #999; font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* words page uses reactive classes; verbarium uses the server-computed int-* */
+/* Interest colours. The words page sets .interesting and .rejected from the tag
+   store; the verbarium sets an int-<interest> class from the interest the server sends. */
 .ccell.interesting, .ccell.int-interesting { background: #16a0850f; border-color: #16a08533; }
 .ccell.rejected { opacity: 0.55; }
 .ccell.rejected .ccell-word { text-decoration: line-through; }
@@ -789,7 +791,8 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
   display: block; font-size: 0.8rem; color: #999; max-width: 26rem;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* tokens with no dictionary entry can't be opened — say so by not offering */
+/* a word that is not in the dictionary has no detail sheet, so it is shown in grey
+   italics instead of as a clickable word */
 .excl-oov { color: #888; font-style: italic; }
 .excl-head { color: #888; }
 .excl-why { color: #888; }

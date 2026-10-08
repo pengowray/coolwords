@@ -561,7 +561,8 @@ pub struct Candidate {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CandidatePage {
     pub items: Vec<Candidate>,
-    /// Candidates matching the current category filter, before the display cap.
+    /// Number of candidates that match the current category filter, before the
+    /// `limit` passed to get_candidates.
     pub total: i64,
 }
 
@@ -1657,8 +1658,9 @@ pub async fn get_candidates(
             .collect(),
     };
 
-    // How many matched before the display cap — the SQL path counts with the same
-    // WHERE, the trajectory path counts what survived classification.
+    // Number of candidates that match, before the limit. Without an era or obsolete
+    // filter, it is the page length or, when the page is full, a count query with the
+    // same WHERE. With one, it is the number of candidates left after classification.
     let mut total = out.len() as i64;
 
     if needs_traj {
@@ -1972,16 +1974,19 @@ pub struct BookExample {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExampleSet {
     pub examples: Vec<BookExample>,
-    /// Sentences found in the whole book — `examples` is capped, this is not.
+    /// Number of matching sentences in the whole book. `examples` has at most
+    /// `limit` of them.
     pub total: i64,
-    /// The surface forms searched for (the merged group at the current level).
+    /// The surface forms searched for: the headword and the forms merged into it at
+    /// the current merge level.
     pub forms: Vec<String>,
 }
 
-/// Sentences from the book for a word (and, at merge levels above none, its merged
-/// forms). Only ONE example per token is stored at ingest time, so this re-reads the
-/// book's stored file through the Python extractor — a few hundred ms, hence it runs
-/// on demand behind the "more examples" button rather than with the word detail.
+/// Sentences from the book that use a word or, when the merge level is not "none",
+/// any form merged into it. Ingest stores one example sentence per word form, so this
+/// reads the book's stored text again through the Python extractor. That takes a few
+/// hundred ms, so it runs only when the "more examples from this book" button is
+/// clicked.
 #[server]
 pub async fn word_examples(
     book_id: i64,
@@ -2016,8 +2021,9 @@ pub async fn word_examples(
         .map_err(|e| ServerFnError::new(e.to_string()))?
         .filter_map(Result::ok)
         .collect();
-    // The headword itself may not occur in the book (a merged lemma like "sev"),
-    // but searching for it costs nothing and keeps the list honest.
+    // At merge levels 1-3 the book may contain the forms merged into the headword but
+    // not the headword itself. It is searched for anyway, so the "searched for:"
+    // tooltip includes the headword shown on the detail sheet.
     if let Some(hw) = conn
         .query_row("SELECT word FROM words WHERE id = ?1", [word_id], |r| r.get::<_, String>(0))
         .optional()
@@ -2035,8 +2041,9 @@ pub async fn word_examples(
     let lim = limit.clamp(1, 40).to_string();
     let v = run_importer(&["--examples", &slug, "--words", &joined, "--limit", &lim]).map_err(
         |e| {
-            // book_file()'s NO_FILE text names an internal directory; say the useful
-            // part instead (same situation the "view stripping" page explains).
+            // book_file()'s NO_FILE error text includes an internal directory path, so
+            // the user sees this message instead. The "view stripping" page shows a
+            // similar message when the same file is missing.
             if e.to_string().contains("no stored file") {
                 ServerFnError::new(
                     "This book's text file is no longer stored. Re-import the book to read more examples.",
@@ -4556,9 +4563,9 @@ fn WordCard(
     }
 }
 
-/// A failed server call as the user should read it. Leptos prefixes every
-/// `ServerFnError` with "error running server function: ", which is about our
-/// plumbing and tells the reader nothing they can act on.
+/// The error message to show the user: the error's text without the
+/// "error running server function: " prefix that Leptos adds to every
+/// `ServerFnError`.
 pub fn err_text<E: std::fmt::Display>(e: &E) -> String {
     let s = e.to_string();
     s.strip_prefix("error running server function: ").unwrap_or(&s).to_string()
@@ -4642,8 +4649,9 @@ fn WordExamples(book_id: i64, word_id: i64, level: i64) -> impl IntoView {
                         view! { <p class="caps">"no sentences found in this book's stored text"</p> }.into_any(),
                     Ok(Some(set)) => {
                         let (n, total) = (set.examples.len() as i64, set.total);
-                        // At a merge level the sentences can use any form in the group,
-                        // so name them rather than leave a "dogs" quote unexplained.
+                        // When forms are merged, a sentence can use any form in the
+                        // group (for example "dogs" for "dog"), so the heading's tooltip
+                        // lists every form searched for.
                         let searched = (set.forms.len() > 1)
                             .then(|| format!("searched for: {}", set.forms.join(", ")))
                             .unwrap_or_default();
@@ -4672,8 +4680,9 @@ fn WordExamples(book_id: i64, word_id: i64, level: i64) -> impl IntoView {
     }
 }
 
-/// "Herman Melville · 1851" for a book, skipping whichever half is missing.
-/// EPUB metadata separates co-authors with semicolons; read as a list instead.
+/// The byline for a book, such as "Herman Melville · 1851". If the author or the year
+/// is missing, the byline has only the other one. EPUB metadata separates co-authors
+/// with semicolons, and this replaces each semicolon with a comma.
 fn byline(author: &Option<String>, year: Option<i64>) -> String {
     let a = author.as_deref().unwrap_or("").trim().replace("; ", ", ").replace(';', ", ");
     match (a.is_empty(), year) {
@@ -4698,8 +4707,9 @@ fn BookSearch(
 ) -> impl IntoView {
     const MAX_HITS: usize = 12;
     let q = RwSignal::new(String::new());
-    // Mirror the loaded list into a plain signal: the results render and the Enter
-    // key handler both need it, and a resource read in either spot comes back empty.
+    // Copy the loaded book list into a plain signal. Both the results list and the
+    // Enter key handler need the book list, and reading the resource in either place
+    // returns nothing.
     let all = RwSignal::new(Vec::<Book>::new());
     Effect::new(move |_| {
         if let Some(Ok(list)) = books.get() {
@@ -4722,7 +4732,7 @@ fn BookSearch(
     };
     let open = move |id: i64| {
         set_book.set(Some(id));
-        set_word.set(None); // a new book's word ids mean nothing here
+        set_word.set(None); // close the open word, which may not be in the new book
         q.set(String::new());
     };
     view! {
@@ -4869,7 +4879,7 @@ fn BookSelect(
                 let pick = move |ev: web_sys::Event| {
                     if let Ok(id) = event_target_value(&ev).parse::<i64>() {
                         set_book.set(Some(id));
-                        set_word.set(None); // a new book's word ids mean nothing here
+                        set_word.set(None); // close the open word, which may not be in the new book
                     }
                 };
                 view! {
@@ -5234,8 +5244,8 @@ fn HomePage() -> impl IntoView {
                     let total = list.len();
                     let chunk = pos_chunk.get();
                     let by_pos = pos_view.get();
-                    // Plain-text mode: each word on its own line (in the shown order),
-                    // optionally with its merged forms (`dog/dogs`) and/or its tags as
+                    // Plain-text mode: the words in the shown order, each optionally
+                    // with its merged forms (`dog/dogs`) and/or its tags as
                     // `#hashtag[:value]`, joined by the chosen separator, with a copy button.
                     if show_list.get() {
                         let forms_on = show_forms.get();
@@ -6095,16 +6105,18 @@ fn CollectionPage() -> impl IntoView {
                     let count = list.len();
                     let chunk = pos_chunk.get();
                     let by_pos = pos_view.get();
-                    // Plain-text mode: one headword per line (optionally with its tags as
-                    // `#hashtags`), joined by the chosen separator, with a copy button. In
-                    // the POS view the sections become `# nouns` comment lines, but only in
-                    // the newline flavour (a heading in a comma-run would read as a word).
+                    // Plain-text mode: the words, each optionally followed by its tags as
+                    // `#hashtags`, joined by the chosen separator (newline, space or
+                    // comma), with a copy button. In the by-part-of-speech view each
+                    // section starts with a heading line such as `# nouns`, but only when
+                    // the separator is newline: in space- or comma-separated text a
+                    // heading would look like another word.
                     if show_list.get() {
                         let tags_on = show_tags.get();
                         let line = |e: &CollectionEntry| -> String {
                             if !tags_on { return e.word.clone(); }
-                            // exclude the ★ quick-favourite marker + pick: buckets, matching
-                            // the words page's group_tag_values export.
+                            // Leave out the ★ quick-favourite tag and all `pick:` tags, as
+                            // the words page's export (group_tag_values) does.
                             let hs = e.tags.iter()
                                 .filter(|(n, _)| n != "star" && !n.starts_with("pick:"))
                                 .map(|(n, _)| hashtag(n, e.tag_values.get(n).copied().unwrap_or(TAG_ON)))
