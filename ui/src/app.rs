@@ -580,6 +580,8 @@ pub struct WordInfo {
     pub origin_name: Option<String>,
     pub freq_pm: Option<f64>,
     pub syllables: Option<i64>,
+    /// Times the word and the forms merged into it at the current merge level occur
+    /// in the book.
     pub in_book: i64,
     pub example: Option<String>,
     pub book_year: Option<i64>,
@@ -1745,17 +1747,30 @@ pub async fn word_detail(book_id: i64, word_id: i64, level: i64) -> Result<WordI
     use rusqlite::{Connection, OptionalExtension};
     let conn = Connection::open(db_path()).map_err(|e| ServerFnError::new(e.to_string()))?;
 
+    // in_book is the merged group's count, the same number as the word list's "N×":
+    // the candidate row's count, or for a word that is not a candidate at this level,
+    // the sum over the word and every in-book form that merges into it.
     let (word, gloss, origin_code, origin_name, freq_pm, syllables, stem, in_book, example, book_year):
         (String, Option<String>, Option<String>, Option<String>, Option<f64>, Option<i64>,
          Option<String>, i64, Option<String>, Option<i64>) = conn
         .query_row(
             "SELECT w.word, w.gloss, w.etymology_lang, ln.name, w.freq_pm, w.syllables, w.stem,
-                    COALESCE(bo.count, 0), bo.example, (SELECT year FROM books WHERE id = ?1)
+                    COALESCE(
+                        (SELECT c.in_book FROM candidates c
+                          WHERE c.book_id = ?1 AND c.level = ?3 AND c.word_id = ?2),
+                        (SELECT SUM(g.count) FROM book_occurrences g
+                          WHERE g.book_id = ?1 AND (
+                              g.word_id = ?2
+                              OR EXISTS (SELECT 1 FROM word_lemma wl
+                                         WHERE wl.word_id = g.word_id AND wl.level = ?3
+                                           AND wl.lemma_id = ?2))),
+                        0),
+                    bo.example, (SELECT year FROM books WHERE id = ?1)
              FROM words w
              LEFT JOIN lang_names ln ON ln.code = w.etymology_lang
              LEFT JOIN book_occurrences bo ON bo.word_id = w.id AND bo.book_id = ?1
              WHERE w.id = ?2",
-            (book_id, word_id),
+            (book_id, word_id, level),
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
                     r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
         )
@@ -5290,8 +5305,9 @@ fn HomePage() -> impl IntoView {
                                     <li>{format!("syllables: {}", d.syllables.map(|n| n.to_string()).unwrap_or_default())}</li>
                                     <li>{format!("origin: {origin}")}</li>
                                 </ul>
-                                // One quote already sits at the top of the picker; this
-                                // fetches the rest, and only for a word used more than once.
+                                // The tag picker above already shows one example sentence.
+                                // The "more examples" button appears only when the word and
+                                // its merged forms occur more than once in the book.
                                 {(d.in_book > 1).then(|| view! {
                                     <WordExamples book_id=b word_id=wid level=level.get()/>
                                 })}
