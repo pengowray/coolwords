@@ -727,10 +727,13 @@ button.commit:disabled { background: #8886; border-color: #8886; cursor: not-all
 .btagsel { max-width: 12rem; }
 .viewsel, .chunksel { max-width: 14rem; }
 
-/* Book search: a search box with a list of matching books under it. The list covers
-   the word list, with a z-index below the detail modal's (40 and 41). The search box
-   has a higher z-index than the click-away layer (.plmenu-backdrop, z-index 19), so a
-   click in the box moves the cursor and keeps the search text. */
+/* Book search: a search box (.bfind-q) with the list of matching books (.bfind-hits)
+   under it. The list of matching books has z-index 20, so it covers the word list and
+   stays below the detail modal (backdrop z-index 40, panel z-index 41). While the list
+   of matching books is open, a click elsewhere on the page lands on the click-away
+   layer (.plmenu-backdrop, z-index 19), which clears the search. The search box also
+   has z-index 20, above the click-away layer, so a click in the box moves the cursor
+   and keeps the search text. */
 .bfind { position: relative; display: inline-flex; }
 .bfind-q { flex: 0 1 11rem; min-width: 7rem; position: relative; z-index: 20; }
 .bfind-hits {

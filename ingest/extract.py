@@ -206,7 +206,8 @@ _TOC_ENTRY = re.compile(
 _TOC_WINDOW = 30000   # only look for a CONTENTS heading in the first ~30k chars of the body
 _TRANSCRIBER = re.compile(r"\n[ \t]*\r?\n[ \t]*(?:\*\s*)?Transcriber'?s?\s+Notes?\b", re.I)
 # A transcriber's note is removed only when it starts in the last 20% of the text
-# before the licence footer, or before the end of the body when there is no footer.
+# before the licence footer or, when there is no licence footer, in the last 20% of
+# the body.
 _TAIL_NOTE_SHARE = 0.2
 
 # Headings of the Project Gutenberg licence. They are searched for only when the
@@ -263,9 +264,11 @@ def _subsegment_body(body: str, end_marker_found: bool = False) -> list[Segment]
     if sp := _SMALL_PRINT.search(rest):
         block = Segment("gutenberg-licence", False, rest[sp.start(): sp.end()],
                         "Project Gutenberg 'Small Print!' legal block")
-        # Keep the text on the other side of the block exactly as it is, even if it is
-        # not part of the book (_extract_txt drops it if it is blank), so the segments
-        # still join back into `body`.
+        # The text on the other side of the block (before a block at the top, after a
+        # block at the bottom) becomes a kept "body" segment, even when that text is
+        # not part of the book. _extract_txt removes the segment only when its text is
+        # blank. The segment contains the text unchanged, so the segments still join
+        # back into `body`.
         if sp.start() < len(rest) - sp.end():
             out += [Segment("body", True, rest[: sp.start()]), block]
             rest = rest[sp.end():]

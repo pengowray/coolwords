@@ -60,7 +60,9 @@ pub fn now() -> String {
 }
 
 /// The body served at `/version`: version, build time, start time, and the current
-/// time. Open it through the sidebar or the tunnel to see which build is running.
+/// time. To see which build is running, add `/version` to the end of the Home
+/// Assistant sidebar panel's URL, or open `/version` through the Cloudflare tunnel
+/// (see LOCAL.md).
 pub fn report() -> String {
     format!(
         "coolwords {version}\nbuilt   {built}\nstarted {started}\nnow     {now}\n",

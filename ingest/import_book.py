@@ -13,9 +13,10 @@ UI, ui/src/app.rs):
       trajectory). Refuses if a *different* book already has this content hash.
 
   python -m ingest.import_book --examples <slug> --words dog,dogs [--limit 20]
-      Find the sentences in an imported book that contain any of the --words forms.
-      The JSON object lists the first --limit sentences (default 20, at most 40) and
-      the total number found. The word detail sheet's "more examples" list uses it.
+      Find the sentences in an imported book that contain any of the --words forms,
+      and print a JSON object with the first --limit sentences (default 20, at most
+      40) and the total number of sentences found. The "more examples from this
+      book" button in the word detail sheet runs this command.
 
 Keeping all extraction/segmentation/ingest here (not in Rust) means the import
 preview, the commit, and any future "view source" page share one code path.
@@ -349,8 +350,11 @@ def do_ocr_status(slug: str) -> dict:
 
 
 def _ocr_cache_pages(path: Path, text_source: str) -> tuple[str, dict[int, str]]:
-    """The OCR engine named by `text_source` ("ocr" or "ocr:<engine>"), and that
-    engine's cached text for the PDF at `path`, keyed by 0-based page number."""
+    """The OCR engine for `text_source`, and that engine's cached text for the PDF at
+    `path` as a dict keyed by 0-based page number. `text_source` is "ocr:<engine>",
+    or "ocr" for the engine that ocr.default_engine() picks. The dict is empty when
+    the engine has no cached pages for the PDF. Raises OcrError when the engine is
+    unknown or not installed."""
     eng = ocr.require_engine(text_source.split(":", 1)[1] if ":" in text_source else None)
     return eng, {int(k): v for k, v in ocr.load_cache(path, eng)["pages"].items()}
 

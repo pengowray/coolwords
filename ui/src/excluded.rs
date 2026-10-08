@@ -31,11 +31,16 @@
 //! | `score_group`: `length < MIN_LEN`           | `short`       |
 //! | `score_group`: `freq_comb > MAX_FREQ_PM_LC` | `common`      |
 //!
-//! `score_group` checks `not alpha`, `not inwikt`, `formof`, `proper` and
-//! `offensive` in a single `or` and returns `None` without recording which of
-//! those tests excluded the word. The order of `nowikt`, `formof`, `proper` and
-//! `offensive` in the `CASE` is this module's choice: a word that fails more than
-//! one of them gets the reason that comes first in the table.
+//! `score_group` has five tests in a single `or`: `not alpha`, `not inwikt`,
+//! `formof`, `proper` and `offensive`, each on the word that the book's word is
+//! merged into. When any of the five tests is true, `score_group` returns `None`
+//! without recording which test excluded the word. So the order of the `CASE` keys
+//! for four of those tests (`nowikt`, `formof`, `proper` and `offensive`) is this
+//! module's choice: a word excluded by more than one of these four tests gets the
+//! key that comes first in the table. The `CASE` has no key for `score_group`'s
+//! `not alpha` test. The `nonalpha` key matches the `occ` query's
+//! `w.alpha_only = 1` test on the word as it appears in the book, and the `CASE`
+//! tests `nonalpha` before every `score_group` test.
 //!
 //! `nodict` and `nonalpha` test the word as it appears in the book. Every later test
 //! reads the word that the book's word is merged into at the current merge level,

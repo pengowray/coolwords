@@ -594,8 +594,8 @@ pub struct WordInfo {
     pub origin_name: Option<String>,
     pub freq_pm: Option<f64>,
     pub syllables: Option<i64>,
-    /// Times the word and the forms merged into it at the current merge level occur
-    /// in the book.
+    /// Number of times the word occurs in the book, including the forms merged into
+    /// the word at the current merge level.
     pub in_book: i64,
     pub example: Option<String>,
     pub book_year: Option<i64>,
@@ -907,8 +907,10 @@ pub(crate) fn migrate_user(u: &rusqlite::Connection) -> Result<(), ServerFnError
         u.execute("PRAGMA user_version = 1", [])
             .map_err(|e| ServerFnError::new(e.to_string()))?;
     }
-    // 2: a boolean tag has no levels, so a value of 1 or more on one means "on" and
-    // becomes NULL. `pick:` tags have no row in `tags`, so their rows are not changed.
+    // 2: a boolean tag has no levels, so a `word_tags` value of 1 or more for a
+    // boolean tag means "on" and becomes NULL. The query finds boolean tags by their
+    // row in `tags` (kind 'bool'). `pick:` tags have no row in `tags`, so their
+    // `word_tags` rows keep their values.
     if ver < 2 {
         u.execute(
             "UPDATE word_tags SET value = NULL
@@ -1567,8 +1569,9 @@ pub async fn list_categories(book_id: i64, level: i64) -> Result<Vec<FilterOpt>,
 }
 
 /// One page of a book's candidates at a merge level, filtered by `category`. The
-/// page holds the first `limit` in rank order, or, with `by_count`, the `limit` with
-/// the highest count in the book (ties in rank order).
+/// page has the first `limit` candidates in rank order or, when `by_count` is set,
+/// the `limit` candidates with the highest count in the book, with ties in rank
+/// order.
 #[server]
 pub async fn get_candidates(
     book_id: i64,
@@ -1608,8 +1611,11 @@ pub async fn get_candidates(
     }
 
     // trajectory filters need every candidate (to classify), so fetch unbounded
-    // and truncate after filtering; otherwise push the limit into SQL. Both paths
-    // keep this ORDER BY, so the truncate also keeps the top of the chosen order.
+    // and truncate after filtering; otherwise push the limit into SQL. The query
+    // with LIMIT and the query without it both sort by `order_sql` (rank order or,
+    // when `by_count` is set, highest count in the book first), so after a
+    // trajectory filter, `out.truncate` keeps the first `limit` candidates in that
+    // order.
     let limit_sql = if needs_traj { String::new() } else { format!(" LIMIT {}", limit.max(0)) };
     let order_sql = if by_count { "c.in_book DESC, c.rank" } else { "c.rank" };
     let sql = format!(
@@ -2350,7 +2356,10 @@ pub async fn collection_words(filter: Option<String>) -> Result<Vec<CollectionEn
             });
         }
         let acc = by_word.get_mut(&word).unwrap();
-        // Seeded with TAG_ON, as in group_tag_values, so any rating level wins the max.
+        // acc.values keeps the highest value for each tag. A tag's entry starts at
+        // TAG_ON (-1), as in group_tag_values, so the entry stays TAG_ON when every row
+        // for the tag is "on", and becomes the highest rating level (1 or more)
+        // otherwise. The query has already dropped declined rows (value 0).
         let best = acc.values.entry(tagname.clone()).or_insert(TAG_ON);
         *best = (*best).max(value_from_db(value));
         if book_slug == "*" && !acc.global_tags.iter().any(|(n, _)| n == &tagname) {
@@ -5036,10 +5045,11 @@ fn HomePage() -> impl IntoView {
 
     let categories = Resource::new(move || (book.get(), level.get()), |(b, l)| list_categories(b, l));
     let candidates = Resource::new(
-        // The varied top-20 are near the top of the ranking but can occur only once
-        // in the book. So when "varied top-20 only" is on, get_candidates returns the
-        // page in rank order, which contains all 20, and the list below sorts the 20
-        // by count.
+        // The varied top-20 words are near the top of the ranking, but some of them
+        // occur only once in the book, so a page of the 400 candidates with the
+        // highest counts might leave those words out. When "varied top-20 only" is
+        // on, get_candidates returns the page in rank order instead, which contains
+        // all 20 words, and the list below sorts the 20 words by count.
         move || (book.get(), category.get(), level.get(), count_view.get() && !only_top.get()),
         move |(b, cat, l, by_count)| get_candidates(b, cat, 400, l, by_count),
     );
