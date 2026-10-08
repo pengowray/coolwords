@@ -69,4 +69,9 @@ ENV LEPTOS_OUTPUT_NAME=coolwords_ui \
     LEPTOS_SITE_ROOT=/app/site \
     LEPTOS_SITE_PKG_DIR=pkg \
     LEPTOS_ENV=PROD
+# Keep this step last. It writes the image's build time to /app/BUILT_AT, which
+# ui/src/buildinfo.rs reads for the startup log and /version. Docker reruns this step
+# whenever an earlier step in this stage misses the layer cache, which happens when the
+# server binary or site, run.sh, or any file under ingest/ or schema/ changes.
+RUN date -u +%Y-%m-%dT%H:%M:%SZ > /app/BUILT_AT
 CMD [ "/run.sh" ]

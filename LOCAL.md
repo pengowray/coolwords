@@ -105,19 +105,26 @@ install is still registered and editing files won't switch it to local-build. Re
 Bumping `version:` in the root `config.yaml` isn't required for local rebuilds, but if
 you do bump it HA will surface a normal **Update** button too.
 
-### Did the rebuild take?
-HA's add-on log shows neither dates nor versions, so a log full of restarts can't tell
-you which build is answering. Two places now say:
+### Checking which build is running
+Home Assistant's add-on log has no timestamps or version numbers, so the server
+reports its version and build time in two places:
 
-- the **first line of the log** on every start:
+- **The log**, on every start: the `[coolwords] <version> (built ...)` line right
+  after the `[coolwords] starting on ...` line, for example
   `[coolwords] 0.1.0 (built 2026-08-05T01:23:45Z) starting at 2026-08-05T01:24:02Z`
-- **`/version`** on the running server — open it from the sidebar panel URL (append
-  `/version`) or through the tunnel at `https://words.ffff.network/version`. It answers
-  in plain text with the version, build time, start time, and the current time, so it
-  also tells you how long the process has been up.
+- **`/version`** on the running server. Open it from the sidebar panel URL (append
+  `/version`) or through the tunnel at `https://words.ffff.network/version`. It
+  returns plain text with the version, build time, start time and current time, so
+  you can also see how long the server has been running.
 
-If "built" is older than your rebuild, the Supervisor served a cached image: rebuild
-again, or bump `version:` in `config.yaml` first.
+All times are UTC. "built" is the time of the last rebuild that changed a file in
+the image, such as after an edit under `ui/`, `ingest/` or `schema/`, or to
+`coolwords/run.sh`. A rebuild with no changed files keeps the earlier time, so if
+"built" is older than your latest rebuild, your changes probably did not reach
+`/addons/coolwords/` on the box. Check the files there and rebuild again.
+
+The version number comes from `ui/Cargo.toml`. Bumping `version:` in `config.yaml`
+changes neither the version number nor "built".
 
 ---
 

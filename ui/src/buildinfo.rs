@@ -1,13 +1,14 @@
-//! Which build is this, and how old is the log?
+//! The running server's version, build time and start time.
 //!
-//! An add-on log with no dates and no version can't answer "did my rebuild actually
-//! take?" — so the server announces both at startup and serves them at `/version`.
-//! The build time is the server binary's own mtime, which the Docker build sets when
-//! it compiles: no build script, no extra dependency, and nothing to remember to bump.
+//! Home Assistant's add-on log has no timestamps or version numbers, so the server
+//! logs these three values at startup and serves them, with the current time, at
+//! `/version`. In the Docker image the build time comes from `BUILT_AT`, a file next
+//! to the binary that the Dockerfile writes in its last step. A local `cargo` build
+//! has no such file and uses the binary's mtime instead.
 //!
-//! Timestamps are UTC and formatted by hand (`SystemTime` -> ISO 8601) rather than by
-//! pulling in `chrono`/`time`. A new dependency would invalidate the Dockerfile's
-//! dependency layer, and that layer is the expensive one — see the comment on it.
+//! Timestamps are UTC and formatted by hand (`SystemTime` -> ISO 8601) instead of with
+//! `chrono` or `time`. A new dependency would invalidate the Dockerfile's dependency
+//! layer, which is the slowest layer to rebuild (see the comment on that layer).
 
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,17 +18,33 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// distinguishes builds either way.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// When this binary was compiled, as UTC ISO 8601, or `"unknown"` if the executable's
-/// mtime can't be read.
+/// The build time, as UTC ISO 8601: the contents of the `BUILT_AT` file next to the
+/// executable if there is one (the Docker image has one), otherwise the executable's
+/// mtime. `"unknown"` if neither can be read.
 pub fn built_at() -> &'static str {
     static BUILT: OnceLock<String> = OnceLock::new();
     BUILT.get_or_init(|| {
-        std::env::current_exe()
-            .and_then(std::fs::metadata)
-            .and_then(|m| m.modified())
-            .map(iso8601_utc)
-            .unwrap_or_else(|_| "unknown".to_string())
+        let Ok(exe) = std::env::current_exe() else {
+            return "unknown".to_string();
+        };
+        std::fs::read_to_string(exe.with_file_name("BUILT_AT"))
+            .ok()
+            .and_then(|contents| built_at_from(&contents))
+            .or_else(|| {
+                std::fs::metadata(&exe)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(iso8601_utc)
+            })
+            .unwrap_or_else(|| "unknown".to_string())
     })
+}
+
+/// The build time in a `BUILT_AT` file's contents, trimmed, or `None` if the file is
+/// blank.
+fn built_at_from(contents: &str) -> Option<String> {
+    let trimmed = contents.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// When this process started, as UTC ISO 8601. Fixed on first call, so call it once
@@ -43,7 +60,7 @@ pub fn now() -> String {
 }
 
 /// The body served at `/version`: version, build time, start time, and the current
-/// time. Reading it through the sidebar or the tunnel confirms *which* build answered.
+/// time. Open it through the sidebar or the tunnel to see which build is running.
 pub fn report() -> String {
     format!(
         "coolwords {version}\nbuilt   {built}\nstarted {started}\nnow     {now}\n",
@@ -100,5 +117,15 @@ mod tests {
         assert_eq!(at(951_782_400), "2000-02-29T00:00:00Z"); // leap day, century leap
         assert_eq!(at(1_754_352_000), "2025-08-05T00:00:00Z");
         assert_eq!(at(1_754_352_000 + 45_296), "2025-08-05T12:34:56Z");
+    }
+
+    #[test]
+    fn reads_built_at_file_contents() {
+        assert_eq!(
+            built_at_from("2026-08-05T01:23:45Z\n").as_deref(),
+            Some("2026-08-05T01:23:45Z")
+        );
+        assert_eq!(built_at_from(" \n"), None);
+        assert_eq!(built_at_from(""), None);
     }
 }
