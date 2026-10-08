@@ -1552,12 +1552,16 @@ pub async fn list_categories(book_id: i64, level: i64) -> Result<Vec<FilterOpt>,
     Ok(out)
 }
 
+/// One page of a book's candidates at a merge level, filtered by `category`. The
+/// page holds the first `limit` in rank order, or, with `by_count`, the `limit` with
+/// the highest count in the book (ties in rank order).
 #[server]
 pub async fn get_candidates(
     book_id: i64,
     category: Option<String>,
     limit: i32,
     level: i64,
+    by_count: bool,
 ) -> Result<CandidatePage, ServerFnError> {
     let conn = open_conn()?;
     let tags = load_tags(&conn, book_id)?;
@@ -1590,8 +1594,10 @@ pub async fn get_candidates(
     }
 
     // trajectory filters need every candidate (to classify), so fetch unbounded
-    // and truncate after filtering; otherwise push the limit into SQL.
+    // and truncate after filtering; otherwise push the limit into SQL. Both paths
+    // keep this ORDER BY, so the truncate also keeps the top of the chosen order.
     let limit_sql = if needs_traj { String::new() } else { format!(" LIMIT {}", limit.max(0)) };
+    let order_sql = if by_count { "c.in_book DESC, c.rank" } else { "c.rank" };
     let sql = format!(
         "SELECT w.id, w.word, c.in_book, c.score, w.gloss, w.etymology_lang, ln.name,
                 w.wordnet_category, c.cluster, c.selected, bo.example, c.n_forms
@@ -1600,7 +1606,7 @@ pub async fn get_candidates(
          LEFT JOIN lang_names ln ON ln.code = w.etymology_lang
          LEFT JOIN book_occurrences bo ON bo.book_id = c.book_id AND bo.word_id = c.word_id
          WHERE c.book_id = ?1 AND c.level = ?2{where_extra}
-         ORDER BY c.rank{limit_sql}"
+         ORDER BY {order_sql}{limit_sql}"
     );
 
     let mut stmt = conn.prepare(&sql).map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -4893,7 +4899,8 @@ fn HomePage() -> impl IntoView {
     // once; the ↻ button bumps it for a fresh order. Server + client shuffle the same
     // seeded way, so a shuffled list still hydrates cleanly.
     let rand_view = Memo::new(move |_| view_q.get().as_deref() == Some("random"));
-    // "most in text": order the list by in-book occurrence count instead of rank.
+    // "most used in this book": the words with the highest count in this book,
+    // highest first, instead of the top of the ranking.
     let count_view = Memo::new(move |_| view_q.get().as_deref() == Some("count"));
     let shuffle_seed = RwSignal::new(1u64);
     // Jump to a random book. A bumped nonce (mixed with the current book id so the
@@ -4955,8 +4962,12 @@ fn HomePage() -> impl IntoView {
 
     let categories = Resource::new(move || (book.get(), level.get()), |(b, l)| list_categories(b, l));
     let candidates = Resource::new(
-        move || (book.get(), category.get(), level.get()),
-        move |(b, cat, l)| get_candidates(b, cat, 400, l),
+        // The varied top-20 are near the top of the ranking but can occur only once
+        // in the book. So when "varied top-20 only" is on, get_candidates returns the
+        // page in rank order, which contains all 20, and the list below sorts the 20
+        // by count.
+        move || (book.get(), category.get(), level.get(), count_view.get() && !only_top.get()),
+        move |(b, cat, l, by_count)| get_candidates(b, cat, 400, l, by_count),
     );
     let detail = Resource::new(
         move || (book.get(), selected.get(), level.get()),
@@ -5163,14 +5174,14 @@ fn HomePage() -> impl IntoView {
                     if rand_view.get() {
                         shuffle_seeded(&mut list, shuffle_seed.get());
                     } else if count_view.get() {
-                        // "most in text": by in-book occurrence count, ties by rank (input order).
+                        // Highest count in the book first, ties in rank order. The server
+                        // already returns the page in this order unless "varied top-20
+                        // only" is on.
                         list.sort_by(|a, b| b.in_book.cmp(&a.in_book));
                     }
                     let total = list.len();
                     let chunk = pos_chunk.get();
-                    // these flat orderings are mutually exclusive with by-POS (one view
-                    // select), but be explicit: a flat re-sort wins over POS grouping.
-                    let by_pos = pos_view.get() && !rand_view.get() && !count_view.get();
+                    let by_pos = pos_view.get();
                     // Plain-text mode: each word on its own line (in the shown order),
                     // optionally with its merged forms (`dog/dogs`) and/or its tags as
                     // `#hashtag[:value]`, joined by the chosen separator, with a copy button.
